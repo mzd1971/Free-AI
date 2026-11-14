@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -20,18 +21,24 @@ from api_settings import APISettings
 from desktop_app import DesktopApp as ExistingActions, size_text
 from epistemology import KnowledgeStore
 from paths import ROOT, ARTIFACTS
-from ui_kit import COLORS as C, FONT, FlatButton, RoundedFrame, ScrollArea, label, setup_theme
+from ui_kit import COLORS as C, CLIENT_SKINS, FONT, FlatButton, RoundedFrame, ScrollArea, label, setup_theme
 
 
 class ClientApp(ExistingActions):
     """Reuse tested file/audio actions; own a deliberately small client interface."""
     def __init__(self, root):
         self.root = root
-        setup_theme(root, 'Free AI', (1320, 880))
+        self.sessions = Sessions(ARTIFACTS)
+        self.theme = self.sessions.get('client_theme', 'cyberpunk')
+        if self.theme not in CLIENT_SKINS.values():
+            self.theme = 'cyberpunk'
+        setup_theme(root, 'Free AI', (1440, 900), theme=self.theme)
         self.events, self.buttons = queue.Queue(), []
         self.busy, self.cancellable, self.downloading = False, False, None
         self.generation_cancel, self.download_cancel = threading.Event(), threading.Event()
-        self.manager, self.sessions, self.knowledge = PackageManager(), Sessions(ARTIFACTS), KnowledgeStore()
+        self.manager, self.knowledge = PackageManager(), KnowledgeStore()
+        from agent_memory import AgentMemoryStore
+        self.personal_memory = AgentMemoryStore()
         self.api_settings = APISettings(ARTIFACTS)
         self.backend = 'api' if self.sessions.get('client_backend') == 'api' else 'local'
         # Existing files are only a cache, not consent to choose or load a model.
@@ -55,31 +62,55 @@ class ClientApp(ExistingActions):
         self.model_state = tk.StringVar(value='未启用模型')
         self.chat_hint = tk.StringVar(value='Enter 发送 · Shift + Enter 换行')
         self.download_status = tk.StringVar(value='只下载你需要的能力，聊天和经验会一直保留。')
+        self.rail = tk.Frame(root, bg=C['side'], width=52)
+        self.rail.pack(side='left', fill='y')
+        self.rail.pack_propagate(False)
+        try:
+            self.brand_image = tk.PhotoImage(file=str(ROOT / 'assets/free-ai-ui.png')).subsample(2)
+            brand_button = tk.Button(self.rail, image=self.brand_image, command=lambda: self.select_page(0),
+                width=38, height=40, bg=C['side'], activebackground=C['hover'], bd=0, relief='flat',
+                highlightthickness=1, highlightbackground=C['side'], highlightcolor=C['focus'], cursor='hand2')
+        except tk.TclError:
+            brand_button = FlatButton(self.rail, 'f', lambda: self.select_page(0), variant='selected', width=38, height=40, font_size=20)
+        brand_button.pack(pady=(12, 20))
+        FlatButton(self.rail, '☰', self.toggle_sidebar, variant='ghost', width=38, height=38, font_size=16).pack(pady=4)
+        FlatButton(self.rail, '＋', self.new_conversation, variant='ghost', width=38, height=38, font_size=18).pack(pady=4)
+        FlatButton(self.rail, '◇', lambda: self.select_page(1), variant='ghost', width=38, height=38, font_size=17).pack(pady=4)
+        FlatButton(self.rail, '⚙', lambda: self.select_page(2), variant='ghost', width=38, height=38, font_size=17).pack(side='bottom', pady=18)
         self.sidebar = tk.Frame(root, bg=C['side'], width=224)
         self.sidebar.pack(side='left', fill='y')
         self.sidebar.pack_propagate(False)
         brand = tk.Frame(self.sidebar, bg=C['side'])
-        brand.pack(fill='x', padx=24, pady=(26, 26))
-        label(brand, 'f', size=23, bold=True, color=C['accent']).pack(side='left', padx=(0, 9))
-        label(brand, 'free ai', size=19, bold=True).pack(side='left')
+        brand.pack(fill='x', padx=20, pady=(17, 22))
+        label(brand, 'Free AI', size=16, bold=True, color=C.get('brand', C['text'])).pack(side='left')
+        label(brand, '本地工作空间', size=9, color=C['muted']).pack(side='right')
         FlatButton(self.sidebar, '+   新的对话', self.new_conversation, variant='selected', anchor='w', height=44).pack(fill='x', padx=14)
-        FlatButton(self.sidebar, '◇   能力中心', lambda: self.select_page(1), variant='ghost', anchor='w', height=44).pack(fill='x', padx=14, pady=(6, 24))
-        label(self.sidebar, '最近', size=10, color=C['muted']).pack(anchor='w', padx=29, pady=(0, 10))
+        FlatButton(self.sidebar, '◇   能力中心', lambda: self.select_page(1), variant='ghost', anchor='w', height=44).pack(fill='x', padx=14, pady=(6, 0))
         bottom = tk.Frame(self.sidebar, bg=C['side'])
         bottom.pack(side='bottom', fill='x', padx=14, pady=18)
         FlatButton(bottom, '设置', lambda: self.select_page(2), variant='ghost', anchor='w', height=36).pack(fill='x')
-        label(bottom, 'Free AI  /  2.3.1', size=10, color=C['muted']).pack(anchor='w', padx=16, pady=(8, 0))
+        label(bottom, 'Free AI  /  2.4.2', size=10, color=C['muted']).pack(anchor='w', padx=16, pady=(8, 0))
         self.recent_area = ScrollArea(self.sidebar, bg=C['side'])
         self.recent_area.pack(fill='both', expand=True, padx=14)
-        main = tk.Frame(root, bg=C['bg'])
+        main = self.main = tk.Frame(root, bg=C['bg'])
         main.pack(side='left', fill='both', expand=True)
         header = tk.Frame(main, bg=C['bg'], height=64)
-        header.pack(fill='x', padx=30, pady=(16, 0))
+        header.pack(fill='x', padx=24, pady=(5, 0))
         self.page_title = tk.StringVar(value='新的对话')
-        label(header, textvariable=self.page_title, size=11, color=C['muted']).pack(side='left', pady=12)
+        label(header, '▱', size=16, color=C['muted']).pack(side='left', padx=(0, 10))
+        label(header, textvariable=self.page_title, size=12).pack(side='left', pady=12)
+        self.details_button = FlatButton(header, '◫', self.toggle_project_details, variant='ghost', width=36, height=34, font_size=16)
+        self.details_button.pack(side='right', padx=(12, 0))
+        self.memory_button = FlatButton(header, '记忆', self.open_memory, variant='ghost', width=62, height=34, font_size=11)
+        self.memory_button.pack(side='right', padx=(8, 0))
         label(header, textvariable=self.model_state, size=10, color=C['muted']).pack(side='right')
+        if self.theme == 'cyberpunk':
+            from ui_kit import paint_circuit
+            circuit = tk.Canvas(main, bg=C['bg'], height=18, highlightthickness=0, bd=0)
+            circuit.pack(fill='x', padx=24, pady=(0, 2))
+            circuit.bind('<Configure>', lambda event: paint_circuit(event.widget))
         self.footer = tk.Frame(main, bg=C['bg'])
-        self.footer.pack(side='bottom', fill='x', padx=30, pady=(4, 12))
+        self.footer.pack(side='bottom', fill='x', padx=24, pady=(2, 7))
         label(self.footer, textvariable=self.status, size=10, color=C['muted'], anchor='w', wraplength=740).pack(side='left', fill='x', expand=True)
         self.stop_task_button = FlatButton(self.footer, '停止', self.stop_generation, variant='ghost', width=60, height=28)
         self.progress = ttk.Progressbar(main, mode='indeterminate', length=30)
@@ -88,6 +119,10 @@ class ClientApp(ExistingActions):
         self.pages = [tk.Frame(self.host, bg=C['bg']) for _ in range(3)]
         self.current_page = 0
         self.build_chat(self.pages[0])
+        from project_chat import ProjectConversation
+        self.project = ProjectConversation(self)
+        from memory_panel import MemoryPanel
+        self.memories = MemoryPanel(self)
         self.build_capabilities(self.pages[1])
         self.build_settings(self.pages[2])
         self.refresh_recent()
@@ -111,28 +146,45 @@ class ClientApp(ExistingActions):
             self.layout_chat()
 
     def build_chat(self, page):
+        self.show_project_details = True
+        self.project_summary = RoundedFrame(page, bg=C['surface'], radius=16, padding=16)
+        self.summary_content = self.project_summary.body
         self.chat_stack = tk.Frame(page, bg=C['bg'])
         self.hero = tk.Frame(self.chat_stack, bg=C['bg'])
-        label(self.hero, '✦', size=27, color=C['accent']).pack(pady=(0, 14))
-        label(self.hero, '有什么想一起完成？', size=26, bold=True).pack()
-        label(self.hero, '整理想法，读懂资料，或者写一段代码。', size=12, color=C['muted']).pack(pady=(12, 26))
-        suggestions = tk.Frame(self.hero, bg=C['bg'])
+        if self.theme == 'cyberpunk':
+            grid = tk.Canvas(self.hero, bg=C['bg'], highlightthickness=0, bd=0)
+            grid.place(x=0, y=0, relwidth=1, relheight=1)
+            def draw_grid(event):
+                grid.delete('all')
+                for x in range(22, event.width, 42):
+                    for y in range(20, event.height, 42):
+                        grid.create_oval(x, y, x+2, y+2, fill='#19393c', outline='')
+            grid.bind('<Configure>', draw_grid)
+        self.hero_content = tk.Frame(self.hero, bg=C['bg'])
+        self.hero_content.place(relx=.5, rely=.46, anchor='center')
+        label(self.hero_content, '一起完成下一件事', size=25, bold=True).pack()
+        label(self.hero_content, '聊想法，写代码，让项目向前一步。', size=12, color=C['muted']).pack(pady=(12, 22))
+        suggestions = tk.Frame(self.hero_content, bg=C['bg'])
         suggestions.pack(pady=(0, 20))
         for title, prompt in [('整理思路', '帮我把下面的想法整理成清晰的计划：\n'),
                               ('润色文字', '帮我润色下面这段文字，保留原来的意思：\n'),
                               ('解释代码', '请解释下面的代码，并指出需要注意的地方：\n')]:
             FlatButton(suggestions, title, lambda p=prompt: self.fill_prompt(p), variant='ghost', height=34, width=116, font_size=11).pack(side='left', padx=5)
         self.transcript = tk.Text(self.chat_stack, bg=C['bg'], fg=C['text'], wrap='word', bd=0,
-             highlightthickness=0, padx=16, pady=16, font=(FONT, 12), spacing1=5, spacing3=12,
-             selectbackground=C['tint'], state='disabled', height=8)
-        self.transcript.tag_configure('user', font=(FONT, 12, 'bold'), foreground=C['text'], spacing1=20)
-        self.transcript.tag_configure('assistant', foreground=C['accent'], font=(FONT, 11, 'bold'), spacing1=20)
-        self.composer = RoundedFrame(self.chat_stack, radius=22, padding=(18, 14), border=C['line'])
+             highlightthickness=0, padx=12, pady=10, font=(FONT, 12), spacing1=2, spacing3=5,
+             selectbackground=C['selection_bg'], selectforeground=C['selection_fg'], state='disabled', height=8)
+        self.transcript.tag_configure('user', font=(FONT, 12, 'bold'), foreground=C['text'], spacing1=14)
+        self.transcript.tag_configure('assistant', foreground=C.get('secondary', C['muted']), font=(FONT, 11), spacing1=14)
+        self.transcript.tag_configure('md_marker', elide=True)
+        self.transcript.tag_configure('md_heading', font=(FONT, 14, 'bold'), spacing1=8, spacing3=3)
+        self.transcript.tag_configure('md_bold', font=(FONT, 12, 'bold'))
+        self.transcript.tag_configure('md_code', font=('Consolas', 11), background=C['surface'], spacing1=0, spacing3=0)
+        self.composer = RoundedFrame(self.chat_stack, bg=C['input'], radius=20, padding=(14, 10), border=C['line'])
         self.composer.pack(fill='x')
-        self.input = tk.Text(self.composer.body, bg=C['surface'], fg=C['text'], font=(FONT, 13), height=4,
+        self.input = tk.Text(self.composer.body, bg=C['input'], fg=C['text'], font=(FONT, 13), height=2,
             wrap='word', bd=0, highlightthickness=0, insertbackground=C['accent'], padx=3, pady=7, undo=True)
         self.input.pack(fill='x')
-        self.placeholder = label(self.input, '说说你的想法，或添加一份资料…', size=13, color='#a0a198', cursor='xterm')
+        self.placeholder = label(self.input, '输入需求，让 Free AI 帮你完成…', size=13, color=C['muted'], cursor='xterm')
         self.placeholder.place(x=4, y=8)
         self.placeholder.bind('<Button-1>', lambda e: self.input.focus_set())
         self.input.bind('<KeyRelease>', lambda e: self.update_placeholder())
@@ -140,25 +192,25 @@ class ClientApp(ExistingActions):
         self.input.bind('<FocusOut>', lambda e: self.update_placeholder())
         self.input.bind('<Return>', self.enter_send)
         self.input.bind('<Control-Return>', lambda e: (self.send_chat(), 'break')[-1])
-        tools = tk.Frame(self.composer.body, bg=C['surface'])
-        tools.pack(fill='x', pady=(10, 0))
+        tools = tk.Frame(self.composer.body, bg=C['input'])
+        tools.pack(fill='x', pady=(5, 0))
         self.add_button = FlatButton(tools, '+', self.attachment_menu, variant='ghost', width=34, height=34, font_size=20)
         self.add_button.pack(side='left')
         self.buttons.append(self.add_button)
-        self.model_button = FlatButton(tools, '选择模型', self.model_menu, variant='ghost', width=150, height=34, font_size=10)
+        self.model_button = FlatButton(tools, '选择模型', self.model_menu, variant='ghost', width=140, height=34, font_size=10)
         self.model_button.pack(side='left', padx=(4, 0))
         self.context_button = FlatButton(tools, self.context.get().split(' · ')[0] + ' ▾', self.context_menu,
-                                        variant='ghost', width=116, height=34, font_size=10)
+                                        variant='ghost', width=100, height=34, font_size=10)
         self.context_button.pack(side='left')
         self.skill_button = FlatButton(tools, get_skill(self.skill.get())['title'] + ' ▾', self.skill_menu,
-                                       variant='ghost', width=124, height=34, font_size=10)
+                                       variant='ghost', width=100, height=34, font_size=10)
         self.skill_button.pack(side='left')
         self.send_button = FlatButton(tools, '↑', self.send_or_stop, width=40, height=40, radius=20, font_size=20, variant='primary')
         self.send_button.pack(side='right')
         self.more_button = FlatButton(tools, '···', self.answer_menu, variant='ghost', width=40, height=34, font_size=18)
         self.more_button.pack(side='right', padx=8)
         self.hint_label = label(self.chat_stack, textvariable=self.chat_hint, size=10, color=C['muted'], wraplength=760)
-        self.hint_label.pack(pady=(12, 0))
+        self.hint_label.pack(pady=(7, 0))
         self.setup_button = FlatButton(self.chat_stack, '下载模型或连接 API', lambda: self.show_capabilities('models'),
                                       variant='accent', width=238, height=34, font_size=10)
         page.bind('<Configure>', lambda e: self.layout_chat())
@@ -172,16 +224,81 @@ class ClientApp(ExistingActions):
     def layout_chat(self):
         if not hasattr(self, 'chat_stack'):
             return
-        width = max(450, min(850, self.pages[0].winfo_width()-64))
-        self.chat_stack.place_forget()
+        page_width = self.pages[0].winfo_width()
+        project_mode = hasattr(self, 'project') and self.project.enabled.get()
+        memory_open = hasattr(self, 'memories') and self.memories.opened
+        aside = 328 if memory_open else 220 if project_mode and self.show_project_details and page_width >= 850 else 0
+        width = max(440, min(850, page_width - aside - 54))
+        if memory_open:
+            self.project_summary.place_forget()
+            self.memories.frame.place(relx=1, x=-10, y=8, anchor='ne', width=318, relheight=.97)
+        elif aside:
+            self.project_summary.place(relx=1, x=-14, y=14, anchor='ne', width=aside - 8)
+        else:
+            self.project_summary.place_forget()
+        if hasattr(self, 'memories') and not memory_open:
+            self.memories.frame.place_forget()
+        self.chat_stack.place(x=max(12, (page_width - aside - width) // 2), y=4, width=width, relheight=.98)
+        self.hint_label.configure(wraplength=width - 24)
         if self.history:
             self.hero.pack_forget()
             self.transcript.pack(fill='both', expand=True, before=self.composer, pady=(0, 10))
-            self.chat_stack.place(relx=.5, rely=0, anchor='n', width=width, relheight=.97)
         else:
             self.transcript.pack_forget()
-            self.hero.pack(fill='x', before=self.composer)
-            self.chat_stack.place(relx=.5, rely=.44, anchor='center', width=width)
+            self.hero.pack(fill='both', expand=True, before=self.composer)
+
+    def toggle_sidebar(self):
+        if self.sidebar.winfo_manager():
+            self.sidebar.pack_forget()
+        else:
+            self.sidebar.pack(side='left', fill='y', before=self.main)
+
+    def open_memory(self):
+        self.memories.toggle()
+
+    def toggle_project_details(self):
+        if not self.project.enabled.get():
+            self.status.set('切换到“做项目”后，这里会显示项目文件和执行结果。')
+            return
+        self.show_project_details = not self.show_project_details
+        if self.show_project_details and self.pages[0].winfo_width() < 850 and self.sidebar.winfo_manager():
+            self.sidebar.pack_forget()
+        self.layout_chat()
+
+    def refresh_project_summary(self):
+        if not hasattr(self, 'project'):
+            return
+        for child in self.summary_content.winfo_children():
+            child.destroy()
+        def section(title, text):
+            label(self.summary_content, title, size=10, color=C['muted']).pack(anchor='w', pady=(10, 7))
+            label(self.summary_content, text, size=11, wraplength=178, justify='left', anchor='w').pack(fill='x')
+        workspace = self.project.workspace.get()
+        section('当前项目', Path(workspace).name if workspace else '尚未选择文件夹')
+        if workspace:
+            FlatButton(self.summary_content, '打开文件夹 ↗', lambda: self.open_project_folder(workspace),
+                       variant='ghost', height=30, font_size=10).pack(anchor='w', pady=(5, 2))
+        cards = self.project.cards
+        latest = self.project.active or (cards[-1] if cards else None)
+        section('执行状态', latest.status.get() if latest else '发送一个目标，开始处理')
+        files = list(dict.fromkeys(row['path'] for card in cards if card.workspace == workspace
+                   for row in (card.result or {}).get('changes', [])))
+        tk.Frame(self.summary_content, height=1, bg=C['line']).pack(fill='x', pady=(14, 0))
+        section('修改过的文件', '\n'.join('▱ ' + path for path in files[-8:]) or '暂时没有修改')
+        if latest:
+            checks = latest.activity.count('退出码：0\n')
+            failures = latest.activity.count('退出码：') - checks
+            section('本轮命令结果', f'{checks} 次正常结束 · {failures} 次需检查' if checks or failures else '暂无命令结果')
+            if '[已撤回文件修改]' in latest.activity:
+                label(self.summary_content, '已执行撤回，详情见聊天记录。', size=10,
+                      color=C['muted'], wraplength=178, justify='left').pack(anchor='w', pady=(8, 0))
+        self.layout_chat()
+
+    def open_project_folder(self, folder):
+        try:
+            os.startfile(folder)
+        except OSError:
+            self.status.set('项目文件夹无法打开，请检查它是否已移动。')
 
     def enter_send(self, event):
         if event.state & 0x0001:
@@ -208,6 +325,8 @@ class ClientApp(ExistingActions):
         menu.tk_popup(self.add_button.winfo_rootx(), self.add_button.winfo_rooty()+38)
 
     def mode_changed(self):
+        if self.tool_mode.get() and self.project.enabled.get():
+            self.project.set_mode(False)
         if self.tool_mode.get():
             self.skill.set('general')
             self.sessions.set('client_skill', 'general')
@@ -217,6 +336,8 @@ class ClientApp(ExistingActions):
         self.refresh_model_state()
 
     def refresh_model_state(self):
+        if hasattr(self, 'project') and self.project.enabled.get():
+            self.project.refresh()
         if self.backend == 'api':
             profile = self.api_settings.public()
             self.model_state.set('联网 API · ' + profile['model'] if profile['key_available'] else '联网 API · 请填写密钥')
@@ -302,6 +423,8 @@ class ClientApp(ExistingActions):
             self.status.set('当前任务结束后再切换技能。')
             return
         spec = get_skill(identity)
+        if self.project.enabled.get():
+            self.project.set_mode(False)
         self.skill.set(identity)
         self.sessions.set('client_skill', identity)
         self.tool_mode.set(False)
@@ -397,10 +520,27 @@ class ClientApp(ExistingActions):
             child.destroy()
         if not self.recent_rows:
             label(self.recent_area.body, '你的对话会出现在这里', size=10, color=C['muted']).pack(anchor='w', padx=14, pady=8)
+        projects, chats = {}, []
         for identity, title in self.recent_rows:
-            button = FlatButton(self.recent_area.body, title[:16], lambda i=identity: self.choose_session(i),
-                                variant='selected' if identity == self.session_id else 'ghost', anchor='w', height=40, font_size=10)
-            button.pack(fill='x', pady=2)
+            folder = self.sessions.project_settings(identity).get('workspace')
+            if folder:
+                projects.setdefault(folder, []).append((identity, title))
+            else:
+                chats.append((identity, title))
+        def conversation(identity, title, indent=False):
+            button = FlatButton(self.recent_area.body, title[:12], lambda i=identity: self.choose_session(i),
+                                variant='selected' if identity == self.session_id else 'ghost', anchor='w', height=34, font_size=11)
+            button.pack(fill='x', pady=1, padx=(8 if indent else 0, 0))
+        if projects:
+            label(self.recent_area.body, '项目', size=10, color=C['muted']).pack(anchor='w', padx=13, pady=(18, 8))
+        for folder, rows in projects.items():
+            label(self.recent_area.body, '▱  ' + Path(folder).name[:14], size=11).pack(anchor='w', padx=13, pady=(10, 6))
+            for identity, title in rows:
+                conversation(identity, title, True)
+        if chats:
+            label(self.recent_area.body, '最近对话', size=10, color=C['muted']).pack(anchor='w', padx=13, pady=(20, 8))
+        for identity, title in chats:
+            conversation(identity, title)
         self.recent_area.bind_wheel(self.recent_area.body)
 
     def new_conversation(self):
@@ -426,13 +566,51 @@ class ClientApp(ExistingActions):
         self.input.delete('1.0', 'end')
         self.image_path = None
         self.skill_file = None
+        project_rows = self.project.load(identity)
         self.write(self.transcript, '')
-        for message in self.history:
+        for index, message in enumerate(self.history):
             self.append_heading('你' if message['role'] == 'user' else 'Free AI', message['role'])
+            if index in project_rows:
+                self.project.restore(project_rows[index])
             self.write(self.transcript, message['content'] + '\n\n', True)
         self.update_placeholder()
         self.refresh_recent()
         self.layout_chat()
+        self.format_transcript()
+        self.memories.refresh()
+
+    def format_transcript(self):
+        # Style the existing text in place: copying, persistence and undo still use its exact source.
+        text = self.transcript
+        for tag in ('md_marker', 'md_heading', 'md_bold', 'md_code'):
+            text.tag_remove(tag, '1.0', 'end')
+        assistant_lines = {int(str(index).split('.')[0]) for index in text.tag_ranges('assistant')[::2]}
+        user_lines = {int(str(index).split('.')[0]) for index in text.tag_ranges('user')[::2]}
+        assistant, code = False, False
+        for number in range(1, int(text.index('end-1c').split('.')[0]) + 1):
+            if number in user_lines or number in assistant_lines:
+                assistant, code = number in assistant_lines, False
+                continue
+            if not assistant:
+                continue
+            line = text.get(f'{number}.0', f'{number}.end')
+            if line.strip().startswith('```'):
+                text.tag_add('md_marker', f'{number}.0', f'{number + 1}.0')
+                code = not code
+                continue
+            if code:
+                text.tag_add('md_code', f'{number}.0', f'{number}.end')
+                continue
+            heading = re.match(r'^(#{1,6})\s+', line)
+            if heading:
+                text.tag_add('md_marker', f'{number}.0', f'{number}.{heading.end()}')
+                text.tag_add('md_heading', f'{number}.{heading.end()}', f'{number}.end')
+            for pattern, tag, delimiter in ((r'\*\*(.+?)\*\*', 'md_bold', 2), (r'`([^`]+)`', 'md_code', 1)):
+                for match in re.finditer(pattern, line):
+                    start, end = match.span()
+                    text.tag_add('md_marker', f'{number}.{start}', f'{number}.{start + delimiter}')
+                    text.tag_add('md_marker', f'{number}.{end - delimiter}', f'{number}.{end}')
+                    text.tag_add(tag, f'{number}.{start + delimiter}', f'{number}.{end - delimiter}')
 
     def append_heading(self, text, role):
         self.transcript.configure(state='normal')
@@ -444,6 +622,9 @@ class ClientApp(ExistingActions):
 
     def send_chat(self):
         if self.busy:
+            return
+        if self.project.enabled.get():
+            self.project.send()
             return
         skill_id = self.skill.get()
         skill = get_skill(skill_id)
@@ -487,6 +668,7 @@ class ClientApp(ExistingActions):
         identity, history = self.session_id, list(self.history)
         picture, context = self.image_path, CONTEXTS[self.context.get()]
         tool_mode = self.tool_mode.get()
+        personal_options = self.memories.snapshot(self.backend)
         model_id = self.selected_model
         self.pending_chat, self.streamed = identity, ''
         self.last_episode, self.last_tool_result = None, None
@@ -525,15 +707,23 @@ class ClientApp(ExistingActions):
             return chat(message, history, memory_store=self.knowledge, return_details=True, context=context,
                         image_path=picture, model_id=model_id, skill_id=skill_id, cancel_event=self.generation_cancel,
                         api_client=api_client, api_use_memory=api_memory,
+                        personal_memory=self.personal_memory, read_personal_memory=personal_options['read'],
+                        write_personal_memory=personal_options['write'], memory_evidence='对话：' + identity,
+                        on_memory_stage=lambda: self.events.put(('update', lambda _: self.chat_hint.set('回答已生成，正在整理可长期记住的信息…'), None)),
                         on_token=lambda value: self.events.put(('update', token, value)))
         def done(result):
             self.last_episode, self.last_answer = result.get('episode_id'), result['answer']
             self.last_tool_result = result.get('tool_details')
             if not self.streamed:
                 self.write(self.transcript, self.last_answer, True)
+            memory_notice = self.memories.chat_notice(result, message) if not direct_tool and not tool_mode else ''
+            if memory_notice:
+                self.last_answer += memory_notice
+                self.write(self.transcript, memory_notice, True)
             self.write(self.transcript, '\n\n', True)
             self.sessions.append(identity, 'assistant', self.last_answer)
             self.history.append({'role': 'assistant', 'content': self.last_answer})
+            self.format_transcript()
             self.pending_chat = None
             import qwen_chat
             notice = (getattr(api_client, 'last_context_notice', '') if use_api else
@@ -541,6 +731,9 @@ class ClientApp(ExistingActions):
             self.chat_hint.set((notice + '  ·  ' if notice else '') + f'已保存 · {time.monotonic()-started:.1f} 秒')
             self.refresh_model_state()
         self.submit('正在执行本机技能' if direct_tool else '正在准备回答', work, done, cancellable=not direct_tool)
+
+    def open_project_assistant(self):
+        self.project.set_mode(True)
 
     def open_epistemology(self):
         if not self.last_episode:
@@ -754,6 +947,17 @@ class ClientApp(ExistingActions):
         self.settings_area = area
         area.pack(fill='both', expand=True, padx=40, pady=16)
         label(area.body, '让使用更顺手', size=24, bold=True).pack(anchor='w', pady=(0, 24))
+        appearance = RoundedFrame(area.body, padding=22)
+        appearance.pack(fill='x', pady=(0, 14))
+        label(appearance.body, '界面皮肤', size=14, bold=True, color=C.get('brand', C['text'])).pack(anchor='w')
+        self.skin_choice = tk.StringVar(value=next(name for name, value in CLIENT_SKINS.items() if value == self.theme))
+        self.skin_picker = ttk.Combobox(appearance.body, values=list(CLIENT_SKINS), textvariable=self.skin_choice,
+                                       state='readonly', width=24)
+        self.skin_picker.pack(anchor='w', pady=(12, 8))
+        self.skin_notice = tk.StringVar(value='边缘行者：黑底、青色电路、切角面板、荧光绿按钮与黄色点缀。选择后，重新打开应用生效。')
+        label(appearance.body, textvariable=self.skin_notice, size=11, color=C['muted'],
+              wraplength=760, justify='left').pack(anchor='w')
+        self.skin_picker.bind('<<ComboboxSelected>>', self.save_skin)
         self.api_panel = APISettingsPanel(self, area.body)
         for title, detail, actions in [
             ('文件放在哪里', '聊天和训练记录：' + str(ARTIFACTS) + '\n模型和扩展：' + str(self.manager.root) +
@@ -761,7 +965,7 @@ class ClientApp(ExistingActions):
              [('打开记录文件夹', lambda: os.startfile(ARTIFACTS)), ('打开模型文件夹', self.open_model_folder), ('更改记录位置', self.choose_storage)]),
             ('模型占用', '启动时不加载模型。释放内存会保留选择；停用模型会清除选择，文件仍保留。', [('释放模型', self.release_model), ('停用模型', self.disable_model)]),
             ('独立训练端', '准备资料、训练、评估与经验改进，都在 Free AI Trainer 中完成。', [('打开训练端', self.open_training)]),
-            ('关于 Free AI', '2.3.1  ·  本地模型与联网 API 自由选择，技能随任务切换。', [('使用说明', lambda: os.startfile(ROOT / '使用说明.md'))])]:
+            ('关于 Free AI', '2.4.2  ·  在对话里做项目，也能管理长期记忆。', [('使用说明', lambda: os.startfile(ROOT / '使用说明.md'))])]:
             card = RoundedFrame(area.body, padding=22)
             card.pack(fill='x', pady=(0, 14))
             label(card.body, title, size=14, bold=True).pack(anchor='w')
@@ -771,6 +975,12 @@ class ClientApp(ExistingActions):
             for text, action in actions:
                 FlatButton(row, text, action, variant='secondary', height=34, font_size=11).pack(side='left', padx=(0, 10))
         area.bind_wheel(area.body)
+
+    def save_skin(self, event=None):
+        choice = CLIENT_SKINS.get(self.skin_choice.get())
+        if choice:
+            self.sessions.set('client_theme', choice)
+            self.skin_notice.set('已保存「' + self.skin_choice.get() + '」。重新打开 Free AI 后生效。')
 
     def open_model_folder(self):
         try:
@@ -793,6 +1003,8 @@ class ClientApp(ExistingActions):
         if self.busy:
             return
         self.busy, self.cancellable = True, cancellable
+        self.project.sync_busy()
+        self.memories.sync_busy()
         self.generation_cancel.clear()
         self.status.set(title + '…')
         self.send_button.configure(text='■' if cancellable else '…', state='normal' if cancellable else 'disabled')
@@ -816,6 +1028,8 @@ class ClientApp(ExistingActions):
                     handler(payload)
                     continue
                 self.busy = False
+                self.project.sync_busy()
+                self.memories.sync_busy()
                 self.send_button.configure(text='↑', state='normal')
                 self.stop_task_button.pack_forget()
                 for button in self.buttons:
@@ -834,7 +1048,11 @@ class ClientApp(ExistingActions):
                 self.update_placeholder()
         except queue.Empty:
             pass
-        self.poll_id = self.root.after(60, self.poll)
+        except Exception:
+            logging.exception('Client task update failed')
+            self.status.set('处理任务反馈时发生错误，请查看运行记录。')
+        finally:
+            self.poll_id = self.root.after(60, self.poll)
 
     def close(self):
         if self.busy:

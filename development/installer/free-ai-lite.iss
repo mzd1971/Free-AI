@@ -7,7 +7,7 @@
 #ifndef ReleaseDir
   #error ReleaseDir is required
 #endif
-#define AppVersion "2.3.1"
+#define AppVersion "2.4.2"
 [Setup]
 AppId={{3EAACF9D-4709-48F0-AF84-0275969D1600}
 AppName=Free AI
@@ -42,10 +42,10 @@ Name: "trainerdesktopicon"; Description: "Free AI 训练端 — 准备数据、�
 [Files]
 Source: "{#StageRoot}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 [Icons]
-Name: "{group}\Free AI"; Filename: "{app}\Free AI.exe"; WorkingDir: "{app}"
-Name: "{group}\Free AI 训练端"; Filename: "{app}\Free AI Trainer.exe"; WorkingDir: "{app}"
-Name: "{autodesktop}\Free AI"; Filename: "{app}\Free AI.exe"; WorkingDir: "{app}"; Tasks: desktopicon
-Name: "{autodesktop}\Free AI 训练端"; Filename: "{app}\Free AI Trainer.exe"; WorkingDir: "{app}"; Tasks: trainerdesktopicon
+Name: "{group}\Free AI"; Filename: "{app}\Free AI.exe"; WorkingDir: "{app}"; IconFilename: "{app}\assets\free-ai.ico"
+Name: "{group}\Free AI 训练端"; Filename: "{app}\Free AI Trainer.exe"; WorkingDir: "{app}"; IconFilename: "{app}\assets\free-ai.ico"
+Name: "{autodesktop}\Free AI"; Filename: "{app}\Free AI.exe"; WorkingDir: "{app}"; IconFilename: "{app}\assets\free-ai.ico"; Tasks: desktopicon
+Name: "{autodesktop}\Free AI 训练端"; Filename: "{app}\Free AI Trainer.exe"; WorkingDir: "{app}"; IconFilename: "{app}\assets\free-ai.ico"; Tasks: trainerdesktopicon
 [Run]
 Filename: "{app}\Free AI.exe"; Description: "打开 Free AI"; Flags: nowait postinstall skipifsilent
 [Code]

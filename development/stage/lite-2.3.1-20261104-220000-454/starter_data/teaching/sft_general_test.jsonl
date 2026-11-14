@@ -1,6 +1,0 @@
-{"id":"general_001","prompt":"一盒有12支铅笔，买了3盒，分给同学7支，还剩几支？","response":"还剩29支。先算总数12×3＝36，再减去分出的7支，得到36－7＝29。"}
-{"id":"general_002","prompt":"一句话解释成语“循序渐进”的意思。","response":"循序渐进是指按照一定的顺序和步骤，逐渐深入或提高。"}
-{"id":"general_003","prompt":"写一个Python函数square，输入数字x，返回它的平方，不要打印。","response":"def square(x):\n    return x * x"}
-{"id":"general_004","prompt":"从这句话提取地点和时间：小林计划周五下午三点在市图书馆参加读书会。只输出这两项。","response":"地点：市图书馆\n时间：周五下午三点"}
-{"id":"general_005","prompt":"将“Please close the window.”翻译成中文。","response":"请关上窗户。"}
-{"id":"general_006","prompt":"所有松树都是植物。这棵树是松树。能否由此推出这棵树是植物？","response":"能。既然所有松树都属于植物，而这棵树是松树，就可以推出它是植物。"}

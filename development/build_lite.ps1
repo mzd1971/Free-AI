@@ -6,14 +6,14 @@ param(
     [switch]$PrepareOnly
 )
 $ErrorActionPreference = 'Stop'
-$taskVersion = '2.3.1'
+$taskVersion = '2.4.2'
 $taskDevelopment = $PSScriptRoot
 $taskRuntime = Join-Path $SourceRoot 'runtime\python'
 $taskStage = Join-Path $taskDevelopment ('stage\lite-' + $taskVersion + '-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
 $taskStageRuntime = Join-Path $taskStage 'runtime\python'
 $taskReports = Join-Path $taskDevelopment 'reports'
 $taskPrivatePattern = '(?i)(^|[-_.])(api[-_]?connection|api[-_]?settings|settings|secrets?|credentials?|api[-_]?keys?|tokens?)([-_.]|$)|^\.env($|\.)'
-$taskRequired = @('free_ai_bootstrap.py','client_app.py','trainer_app.py','ui_kit.py','compute_guard.py','model_catalog.py','app_skills.py','api_panel.py','api_settings.py','remote_api.py','paths.py','assets\free-ai.ico')
+$taskRequired = @('free_ai_bootstrap.py','client_app.py','trainer_app.py','ui_kit.py','compute_guard.py','model_catalog.py','app_skills.py','api_panel.py','api_settings.py','remote_api.py','project_agent.py','project_chat.py','local_project_model.py','agent_memory.py','memory_learning.py','memory_panel.py','paths.py','assets\free-ai.ico')
 foreach ($taskName in $taskRequired) {
     if (-not (Test-Path -LiteralPath (Join-Path $SourceRoot $taskName) -PathType Leaf)) { throw "Missing application source: $taskName" }
 }
@@ -38,7 +38,7 @@ foreach ($taskSection in @('Lib','DLLs','tcl')) {
 foreach ($taskFile in Get-ChildItem -LiteralPath $SourceRoot -File -Filter '*.py') {
     Copy-Item -LiteralPath $taskFile.FullName -Destination (Join-Path $taskStage $taskFile.Name)
 }
-$taskStatic = @('capability_catalog.json','使用说明.md','assets\free-ai.ico')
+$taskStatic = @('capability_catalog.json','使用说明.md','assets\free-ai.ico','assets\free-ai-ui.png')
 $taskStarter = @('sft_general_test.jsonl','sft_test.jsonl','sft_train.jsonl','sft_validation.jsonl','train.txt','validation.txt')
 foreach ($taskName in $taskStarter) { $taskStatic += 'starter_data\teaching\' + $taskName }
 foreach ($taskRelative in $taskStatic) {

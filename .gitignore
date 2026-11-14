@@ -1,0 +1,39 @@
+# Local conversations, memories, credentials and downloads
+/portable_data/
+/models/
+/storage.json
+/model-location.txt
+/*-self-test.json
+/unins*.exe
+/unins*.dat
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.log
+*.dpapi
+*.secret
+*.key
+.env
+.env.*
+api_settings.json
+api_connection.json
+credentials.json
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+/venv/
+runtime/python/Lib/site-packages/
+
+# Generated packages, experiments and workstation reports
+/development/*
+!/development/build_lite.ps1
+!/development/export_icon.ps1
+!/development/installer/
+!/development/launcher/
+!/development/tests/
+.DS_Store
+Thumbs.db
+Desktop.ini

@@ -6,8 +6,8 @@ using System.Reflection;
 using System.Windows.Forms;
 [assembly: AssemblyCompany("Free AI")]
 [assembly: AssemblyProduct("Free AI")]
-[assembly: AssemblyVersion("2.3.1.0")]
-[assembly: AssemblyFileVersion("2.3.1.0")]
+[assembly: AssemblyVersion("2.4.2.0")]
+[assembly: AssemblyFileVersion("2.4.2.0")]
 #if TRAINER
 [assembly: AssemblyTitle("Free AI Trainer")]
 #else
