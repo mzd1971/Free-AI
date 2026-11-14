@@ -1,0 +1,7 @@
+{
+  "finite_adapter_tensors": 112,
+  "nonzero_lora_B_matrices": 56,
+  "reloaded_generation_matches": true,
+  "example_id": "general_003",
+  "adapter_bytes": 4602248
+}

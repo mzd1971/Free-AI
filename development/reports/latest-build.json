@@ -1,0 +1,22 @@
+{
+  "version": "2.3.1",
+  "created": "2026-11-04T22:00:05.2781745+08:00",
+  "source": "D:\\FreeAI",
+  "stage": "D:\\FreeAI\\development\\stage\\lite-2.3.1-20261104-220000-454",
+  "stage_bytes": 44985789,
+  "runtime_bytes": 44153695.0,
+  "file_count": 1686,
+  "entry_points": [
+    "Free AI.exe",
+    "Free AI Trainer.exe"
+  ],
+  "excludes_models_and_user_data": true,
+  "excludes_api_configuration_and_secrets": true,
+  "excludes_model_location": true,
+  "downloads_during_install": false,
+  "prepared_only": true,
+  "installer": null,
+  "installer_bytes": null,
+  "sha256": null,
+  "documentation_refreshed_after_prepare": true
+}

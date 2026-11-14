@@ -1,0 +1,35 @@
+{
+  "base_model": "Qwen/Qwen3-0.6B",
+  "revision": "c1899de289a04d12100db370d81485cdf75e47ca",
+  "base_snapshot": "models/Qwen3-0.6B",
+  "system_prompt": "你是一个中文助手。请准确、简洁地回答；不确定时说明不确定，不要编造已执行的操作。",
+  "epochs": 6,
+  "learning_rate": 0.0001,
+  "initial_adapter": "portable_data/outputs/qwen-lora-20260916-182553/adapter",
+  "baseline": "initial_adapter",
+  "gradient_accumulation": 4,
+  "max_sequence_length": 512,
+  "seed": 42,
+  "lora_r": 8,
+  "lora_alpha": 16,
+  "lora_targets": ["q_proj", "v_proj"],
+  "trainable_parameters": 1146880,
+  "total_parameters": 597196800,
+  "data_counts": {
+    "sft_train.jsonl": 256,
+    "sft_validation.jsonl": 16,
+    "sft_test.jsonl": 12,
+    "sft_general_test.jsonl": 6
+  },
+  "data_hashes": {
+    "sft_train.jsonl": "7cd62f871194c34e110d7840345dd5a63e75bc7e3d0b8b14f07c2ca392ff6851",
+    "sft_validation.jsonl": "00ea0503c386699f86e4e1d5540ee894d309fe0000b52cd55f688090ee498033",
+    "sft_test.jsonl": "d4c2c4b9ce63234bd1c2200b1c9e99ffd51b54bdac6018a6f334001c6debdece",
+    "sft_general_test.jsonl": "1abb27b297e610fb5e63fac64e22848d677dd29c886e8bbb07cb88cf69c61bb7"
+  },
+  "data_provenance": "Assistant-authored synthetic educational examples; no external teacher API.",
+  "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "torch": "2.6.0+cu124",
+  "precision": "bfloat16 base, float32 trainable adapter",
+  "generation_max_tokens": 192
+}

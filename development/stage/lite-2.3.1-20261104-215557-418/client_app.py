@@ -1,0 +1,860 @@
+"""Free AI client: conversations and optional capabilities, without a training workspace."""
+import json
+import logging
+import os
+import queue
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import tkinter as tk
+from pathlib import Path
+from tkinter import filedialog, messagebox, simpledialog, ttk
+
+from app_state import Sessions, CONTEXTS
+from capability_manager import PackageManager
+from model_catalog import chat_models, is_chat_model, model_name
+from app_skills import skill_catalog, get_skill, execute_skill
+from api_settings import APISettings
+from desktop_app import DesktopApp as ExistingActions, size_text
+from epistemology import KnowledgeStore
+from paths import ROOT, ARTIFACTS
+from ui_kit import COLORS as C, FONT, FlatButton, RoundedFrame, ScrollArea, label, setup_theme
+
+
+class ClientApp(ExistingActions):
+    """Reuse tested file/audio actions; own a deliberately small client interface."""
+    def __init__(self, root):
+        self.root = root
+        setup_theme(root, 'Free AI', (1320, 880))
+        self.events, self.buttons = queue.Queue(), []
+        self.busy, self.cancellable, self.downloading = False, False, None
+        self.generation_cancel, self.download_cancel = threading.Event(), threading.Event()
+        self.manager, self.sessions, self.knowledge = PackageManager(), Sessions(ARTIFACTS), KnowledgeStore()
+        self.api_settings = APISettings(ARTIFACTS)
+        self.backend = 'api' if self.sessions.get('client_backend') == 'api' else 'local'
+        # Existing files are only a cache, not consent to choose or load a model.
+        self.selected_model = self.sessions.get('client_model')
+        if not is_chat_model(self.manager.catalog, self.selected_model):
+            self.selected_model = None
+        saved_skill = self.sessions.get('client_skill', 'general')
+        self.skill = tk.StringVar(value=saved_skill if saved_skill in {s['id'] for s in skill_catalog()} else 'general')
+        self.skill_file = None
+        self.cap_section = 'models'
+        self.session_id, self.pending_chat, self.last_episode = None, None, None
+        self.history, self.last_answer, self.streamed = [], '', ''
+        self.image_path, self.training_process = None, None
+        self.tool_mode = tk.BooleanVar(value=False)
+        self.last_tool_result = None
+        self.context = tk.StringVar(value=self.sessions.get('context', next(iter(CONTEXTS))))
+        if self.context.get() not in CONTEXTS:
+            self.context.set(next(iter(CONTEXTS)))
+        self.status = tk.StringVar(value='当前使用 API；发送时会将当前对话交给所填服务商。' if self.backend == 'api'
+                                  else '先下载模型或连接 API，也可以直接使用本机小工具。' if not self.selected_model else '模型按需加载，打开应用不会启动推理。')
+        self.model_state = tk.StringVar(value='未启用模型')
+        self.chat_hint = tk.StringVar(value='Enter 发送 · Shift + Enter 换行')
+        self.download_status = tk.StringVar(value='只下载你需要的能力，聊天和经验会一直保留。')
+        self.sidebar = tk.Frame(root, bg=C['side'], width=224)
+        self.sidebar.pack(side='left', fill='y')
+        self.sidebar.pack_propagate(False)
+        brand = tk.Frame(self.sidebar, bg=C['side'])
+        brand.pack(fill='x', padx=24, pady=(26, 26))
+        label(brand, 'f', size=23, bold=True, color=C['accent']).pack(side='left', padx=(0, 9))
+        label(brand, 'free ai', size=19, bold=True).pack(side='left')
+        FlatButton(self.sidebar, '+   新的对话', self.new_conversation, variant='selected', anchor='w', height=44).pack(fill='x', padx=14)
+        FlatButton(self.sidebar, '◇   能力中心', lambda: self.select_page(1), variant='ghost', anchor='w', height=44).pack(fill='x', padx=14, pady=(6, 24))
+        label(self.sidebar, '最近', size=10, color=C['muted']).pack(anchor='w', padx=29, pady=(0, 10))
+        bottom = tk.Frame(self.sidebar, bg=C['side'])
+        bottom.pack(side='bottom', fill='x', padx=14, pady=18)
+        FlatButton(bottom, '设置', lambda: self.select_page(2), variant='ghost', anchor='w', height=36).pack(fill='x')
+        label(bottom, 'Free AI  /  2.3.1', size=10, color=C['muted']).pack(anchor='w', padx=16, pady=(8, 0))
+        self.recent_area = ScrollArea(self.sidebar, bg=C['side'])
+        self.recent_area.pack(fill='both', expand=True, padx=14)
+        main = tk.Frame(root, bg=C['bg'])
+        main.pack(side='left', fill='both', expand=True)
+        header = tk.Frame(main, bg=C['bg'], height=64)
+        header.pack(fill='x', padx=30, pady=(16, 0))
+        self.page_title = tk.StringVar(value='新的对话')
+        label(header, textvariable=self.page_title, size=11, color=C['muted']).pack(side='left', pady=12)
+        label(header, textvariable=self.model_state, size=10, color=C['muted']).pack(side='right')
+        self.footer = tk.Frame(main, bg=C['bg'])
+        self.footer.pack(side='bottom', fill='x', padx=30, pady=(4, 12))
+        label(self.footer, textvariable=self.status, size=10, color=C['muted'], anchor='w', wraplength=740).pack(side='left', fill='x', expand=True)
+        self.stop_task_button = FlatButton(self.footer, '停止', self.stop_generation, variant='ghost', width=60, height=28)
+        self.progress = ttk.Progressbar(main, mode='indeterminate', length=30)
+        self.host = tk.Frame(main, bg=C['bg'])
+        self.host.pack(fill='both', expand=True)
+        self.pages = [tk.Frame(self.host, bg=C['bg']) for _ in range(3)]
+        self.current_page = 0
+        self.build_chat(self.pages[0])
+        self.build_capabilities(self.pages[1])
+        self.build_settings(self.pages[2])
+        self.refresh_recent()
+        if self.recent_rows:
+            self.load_conversation(self.recent_rows[0][0])
+        else:
+            self.new_conversation()
+        self.refresh_capabilities()
+        self.select_page(0)
+        root.protocol('WM_DELETE_WINDOW', self.close)
+        root.report_callback_exception = self.callback_error
+        self.poll_id = root.after(60, self.poll)
+
+    def select_page(self, index):
+        for page in self.pages:
+            page.pack_forget()
+        self.pages[index].pack(fill='both', expand=True)
+        self.current_page = index
+        self.page_title.set(dict(self.recent_rows).get(self.session_id, '新的对话') if index == 0 else ['对话', '能力中心', '设置'][index])
+        if index == 0:
+            self.layout_chat()
+
+    def build_chat(self, page):
+        self.chat_stack = tk.Frame(page, bg=C['bg'])
+        self.hero = tk.Frame(self.chat_stack, bg=C['bg'])
+        label(self.hero, '✦', size=27, color=C['accent']).pack(pady=(0, 14))
+        label(self.hero, '有什么想一起完成？', size=26, bold=True).pack()
+        label(self.hero, '整理想法，读懂资料，或者写一段代码。', size=12, color=C['muted']).pack(pady=(12, 26))
+        suggestions = tk.Frame(self.hero, bg=C['bg'])
+        suggestions.pack(pady=(0, 20))
+        for title, prompt in [('整理思路', '帮我把下面的想法整理成清晰的计划：\n'),
+                              ('润色文字', '帮我润色下面这段文字，保留原来的意思：\n'),
+                              ('解释代码', '请解释下面的代码，并指出需要注意的地方：\n')]:
+            FlatButton(suggestions, title, lambda p=prompt: self.fill_prompt(p), variant='ghost', height=34, width=116, font_size=11).pack(side='left', padx=5)
+        self.transcript = tk.Text(self.chat_stack, bg=C['bg'], fg=C['text'], wrap='word', bd=0,
+             highlightthickness=0, padx=16, pady=16, font=(FONT, 12), spacing1=5, spacing3=12,
+             selectbackground=C['tint'], state='disabled', height=8)
+        self.transcript.tag_configure('user', font=(FONT, 12, 'bold'), foreground=C['text'], spacing1=20)
+        self.transcript.tag_configure('assistant', foreground=C['accent'], font=(FONT, 11, 'bold'), spacing1=20)
+        self.composer = RoundedFrame(self.chat_stack, radius=22, padding=(18, 14), border=C['line'])
+        self.composer.pack(fill='x')
+        self.input = tk.Text(self.composer.body, bg=C['surface'], fg=C['text'], font=(FONT, 13), height=4,
+            wrap='word', bd=0, highlightthickness=0, insertbackground=C['accent'], padx=3, pady=7, undo=True)
+        self.input.pack(fill='x')
+        self.placeholder = label(self.input, '说说你的想法，或添加一份资料…', size=13, color='#a0a198', cursor='xterm')
+        self.placeholder.place(x=4, y=8)
+        self.placeholder.bind('<Button-1>', lambda e: self.input.focus_set())
+        self.input.bind('<KeyRelease>', lambda e: self.update_placeholder())
+        self.input.bind('<FocusIn>', lambda e: self.update_placeholder())
+        self.input.bind('<FocusOut>', lambda e: self.update_placeholder())
+        self.input.bind('<Return>', self.enter_send)
+        self.input.bind('<Control-Return>', lambda e: (self.send_chat(), 'break')[-1])
+        tools = tk.Frame(self.composer.body, bg=C['surface'])
+        tools.pack(fill='x', pady=(10, 0))
+        self.add_button = FlatButton(tools, '+', self.attachment_menu, variant='ghost', width=34, height=34, font_size=20)
+        self.add_button.pack(side='left')
+        self.buttons.append(self.add_button)
+        self.model_button = FlatButton(tools, '选择模型', self.model_menu, variant='ghost', width=150, height=34, font_size=10)
+        self.model_button.pack(side='left', padx=(4, 0))
+        self.context_button = FlatButton(tools, self.context.get().split(' · ')[0] + ' ▾', self.context_menu,
+                                        variant='ghost', width=116, height=34, font_size=10)
+        self.context_button.pack(side='left')
+        self.skill_button = FlatButton(tools, get_skill(self.skill.get())['title'] + ' ▾', self.skill_menu,
+                                       variant='ghost', width=124, height=34, font_size=10)
+        self.skill_button.pack(side='left')
+        self.send_button = FlatButton(tools, '↑', self.send_or_stop, width=40, height=40, radius=20, font_size=20, variant='primary')
+        self.send_button.pack(side='right')
+        self.more_button = FlatButton(tools, '···', self.answer_menu, variant='ghost', width=40, height=34, font_size=18)
+        self.more_button.pack(side='right', padx=8)
+        self.hint_label = label(self.chat_stack, textvariable=self.chat_hint, size=10, color=C['muted'], wraplength=760)
+        self.hint_label.pack(pady=(12, 0))
+        self.setup_button = FlatButton(self.chat_stack, '下载模型或连接 API', lambda: self.show_capabilities('models'),
+                                      variant='accent', width=238, height=34, font_size=10)
+        page.bind('<Configure>', lambda e: self.layout_chat())
+
+    def update_placeholder(self):
+        if self.input.get('1.0', 'end').strip():
+            self.placeholder.place_forget()
+        else:
+            self.placeholder.place(x=4, y=8)
+
+    def layout_chat(self):
+        if not hasattr(self, 'chat_stack'):
+            return
+        width = max(450, min(850, self.pages[0].winfo_width()-64))
+        self.chat_stack.place_forget()
+        if self.history:
+            self.hero.pack_forget()
+            self.transcript.pack(fill='both', expand=True, before=self.composer, pady=(0, 10))
+            self.chat_stack.place(relx=.5, rely=0, anchor='n', width=width, relheight=.97)
+        else:
+            self.transcript.pack_forget()
+            self.hero.pack(fill='x', before=self.composer)
+            self.chat_stack.place(relx=.5, rely=.44, anchor='center', width=width)
+
+    def enter_send(self, event):
+        if event.state & 0x0001:
+            return None
+        self.send_chat()
+        return 'break'
+
+    def fill_prompt(self, text):
+        if self.busy:
+            return
+        self.input.delete('1.0', 'end')
+        self.input.insert('1.0', text)
+        self.update_placeholder()
+        self.input.focus_set()
+
+    def attachment_menu(self):
+        menu = tk.Menu(self.root, tearoff=0)
+        for title, action in [('添加文字资料', self.attach_text), ('添加图片', self.attach_image),
+                              ('选择 CSV 文件做统计', self.choose_skill_file), ('移除已选文件', self.clear_attachments),
+                              ('录音转成文字', self.attach_audio), ('画一张图', self.draw_image)]:
+            menu.add_command(label=title, command=lambda fn=action: (fn(), self.update_placeholder()))
+        menu.add_separator()
+        menu.add_checkbutton(label='工具任务：计算 / 训练摘要', variable=self.tool_mode, command=self.mode_changed)
+        menu.tk_popup(self.add_button.winfo_rootx(), self.add_button.winfo_rooty()+38)
+
+    def mode_changed(self):
+        if self.tool_mode.get():
+            self.skill.set('general')
+            self.sessions.set('client_skill', 'general')
+            self.skill_button.configure(text=get_skill('general')['title'] + ' ▾')
+        self.chat_hint.set('工具任务只支持计算和读取本项目训练摘要。其他问题会给出建议。' if self.tool_mode.get()
+                           else 'Enter 发送 · Shift + Enter 换行')
+        self.refresh_model_state()
+
+    def refresh_model_state(self):
+        if self.backend == 'api':
+            profile = self.api_settings.public()
+            self.model_state.set('联网 API · ' + profile['model'] if profile['key_available'] else '联网 API · 请填写密钥')
+            self.model_button.configure(text='API · 联网 ▾')
+            return
+        # Inspect an already-created runtime; never create/load one to display status.
+        import qwen_chat
+        instance = getattr(qwen_chat, '_runtime', None)
+        process = getattr(instance, '_process', None)
+        loaded = process is not None and process.poll() is None
+        self.model_state.set('模型运行中' if loaded else '已选模型 · 尚未加载' if self.selected_model else '未启用模型')
+        self.model_button.configure(text=model_name(self.manager.catalog, self.selected_model) if self.selected_model else '选择模型')
+
+    def model_menu(self):
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label=('✓ ' if self.backend == 'api' else '') + '联网 API · ' + self.api_settings.public()['model'], command=self.enable_api)
+        menu.add_command(label='配置 API 连接', command=self.show_api_settings)
+        menu.add_separator()
+        for spec in chat_models(self.manager.catalog):
+            identity = spec['id']
+            ready = self.manager.ready(identity)
+            title = ('✓ ' if self.backend == 'local' and identity == self.selected_model else '') + model_name(self.manager.catalog, identity)
+            menu.add_command(label=title + ('' if ready else ' · 未下载'),
+                command=(lambda i=identity: self.enable_model(i)) if ready else lambda: self.show_capabilities('models'))
+        menu.add_separator()
+        menu.add_command(label='查看全部模型与下载大小', command=lambda: self.show_capabilities('models'))
+        menu.tk_popup(self.model_button.winfo_rootx(), self.model_button.winfo_rooty()+36)
+
+    def show_api_settings(self):
+        self.select_page(2)
+        self.root.update_idletasks()
+        self.settings_area.canvas.yview_moveto(0)
+
+    def make_api_client(self):
+        from remote_api import APIClient
+        profile, key = self.api_settings.connection()
+        return APIClient(profile['base_url'], profile['model'], key,
+                         max_output_tokens=profile['max_output_tokens'],
+                         thinking=profile['thinking'] if profile['provider'] == 'deepseek' else None)
+
+    def enable_api(self):
+        if self.busy:
+            self.status.set('当前任务结束后再切换到 API。')
+            return
+        try:
+            self.make_api_client()  # Validate configuration only; no network request.
+        except Exception:
+            self.show_api_settings()
+            self.status.set('请先填写有效的 API 地址、模型名和密钥。你的输入已保留。')
+            return
+        from qwen_chat import shutdown
+        shutdown()
+        self.backend = 'api'
+        self.sessions.set('client_backend', 'api')
+        self.refresh_capabilities()
+        self.select_page(0)
+        from urllib.parse import urlsplit
+        host = urlsplit(self.api_settings.public()['base_url']).netloc
+        self.status.set('已选择联网 API。发送消息时，当前对话会发往 ' + host + '；服务商可能计费。')
+
+    def use_local_mode(self):
+        if self.busy:
+            self.status.set('当前任务结束后再切回本机。')
+            return
+        self.backend = 'local'
+        self.sessions.set('client_backend', 'local')
+        self.refresh_capabilities()
+        self.select_page(0)
+        self.status.set('已切回本机模式。选择已下载的模型后再发送，也可以直接使用本机小工具。')
+
+    def skill_menu(self):
+        menu = tk.Menu(self.root, tearoff=0)
+        for spec in skill_catalog():
+            menu.add_command(label=('✓ ' if self.skill.get() == spec['id'] else '') + spec['title'] +
+                             (' · 无需模型' if spec['kind'] == 'tool' else ''),
+                             command=lambda i=spec['id']: self.select_skill(i))
+        menu.add_separator()
+        menu.add_command(label='查看技能说明', command=lambda: self.show_capabilities('skills'))
+        menu.tk_popup(self.skill_button.winfo_rootx(), self.skill_button.winfo_rooty()+36)
+
+    def select_skill(self, identity):
+        if self.busy:
+            self.status.set('当前任务结束后再切换技能。')
+            return
+        spec = get_skill(identity)
+        self.skill.set(identity)
+        self.sessions.set('client_skill', identity)
+        self.tool_mode.set(False)
+        self.skill_button.configure(text=spec['title'] + ' ▾')
+        self.chat_hint.set(spec['input_hint'])
+        self.status.set(spec['description'])
+        self.refresh_capabilities()
+        self.select_page(0)
+
+    def choose_skill_file(self):
+        if self.busy:
+            return
+        path = filedialog.askopenfilename(parent=self.root, title='选择要统计的 CSV 文件', filetypes=[('CSV 表格', '*.csv')])
+        if path:
+            self.select_skill('csv_summary')
+            self.skill_file = str(Path(path).absolute())
+            self.chat_hint.set('已选择 ' + Path(path).name + ' · 点击发送开始统计，文件不会上传。')
+
+    def clear_attachments(self):
+        self.image_path = self.skill_file = None
+        self.chat_hint.set('已移除所选文件，输入内容仍保留。')
+
+    def enable_model(self, identity='text-default'):
+        if self.busy:
+            self.status.set('当前任务结束后再选择模型。')
+            return
+        if not is_chat_model(self.manager.catalog, identity):
+            self.status.set('请选择聊天模型，训练模型在独立训练端管理。')
+            return
+        if not self.manager.ready(identity):
+            self.show_capabilities('models')
+            self.status.set('请先下载推荐模型，下载完成后再点击“使用”。')
+            return
+        if self.selected_model != identity:
+            from qwen_chat import shutdown
+            shutdown()
+        self.selected_model = identity
+        self.backend = 'local'
+        self.sessions.set('client_backend', 'local')
+        self.sessions.set('client_model', self.selected_model)
+        self.refresh_capabilities()
+        self.select_page(0)
+        self.status.set('已选择 ' + model_name(self.manager.catalog, identity) + '。发送第一条消息时才加载，不会重复下载。')
+
+    def disable_model(self):
+        if self.busy:
+            self.status.set('请先停止当前任务，再停用模型。')
+            return
+        from qwen_chat import shutdown
+        shutdown()
+        self.selected_model = None
+        self.backend = 'local'
+        self.sessions.set('client_backend', 'local')
+        self.sessions.set('client_model', None)
+        self.refresh_capabilities()
+        self.status.set('已停用模型，文件仍保留，可以随时再次使用。')
+
+    def release_model(self):
+        if self.busy:
+            self.status.set('先停止当前任务，再释放模型。')
+            return
+        from qwen_chat import shutdown
+        shutdown()
+        self.refresh_model_state()
+        self.status.set('本机模型已释放，当前仍选择联网 API。' if self.backend == 'api'
+                        else '模型已释放。已选择的模型会在下次发送消息时加载。')
+
+    def answer_menu(self):
+        menu = tk.Menu(self.root, tearoff=0)
+        ready = 'normal' if self.last_answer and not self.busy else 'disabled'
+        for title, action in [('复制回答', self.copy_answer), ('保存回答', self.export_answer),
+                              ('读给我听', self.read_aloud), ('纠正这次回答', self.open_epistemology)]:
+            menu.add_command(label=title, command=action, state=ready)
+        if self.last_tool_result:
+            menu.add_command(label='查看实际执行记录', command=lambda: self.show_details('实际执行记录', self.last_tool_result))
+        menu.tk_popup(self.more_button.winfo_rootx(), self.more_button.winfo_rooty()+36)
+
+    def context_menu(self):
+        menu = tk.Menu(self.root, tearoff=0)
+        for value in CONTEXTS:
+            menu.add_radiobutton(label=value, variable=self.context, value=value, command=self.change_context)
+        menu.tk_popup(self.context_button.winfo_rootx(), self.context_button.winfo_rooty()+36)
+
+    def change_context(self, event=None):
+        super().change_context(event)
+        self.context_button.configure(text=self.context.get().split(' · ')[0] + ' ▾')
+
+    def refresh_recent(self):
+        self.recent_rows = self.sessions.recent()
+        if hasattr(self, 'page_title') and self.current_page == 0:
+            self.page_title.set(dict(self.recent_rows).get(self.session_id, '新的对话'))
+        for child in self.recent_area.body.winfo_children():
+            child.destroy()
+        if not self.recent_rows:
+            label(self.recent_area.body, '你的对话会出现在这里', size=10, color=C['muted']).pack(anchor='w', padx=14, pady=8)
+        for identity, title in self.recent_rows:
+            button = FlatButton(self.recent_area.body, title[:16], lambda i=identity: self.choose_session(i),
+                                variant='selected' if identity == self.session_id else 'ghost', anchor='w', height=40, font_size=10)
+            button.pack(fill='x', pady=2)
+        self.recent_area.bind_wheel(self.recent_area.body)
+
+    def new_conversation(self):
+        if self.busy:
+            self.status.set('先停止当前回答，再开始新的对话。')
+            return
+        self.load_conversation(None)
+        self.select_page(0)
+
+    def choose_session(self, identity):
+        if self.busy:
+            self.status.set('先停止当前回答，再切换对话。')
+            return
+        self.load_conversation(identity)
+        self.select_page(0)
+
+    def load_conversation(self, identity):
+        self.session_id = identity
+        self.history = self.sessions.messages(identity) if identity else []
+        self.last_episode = None
+        self.last_tool_result = None
+        self.last_answer = next((m['content'] for m in reversed(self.history) if m['role'] == 'assistant'), '')
+        self.input.delete('1.0', 'end')
+        self.image_path = None
+        self.skill_file = None
+        self.write(self.transcript, '')
+        for message in self.history:
+            self.append_heading('你' if message['role'] == 'user' else 'Free AI', message['role'])
+            self.write(self.transcript, message['content'] + '\n\n', True)
+        self.update_placeholder()
+        self.refresh_recent()
+        self.layout_chat()
+
+    def append_heading(self, text, role):
+        self.transcript.configure(state='normal')
+        self.transcript.insert('end', text + '\n', role)
+        self.transcript.configure(state='disabled')
+
+    def send_or_stop(self):
+        self.stop_generation() if self.busy else self.send_chat()
+
+    def send_chat(self):
+        if self.busy:
+            return
+        skill_id = self.skill.get()
+        skill = get_skill(skill_id)
+        direct_tool = skill['kind'] == 'tool'
+        use_api = self.backend == 'api' and not direct_tool
+        api_client = None
+        api_memory = False
+        skill_file = self.skill_file if skill_id == 'csv_summary' else None
+        message = self.input.get('1.0', 'end').strip()
+        if skill_id == 'csv_summary':
+            if not skill_file:
+                self.chat_hint.set('先点击 +，选择要统计的 CSV 文件，然后发送。')
+                return
+            message = ('统计 CSV 文件：' + Path(skill_file).name + '\n' + message).strip()
+        if not message:
+            return
+        if use_api:
+            try:
+                api_client = self.make_api_client()
+                api_memory = self.api_settings.public()['include_memory']
+            except Exception:
+                self.show_api_settings()
+                self.status.set('API 配置或密钥不可用，请重新填写。你的输入已保留。')
+                return
+        if not direct_tool and not use_api and not is_chat_model(self.manager.catalog, self.selected_model):
+            self.show_capabilities('models')
+            self.status.set('尚未选择模型。请查看推荐并点击“使用”；你的输入已保留。')
+            return
+        if not direct_tool and not use_api and not self.manager.ready(self.selected_model):
+            self.show_capabilities('models')
+            self.status.set('先准备文字能力；你的输入已保留。')
+            return
+        if self.image_path and (direct_tool or use_api or not self.manager.catalog[self.selected_model].get('supports_vision', False)):
+            self.chat_hint.set('本版 API 仅支持文字；当前技能或模型不支持这张图片。请切换本地看图模型，或在 + 菜单移除图片。输入仍保留。')
+            return
+        if self.tool_mode.get() and self.image_path:
+            self.chat_hint.set('图片问答请先在 + 菜单关闭“工具任务”。图片仍保留。')
+            return
+        if self.session_id is None:
+            self.session_id = self.sessions.create()
+        identity, history = self.session_id, list(self.history)
+        picture, context = self.image_path, CONTEXTS[self.context.get()]
+        tool_mode = self.tool_mode.get()
+        model_id = self.selected_model
+        self.pending_chat, self.streamed = identity, ''
+        self.last_episode, self.last_tool_result = None, None
+        self.sessions.append(identity, 'user', message)
+        self.history.append({'role': 'user', 'content': message})
+        self.append_heading('你', 'user')
+        self.write(self.transcript, message + '\n\n', True)
+        self.append_heading('Free AI', 'assistant')
+        self.input.delete('1.0', 'end')
+        self.image_path = None
+        self.skill_file = None
+        self.update_placeholder()
+        self.layout_chat()
+        self.refresh_recent()
+        self.chat_hint.set('正在准备回答…')
+        started = time.monotonic()
+        def token(value):
+            self.streamed += value
+            self.write(self.transcript, value, True)
+            self.chat_hint.set(f'正在回答 · {time.monotonic()-started:.1f} 秒')
+        def work():
+            if direct_tool:
+                result = execute_skill(skill_id, message, file_path=skill_file)
+                return {**result, 'tool_details': result}
+            from qwen_chat import chat
+            if tool_mode:
+                from agent_lab import run_agent
+                result = run_agent(message, api_memory if use_api else True, planner=lambda prompt: chat(prompt, use_memory=False,
+                    context=context, model_id=model_id, api_client=api_client, api_use_memory=False,
+                    cancel_event=self.generation_cancel), knowledge=self.knowledge)
+                answer = result.get('answer', result.get('observation', '工具未返回结果。'))
+                if not isinstance(answer, str):
+                    answer = json.dumps(answer, ensure_ascii=False, indent=2)
+                status = '已核验' if result.get('verified') else '工具执行完成，内容仍需检查' if result.get('tool_execution_verified') else '尚未核验'
+                return {**result, 'answer': answer + '\n\n' + status, 'tool_details': result}
+            return chat(message, history, memory_store=self.knowledge, return_details=True, context=context,
+                        image_path=picture, model_id=model_id, skill_id=skill_id, cancel_event=self.generation_cancel,
+                        api_client=api_client, api_use_memory=api_memory,
+                        on_token=lambda value: self.events.put(('update', token, value)))
+        def done(result):
+            self.last_episode, self.last_answer = result.get('episode_id'), result['answer']
+            self.last_tool_result = result.get('tool_details')
+            if not self.streamed:
+                self.write(self.transcript, self.last_answer, True)
+            self.write(self.transcript, '\n\n', True)
+            self.sessions.append(identity, 'assistant', self.last_answer)
+            self.history.append({'role': 'assistant', 'content': self.last_answer})
+            self.pending_chat = None
+            import qwen_chat
+            notice = (getattr(api_client, 'last_context_notice', '') if use_api else
+                      getattr(getattr(qwen_chat, '_runtime', None), 'last_context_notice', '')) if not direct_tool else result.get('verification_note', '')
+            self.chat_hint.set((notice + '  ·  ' if notice else '') + f'已保存 · {time.monotonic()-started:.1f} 秒')
+            self.refresh_model_state()
+        self.submit('正在执行本机技能' if direct_tool else '正在准备回答', work, done, cancellable=not direct_tool)
+
+    def open_epistemology(self):
+        if not self.last_episode:
+            self.status.set('这条回答暂时没有可关联的经验记录。新回答生成后可以反馈。')
+            return
+        correction = simpledialog.askstring('纠正这次回答', '写下哪里有误，以及正确的做法。\n反馈会保存在本机，训练端可以继续核实。', parent=self.root)
+        if correction:
+            try:
+                self.knowledge.feedback(self.last_episode, outcome='failure', correction=correction, evidence='用户在客户端反馈')
+                self.status.set('反馈已记录，可在训练端的经验改进中查看。')
+            except Exception as exc:
+                self.status.set(str(exc))
+
+    def draw_image(self):
+        if not self.manager.ready('image-model'):
+            self.select_page(1)
+            self.status.set('先在能力中心准备画图功能。')
+            return
+        prompt = simpledialog.askstring('画一张图', '描述想画的内容（英文更合适）。\n当前使用处理器画图，可随时停止。', parent=self.root)
+        if prompt:
+            from qwen_chat import runtime
+            self.submit('正在画图', lambda: runtime().generate_image(prompt, cancel_event=self.generation_cancel), self.image_finished, cancellable=True)
+
+    def image_finished(self, path):
+        self.status.set('图片已保存：' + str(path))
+        os.startfile(path)
+
+    def build_capabilities(self, page):
+        area = ScrollArea(page)
+        area.pack(fill='both', expand=True, padx=40, pady=(8, 16))
+        self.cap_area, self.cap_host = area, area.body
+        label(self.cap_host, '挑选模型和技能', size=24, bold=True).pack(anchor='w', pady=(8, 8))
+        label(self.cap_host, '模型按需下载，技能按任务切换。打开应用不会自动加载模型。', color=C['muted']).pack(anchor='w', pady=(0, 16))
+        tabs = tk.Frame(self.cap_host, bg=C['bg'])
+        tabs.pack(fill='x', pady=(0, 12))
+        self.cap_tabs = {}
+        for section, title in [('models', '聊天模型'), ('skills', '技能'), ('extensions', '扩展能力')]:
+            button = FlatButton(tabs, title, lambda s=section: self.show_capabilities(s), variant='ghost', width=120, height=36)
+            button.pack(side='left', padx=(0, 8))
+            self.cap_tabs[section] = button
+        self.cap_cards = tk.Frame(self.cap_host, bg=C['bg'])
+        self.cap_cards.pack(fill='x')
+        self.download_panel = RoundedFrame(self.cap_host, bg=C['side'], padding=16)
+        self.download_panel.pack(fill='x', pady=(12, 8))
+        label(self.download_panel.body, textvariable=self.download_status, size=11, wraplength=790, justify='left', anchor='w').pack(fill='x')
+        self.download_progress = ttk.Progressbar(self.download_panel.body, maximum=100)
+        self.download_progress.pack(fill='x', pady=(12, 8))
+        self.pause_button = FlatButton(self.download_panel.body, '暂停下载', self.download_cancel.set, variant='ghost', width=105, height=32, state='disabled', font_size=10)
+        self.pause_button.pack(anchor='e')
+        self.space = tk.StringVar()
+        label(self.cap_host, textvariable=self.space, size=10, color=C['muted'], wraplength=800, anchor='w', justify='left').pack(anchor='w', pady=(10, 16))
+
+    def show_capabilities(self, section='models'):
+        if section not in ('models', 'skills', 'extensions'):
+            raise ValueError('未知能力页面')
+        self.cap_section = section
+        self.refresh_capabilities()
+        self.select_page(1)
+        self.root.update_idletasks()
+        self.cap_area.canvas.yview_moveto(0)
+
+    def capability_card(self, title, description, detail=''):
+        card = RoundedFrame(self.cap_cards, padding=(18, 14), radius=16)
+        card.pack(fill='x', pady=5)
+        right = tk.Frame(card.body, bg=C['surface'])
+        right.pack(side='right', padx=(14, 0))
+        words = tk.Frame(card.body, bg=C['surface'])
+        words.pack(side='left', fill='x', expand=True)
+        label(words, title, size=13, bold=True, anchor='w', wraplength=470, justify='left').pack(anchor='w')
+        label(words, description, size=10, color=C['muted'], anchor='w', justify='left', wraplength=450).pack(anchor='w', pady=(5, 0))
+        if detail:
+            label(words, detail, size=10, color=C['muted'], anchor='w', justify='left', wraplength=450).pack(anchor='w', pady=(5, 0))
+        return right
+
+    def refresh_capabilities(self):
+        for widget in self.cap_cards.winfo_children():
+            widget.destroy()
+        self.package_rows = {row['id']: row for row in self.manager.list_packages()}
+        for section, button in self.cap_tabs.items():
+            button.configure(variant='selected' if section == self.cap_section else 'ghost')
+        if self.cap_section == 'skills':
+            label(self.cap_cards, '内置技能无需额外下载。AI 工作方式可使用本机模型或 API，本机小工具可以直接运行。',
+                  size=11, color=C['muted'], wraplength=800, justify='left').pack(anchor='w', pady=(0, 12))
+            for spec in skill_catalog():
+                right = self.capability_card(spec['title'], spec['description'],
+                    ('本机小工具 · 无需模型' if spec['kind'] == 'tool' else 'AI 工作方式 · 需要模型') + '\n' + spec['input_hint'])
+                chosen = self.skill.get() == spec['id']
+                FlatButton(right, '使用中' if chosen else '使用', lambda i=spec['id']: self.select_skill(i),
+                           variant='selected' if chosen else 'secondary', width=90, height=34).pack()
+        else:
+            if self.cap_section == 'models':
+                identities = [spec['id'] for spec in chat_models(self.manager.catalog)]
+                FlatButton(self.cap_cards, '不下载模型 · 配置 API 连接', self.show_api_settings,
+                           variant='accent', width=270, height=36).pack(anchor='w', pady=(0, 10))
+                label(self.cap_cards, '下载大小包含尚未安装的基础组件。内存建议按日常短对话估算，长对话会占用更多。',
+                      size=11, color=C['muted'], wraplength=800, justify='left').pack(anchor='w', pady=(0, 12))
+            else:
+                identities = ['engine-cuda', 'vision', 'speech-model', 'image-model']
+            for identity in identities:
+                row = self.package_rows[identity]
+                is_model = is_chat_model(self.manager.catalog, identity)
+                title = model_name(self.manager.catalog, identity) if is_model else row['title']
+                if identity == 'text-default':
+                    title += ' · 日常推荐'
+                detail = ''
+                if is_model:
+                    detail = '适合：' + '、'.join(row.get('use_cases', []))
+                    if row.get('recommended_ram_gb'):
+                        detail += f"\n内存建议 {row['recommended_ram_gb']} GB · 显卡加速建议 {row.get('recommended_vram_gb', '—')} GB 显存"
+                if identity == 'vision':
+                    detail = '当前看图扩展搭配 Qwen3.5 4B 使用；下载后需要选用它。'
+                right = self.capability_card(title, row['description'], detail)
+                chosen = self.backend == 'local' and self.selected_model == identity
+                state = ('已选用' if chosen else '已下载') if row['installed'] else '可继续下载' if row['status'] == 'paused' else size_text(row['download_size'])
+                label(right, state, size=10, color=C['success'] if row['installed'] else C['muted']).pack(pady=(0, 7))
+                actions = tk.Frame(right, bg=C['surface'])
+                actions.pack()
+                if row['installed']:
+                    if is_model:
+                        FlatButton(actions, '停用' if chosen else '使用', self.disable_model if chosen else lambda i=identity: self.enable_model(i),
+                                   variant='secondary', width=64, height=34, font_size=11).pack(side='left')
+                    FlatButton(actions, '管理', lambda i=identity: self.capability_menu(i), variant='ghost', width=65, height=34, font_size=11).pack(side='left')
+                else:
+                    FlatButton(actions, '继续' if row['status'] == 'paused' else '下载', lambda i=identity: self.start_download(i),
+                               variant='secondary', width=72, height=34, font_size=11, state='disabled' if self.downloading else 'normal').pack(side='left')
+                    FlatButton(actions, '详情', lambda i=identity: self.package_details(i), variant='ghost', width=60, height=34, font_size=11).pack(side='left')
+        self.cap_area.bind_wheel(self.cap_host)
+        disk_path = self.manager.root
+        while not disk_path.exists() and disk_path.parent != disk_path:
+            disk_path = disk_path.parent
+        try:
+            available = '可用 ' + size_text(shutil.disk_usage(disk_path).free)
+        except OSError:
+            available = '暂时无法读取剩余空间'
+        self.space.set('模型和扩展：' + str(self.manager.root) + '  ·  ' + available +
+                       '\n聊天和训练记录：' + str(ARTIFACTS))
+        if self.backend == 'api' or (self.selected_model and self.manager.ready(self.selected_model)):
+            self.setup_button.pack_forget()
+        else:
+            self.setup_button.pack(pady=(12, 0))
+        self.refresh_model_state()
+        self.layout_chat()
+
+    def package_details(self, identity):
+        row = self.package_rows[identity]
+        self.show_details('来源与说明', f"{row['title']}\n\n{row['description']}\n\n来源：{row['source']}\n"
+            f"许可：{row['license']}\n固定版本：{row['version']}\n" +
+            (f"量化文件：{row.get('quantized_source', row['source'])}\n" if is_chat_model(self.manager.catalog, identity) else '') +
+            '\n下载会校验完整性。模型目录中的配置建议不代表所有模型都已在本机实测。')
+
+    def capability_menu(self, identity):
+        row = self.package_rows[identity]
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label='检查完整性', command=lambda: self.submit('正在检查文件', lambda: self.manager.verify(identity), lambda value: self.status.set('完整性检查：' + str(value))))
+        menu.add_command(label='来源与许可', command=lambda: self.package_details(identity))
+        menu.add_separator()
+        menu.add_command(label='移除这项能力', command=lambda: self.remove_capability(identity))
+        menu.tk_popup(self.root.winfo_pointerx(), self.root.winfo_pointery())
+
+    def remove_capability(self, identity):
+        if self.busy or self.downloading:
+            self.status.set('当前任务结束后再移除能力。')
+            return
+        if not messagebox.askyesno('移除能力', '移除已下载的能力文件？聊天和经验都会保留。', parent=self.root):
+            return
+        try:
+            from qwen_chat import shutdown
+            shutdown()
+            from compute_guard import busy_reason
+            occupied = busy_reason()
+            if occupied:
+                self.status.set(occupied + ' 当前能力文件保持不变。')
+                return
+            self.manager.uninstall(identity)
+            if identity == self.selected_model:
+                self.selected_model = None
+                self.sessions.set('client_model', None)
+            self.refresh_capabilities()
+        except Exception as exc:
+            self.status.set(str(exc))
+
+    def start_download(self, identity):
+        self.select_page(1)
+        if self.downloading:
+            self.status.set('已有下载在进行，暂停或完成后可准备其他能力。')
+            return
+        self.downloading = identity
+        self.download_cancel.clear()
+        self.pause_button.configure(state='normal')
+        self.download_status.set('正在准备下载…')
+        self.refresh_capabilities()
+        def work():
+            try:
+                self.manager.install(identity, progress=lambda item: self.events.put(('update', self.download_event, item)), cancel_event=self.download_cancel)
+                message = '下载已完成。模型需点击“使用”才会启用；其他能力按你选择的任务运行。'
+            except Exception as exc:
+                message = '下载已暂停，文件已保留。' if self.download_cancel.is_set() else '下载未完成：' + str(exc)
+            self.events.put(('update', self.download_finished, message))
+        threading.Thread(target=work, daemon=True).start()
+
+    def download_finished(self, message):
+        self.downloading = None
+        self.download_status.set(message)
+        self.pause_button.configure(state='disabled')
+        self.refresh_capabilities()
+        self.status.set(message)
+
+    def build_settings(self, page):
+        from api_panel import APISettingsPanel
+        area = ScrollArea(page)
+        self.settings_area = area
+        area.pack(fill='both', expand=True, padx=40, pady=16)
+        label(area.body, '让使用更顺手', size=24, bold=True).pack(anchor='w', pady=(0, 24))
+        self.api_panel = APISettingsPanel(self, area.body)
+        for title, detail, actions in [
+            ('文件放在哪里', '聊天和训练记录：' + str(ARTIFACTS) + '\n模型和扩展：' + str(self.manager.root) +
+             '\n模型位置可在安装时选择；未另选时放在 FreeAI 文件夹内。',
+             [('打开记录文件夹', lambda: os.startfile(ARTIFACTS)), ('打开模型文件夹', self.open_model_folder), ('更改记录位置', self.choose_storage)]),
+            ('模型占用', '启动时不加载模型。释放内存会保留选择；停用模型会清除选择，文件仍保留。', [('释放模型', self.release_model), ('停用模型', self.disable_model)]),
+            ('独立训练端', '准备资料、训练、评估与经验改进，都在 Free AI Trainer 中完成。', [('打开训练端', self.open_training)]),
+            ('关于 Free AI', '2.3.1  ·  本地模型与联网 API 自由选择，技能随任务切换。', [('使用说明', lambda: os.startfile(ROOT / '使用说明.md'))])]:
+            card = RoundedFrame(area.body, padding=22)
+            card.pack(fill='x', pady=(0, 14))
+            label(card.body, title, size=14, bold=True).pack(anchor='w')
+            label(card.body, detail, size=11, color=C['muted'], wraplength=760, justify='left').pack(anchor='w', pady=(10, 12))
+            row = tk.Frame(card.body, bg=C['surface'])
+            row.pack(fill='x')
+            for text, action in actions:
+                FlatButton(row, text, action, variant='secondary', height=34, font_size=11).pack(side='left', padx=(0, 10))
+        area.bind_wheel(area.body)
+
+    def open_model_folder(self):
+        try:
+            self.manager.root.mkdir(parents=True, exist_ok=True)
+            os.startfile(self.manager.root)
+        except OSError:
+            self.status.set('暂时无法打开模型文件夹，请检查磁盘是否连接以及文件夹权限。')
+
+    def open_training(self):
+        if self.busy:
+            self.status.set('请先停止当前任务。')
+            return
+        self.release_model()
+        exe = ROOT / 'Free AI Trainer.exe'
+        command = [str(exe)] if exe.exists() else [str(Path(sys.executable).with_name('pythonw.exe')), '-E', '-s', '-B', '-X', 'utf8', str(ROOT / 'free_ai_bootstrap.py'), '--trainer']
+        self.training_process = subprocess.Popen(command, cwd=ROOT, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        self.status.set('已打开独立训练端。')
+
+    def submit(self, title, work, done, cancellable=False):
+        if self.busy:
+            return
+        self.busy, self.cancellable = True, cancellable
+        self.generation_cancel.clear()
+        self.status.set(title + '…')
+        self.send_button.configure(text='■' if cancellable else '…', state='normal' if cancellable else 'disabled')
+        if cancellable:
+            self.stop_task_button.pack(side='right')
+        for button in self.buttons:
+            button.configure(state='disabled')
+        def worker():
+            try:
+                self.events.put(('done', done, work()))
+            except Exception as exc:
+                logging.exception('Client task failed: %s', title)
+                self.events.put(('error', None, str(exc)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def poll(self):
+        try:
+            while True:
+                kind, handler, payload = self.events.get_nowait()
+                if kind == 'update':
+                    handler(payload)
+                    continue
+                self.busy = False
+                self.send_button.configure(text='↑', state='normal')
+                self.stop_task_button.pack_forget()
+                for button in self.buttons:
+                    button.configure(state='normal')
+                if kind == 'error':
+                    reason = '已停止，已有内容已保存。' if self.generation_cancel.is_set() else str(payload)
+                    self.status.set(reason)
+                    self.chat_hint.set(reason)
+                    if self.pending_chat:
+                        self.save_interrupted_answer(reason)
+                        self.write(self.transcript, '\n[' + reason + ']\n\n', True)
+                    self.refresh_model_state()
+                else:
+                    self.status.set('已完成')
+                    handler(payload)
+                self.update_placeholder()
+        except queue.Empty:
+            pass
+        self.poll_id = self.root.after(60, self.poll)
+
+    def close(self):
+        if self.busy:
+            self.generation_cancel.set()
+            self.status.set('正在停止，请稍候再关闭。')
+            return
+        self.download_cancel.set()
+        from qwen_chat import shutdown
+        shutdown()
+        self.root.after_cancel(self.poll_id)
+        self.root.destroy()
+
+
+def main():
+    ARTIFACTS.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(filename=ARTIFACTS / 'desktop.log', encoding='utf-8', level=logging.INFO)
+    root = tk.Tk()
+    ClientApp(root)
+    root.mainloop()
+
+
+if __name__ == '__main__':
+    main()

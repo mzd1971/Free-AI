@@ -1,0 +1,13 @@
+{
+  "run_dir": "C:\\Users\\32119\\.codex\\artifacts\\ai-learning\\outputs\\qwen-agent-lora-20260916-200054",
+  "baseline_validation_loss": 0.1328745516977325,
+  "best_validation_loss": 0.09517507120295897,
+  "best_epoch": 1,
+  "updates": 384,
+  "training_seconds": 484.3129999999983,
+  "total_seconds": 523.4369999999981,
+  "peak_allocated_gb": 1.4421701431274414,
+  "peak_reserved_gb": 1.744140625,
+  "test_count": 18,
+  "completed": true
+}

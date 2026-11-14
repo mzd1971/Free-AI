@@ -1,0 +1,23 @@
+{
+  "baseline_validation_loss": 5.420820404743326,
+  "epochs": [
+    {
+      "epoch": 1,
+      "updates": 16,
+      "train_loss": 4.435480181127787,
+      "validation_loss": 4.643071510668459
+    },
+    {
+      "epoch": 2,
+      "updates": 32,
+      "train_loss": 3.900337155908346,
+      "validation_loss": 4.383395899472566
+    },
+    {
+      "epoch": 3,
+      "updates": 48,
+      "train_loss": 3.649216290563345,
+      "validation_loss": 4.266875789597116
+    }
+  ]
+}
