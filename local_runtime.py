@@ -184,9 +184,10 @@ class LocalRuntime:
     def _validate_context(context, spec=None):
         if isinstance(context, bool) or context not in CONTEXT_CHOICES:
             raise ValueError('请选择日常聊天或长文档档位（最多 32K 上下文）。')
-        if spec is not None and context > spec['max_context']:
+        max_context = spec.get('max_context') if spec is not None else None
+        if max_context and context > max_context:
             name = spec.get('short_name') or spec.get('title') or spec['id']
-            capacity = f'{spec["max_context"] // 1024}K'
+            capacity = f'{max_context // 1024}K' if max_context % 1024 == 0 else str(max_context)
             raise ValueError(f'{name}最多支持 {capacity} 的对话容量，请选择较短的档位。')
         return int(context)
 

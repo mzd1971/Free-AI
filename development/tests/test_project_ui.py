@@ -21,9 +21,11 @@ class FixtureModel:
         self.calls = list(calls)
         self.final = final
         self.requests = []
+        self.tool_names = []
 
     def complete_tools(self, messages, tools, **kwargs):
         self.requests.append(json.loads(json.dumps(messages)))
+        self.tool_names.append({tool['function']['name'] for tool in tools})
         if not self.calls:
             return {'role': 'assistant', 'content': self.final, 'tool_calls': []}
         name, arguments = self.calls.pop(0)
@@ -114,7 +116,13 @@ class NativeProjectScenario(unittest.TestCase):
             self.assertTrue(app.project.permissions_button.winfo_manager())
             self.assertFalse(app.project.location.winfo_manager())
             permissions = app.project.permissions_menu
-            for option, key in [(0, 'allow_write'), (1, 'use_memory')]:
+            self.assertEqual(app.project.permissions_button.cget('text'), '逐条确认命令 ▾')
+            with patch.object(app, 'open_project_in_editor') as editor, patch.object(app, 'open_project_terminal') as terminal:
+                permissions.invoke('在编辑器中打开项目')
+                permissions.invoke('在终端中打开项目')
+                editor.assert_called_once_with(str(workspace))
+                terminal.assert_called_once_with(str(workspace))
+            for option, key in [('允许文件工具修改', 'allow_write'), ('参考经验', 'use_memory')]:
                 initial = app.sessions.project_settings(identity)[key]
                 permissions.invoke(option)
                 self.assertEqual(app.sessions.project_settings(identity)[key], not initial)
@@ -124,7 +132,7 @@ class NativeProjectScenario(unittest.TestCase):
             model = FixtureModel([
                 ('read_file', {'path': 'value.py'}),
                 ('replace_text', {'path': 'value.py', 'old': 'value = 1', 'new': 'value = 2'}),
-                ('run_command', {'argv': command, 'timeout': 25}),
+                ('run_command', {'argv': command, 'timeout': 25, 'purpose': 'check'}),
             ])
             with patch.object(app.manager, 'ready', return_value=True), patch(
                     'local_project_model.LocalProjectModel', return_value=model) as local:
@@ -136,6 +144,7 @@ class NativeProjectScenario(unittest.TestCase):
             self.assertEqual(card.result['status'], 'completed', card.result)
             self.assertEqual(source.read_text(), 'value = 2\n')
             self.assertIn('CHECK_OK', card.activity)
+            self.assertIn('验证 · 已通过', card.progress.cget('text'))
             self.assertTrue(Path(card.result['run_dir'], 'result.json').is_file())
             self.assertEqual(card.assistant_index, 3)
             self.assertIn('CHECK_OK', app.sessions.project_runs(identity)[0]['activity'])
@@ -144,6 +153,21 @@ class NativeProjectScenario(unittest.TestCase):
             self.assertTrue(card.expanded)
             self.assertTrue(card.tools.winfo_manager())
             self.assertIn('CHECK_OK', card.detail.get('1.0', 'end-1c'))
+            source.write_bytes(b'value = 101\n')
+            card.review_button.invoke()
+            self.assertTrue(card.review_box.winfo_manager())
+            self.assertFalse(card.detail.winfo_manager())
+            diff = card.review_text.get('1.0', 'end-1c')
+            self.assertIn('value.py', diff)
+            self.assertIn('-value = 1\n+value = 2\n', diff)
+            self.assertNotIn('101', diff)
+            self.assertTrue(card.review_text.tag_ranges('added'))
+            self.assertTrue(card.review_text.tag_ranges('removed'))
+            self.assertEqual(source.read_bytes(), b'value = 101\n')
+            source.write_bytes(b'value = 2\n')
+            card.review_button.invoke()
+            self.assertFalse(card.review_box.winfo_manager())
+            self.assertTrue(card.detail.winfo_manager())
             card.toggle()
             self.assertFalse(card.expanded)
             self.assertFalse(card.detail.winfo_manager())
@@ -184,6 +208,7 @@ class NativeProjectScenario(unittest.TestCase):
                 app.project.undo(restored)
                 self.assertEqual(source.read_text(), 'value = 1\n')
                 self.assertIn('[已撤回文件修改]', restored.activity)
+                self.assertIn('需要重新验证', restored.progress.cget('text'))
                 annotated = app.history[3]['content']
                 self.assertTrue(annotated.startswith('检查完成\n\n'))
                 self.assertIn('用户已执行文件撤回。已恢复文件：value.py。', annotated)
@@ -191,10 +216,14 @@ class NativeProjectScenario(unittest.TestCase):
                 self.assertEqual(app.sessions.messages(identity)[3]['content'], annotated)
                 self.assertEqual(app.last_answer, '后续说明完成')
                 self.assertEqual(len(app.history), 6)
+                restored.review_button.invoke()
+                self.assertIn('-value = 1\n+value = 2\n', restored.review_text.get('1.0', 'end-1c'))
+                self.assertEqual(source.read_bytes(), b'value = 1\n')
                 app.new_conversation()
                 app.load_conversation(identity)
                 restored = app.project.cards[0]
                 self.assertIn('[已撤回文件修改]', restored.activity)
+                self.assertIn('需要重新验证', restored.progress.cget('text'))
                 self.assertEqual(restored.undo_button.button_state, 'disabled')
                 self.assertEqual(app.history[3]['content'], annotated)
 
@@ -204,6 +233,9 @@ class NativeProjectScenario(unittest.TestCase):
                     'local_project_model.LocalProjectModel', return_value=stopped_model):
                 app.send_chat()
                 waiting = settle(app, wait_for_approval=True)
+                self.assertEqual(waiting.request['details']['permission_mode'], 'standard')
+                self.assertFalse(app.project.set_permission_mode('automatic'))
+                self.assertEqual(app.project.permission_mode.get(), 'standard')
                 app.stop_generation()
                 settle(app)
             self.assertFalse(child_marker.exists())
@@ -270,7 +302,7 @@ class NativeProjectScenario(unittest.TestCase):
             draft(app, '模拟结束阶段数据库故障')
             with patch.object(app.manager, 'ready', return_value=True), patch(
                     'local_project_model.LocalProjectModel', return_value=FixtureModel()), patch.object(
-                    app.sessions, '_write_project_run', side_effect=OSError('fixture write failure')):
+                    app.sessions, '_write_project_run', side_effect=OSError('fixture write failure')), self.assertLogs():
                 app.send_chat()
                 settle(app)
             failed_id = app.session_id
@@ -290,6 +322,142 @@ class NativeProjectScenario(unittest.TestCase):
                 app.send_chat()
                 settle(app)
             self.assertEqual(unsaved_followup.requests[0][2]['content'], original_workspace_note + '检查完成')
+
+            app.new_conversation()
+            app.open_project_assistant()
+            with patch('project_chat.filedialog.askdirectory', return_value=str(workspace)):
+                app.project.choose_workspace()
+            retry_command = [sys.executable, '-B', '-c', 'print("RECOVERY_CHECK_OK")']
+            interrupted_model = FixtureModel([
+                ('update_plan', {'steps': [{'text': '运行本地检查', 'status': 'in_progress'}]}),
+                ('run_command', {'argv': retry_command, 'purpose': 'check'}),
+            ])
+            draft(app, '运行检查并记录结果')
+            with patch.object(app.manager, 'ready', return_value=True), patch(
+                    'local_project_model.LocalProjectModel', return_value=interrupted_model):
+                app.send_chat()
+                interrupted = settle(app, wait_for_approval=True)
+                recovery_id = app.session_id
+                checkpoint = app.sessions.project_runs(recovery_id)[0]
+                self.assertEqual(checkpoint['assistant_index'], 1)
+                self.assertEqual(checkpoint['result']['status'], 'running')
+                self.assertEqual(len(app.sessions.messages(recovery_id)), 2)
+                self.assertIn('计划进度 0/1', interrupted.progress.cget('text'))
+                self.assertIn('尚未验证', interrupted.progress.cget('text'))
+                self.assertTrue(checkpoint['result']['run_dir'])
+                app.stop_generation()
+                settle(app)
+            self.assertEqual(interrupted.result['status'], 'stopped')
+            self.assertTrue(interrupted.resume_button.winfo_manager())
+
+            # Reopen the last committed checkpoint as if the app closed before the run could finish.
+            app.sessions.update_project_reply(recovery_id, 1, checkpoint['result'], str(workspace), checkpoint['activity'])
+            app.new_conversation()
+            with patch('local_project_model.LocalProjectModel', side_effect=AssertionError('restoring ran a task')):
+                app.load_conversation(recovery_id)
+            recovered = app.project.cards[0]
+            self.assertEqual(recovered.result['status'], 'interrupted')
+            self.assertIn('上次任务中断', recovered.status.get())
+            self.assertIn('运行本地检查', recovered.progress.cget('text'))
+            self.assertTrue(recovered.resume_button.winfo_manager())
+            self.assertEqual(app.history, app.sessions.messages(recovery_id))
+            self.assertEqual(len(app.history), 2)
+
+            resume_draft = '继续，检查前先查看当前工作区'
+            draft(app, resume_draft)
+            app.project.workspace.set(str(alternate))
+            app.project.resume(recovered)
+            self.assertFalse(app.busy)
+            self.assertIn('原来的项目文件夹', app.status.get())
+            self.assertEqual(app.input.get('1.0', 'end-1c'), resume_draft)
+            app.project.workspace.set(str(workspace))
+            resumed_model = FixtureModel([('run_command', {'argv': retry_command, 'purpose': 'check'})])
+            with patch.object(app.manager, 'ready', return_value=True), patch(
+                    'local_project_model.LocalProjectModel', return_value=resumed_model):
+                app.project.resume(recovered)
+                resumed = settle(app, wait_for_approval=True)
+                self.assertNotIn('RECOVERY_CHECK_OK', resumed.activity)
+                self.assertEqual(recovered.resume_button.button_state, 'disabled')
+                resumed.decide(True)
+                settle(app)
+            self.assertIn('RECOVERY_CHECK_OK', resumed.activity)
+            self.assertNotEqual(resumed.result['run_dir'], checkpoint['result']['run_dir'])
+            self.assertIn('验证 · 已通过', resumed.progress.cget('text'))
+            self.assertEqual(app.history[2]['content'], resume_draft)
+            self.assertEqual(app.history, app.sessions.messages(recovery_id))
+            self.assertEqual([row['assistant_index'] for row in app.sessions.project_runs(recovery_id)], [1, 3])
+
+            legacy_id = app.sessions.create()
+            app.sessions.set_project_settings(legacy_id, {'enabled': True, 'workspace': str(workspace),
+                                                           'allow_write': False})
+            app.load_conversation(legacy_id)
+            self.assertEqual(app.project.permission_mode.get(), 'readonly')
+            self.assertEqual(app.project.permissions_button.cget('text'), '只看项目 ▾')
+            self.assertEqual(permissions.entrycget('允许文件工具修改', 'state'), 'disabled')
+            self.assertIn('文件修改和命令执行关闭', app.chat_hint.get())
+            readonly_model = FixtureModel([
+                ('read_file', {'path': 'value.py'}),
+                ('write_file', {'path': 'must-not-write.py', 'content': 'value = 0\n'}),
+                ('run_command', {'argv': cancelled_command}),
+            ])
+            draft(app, '查看项目文件')
+            with patch.object(app.manager, 'ready', return_value=True), patch(
+                    'local_project_model.LocalProjectModel', return_value=readonly_model), patch(
+                    'project_chat.ActivityCard.show_approval') as approval:
+                app.send_chat()
+                settle(app)
+                approval.assert_not_called()
+            self.assertFalse(child_marker.exists())
+            self.assertFalse((workspace / 'must-not-write.py').exists())
+            self.assertIn('read_file', readonly_model.tool_names[0])
+            self.assertFalse({'write_file', 'replace_text', 'run_command'} & readonly_model.tool_names[0])
+            self.assertEqual(app.project.cards[-1].result['permission_mode'], 'readonly')
+
+            permissions.invoke('自动执行命令')
+            self.assertEqual(app.project.permission_mode.get(), 'automatic')
+            self.assertEqual(app.project.permissions_button.cget('text'), '自动执行命令 ▾')
+            self.assertIn('可访问项目目录之外的文件和网络', app.chat_hint.get())
+            app.new_conversation()
+            self.assertEqual(app.project.permission_mode.get(), 'standard')
+            app.load_conversation(legacy_id)
+            self.assertEqual(app.project.permission_mode.get(), 'automatic')
+            with patch('project_chat.filedialog.askdirectory', return_value=str(workspace)):
+                app.project.choose_workspace()
+            self.assertEqual(app.project.permission_mode.get(), 'automatic')
+            auto_model = FixtureModel([('run_command', {'argv': [sys.executable, '-B', '-c', 'print("AUTO_OK")']})])
+            draft(app, '运行一条本地测试命令')
+            with patch.object(app.manager, 'ready', return_value=True), patch(
+                    'local_project_model.LocalProjectModel', return_value=auto_model), patch(
+                    'project_chat.ActivityCard.show_approval') as approval:
+                app.send_chat()
+                settle(app)
+                approval.assert_not_called()
+            automatic = app.project.cards[-1]
+            self.assertEqual(automatic.result['permission_mode'], 'automatic')
+            self.assertIn('自动运行命令', automatic.activity)
+            self.assertIn('AUTO_OK', automatic.activity)
+            self.assertIn('自动执行命令', automatic.progress.cget('text'))
+            self.assertEqual(app.sessions.project_runs(legacy_id)[-1]['result']['permission_mode'], 'automatic')
+            with patch('project_chat.filedialog.askdirectory', return_value=str(alternate)):
+                app.project.choose_workspace()
+            self.assertEqual(app.project.permission_mode.get(), 'standard')
+            self.assertEqual(app.sessions.project_settings(legacy_id)['permission_mode'], 'standard')
+
+            app.load_conversation(recovery_id)
+            recovered = app.project.cards[0]
+            self.assertEqual(recovered.result['permission_mode'], 'standard')
+            self.assertTrue(app.project.set_permission_mode('readonly'))
+            restart_model = FixtureModel([('run_command', {'argv': cancelled_command})])
+            with patch.object(app.manager, 'ready', return_value=True), patch(
+                    'local_project_model.LocalProjectModel', return_value=restart_model), patch(
+                    'project_chat.ActivityCard.show_approval') as approval:
+                app.project.resume(recovered)
+                settle(app)
+                approval.assert_not_called()
+            self.assertFalse(child_marker.exists())
+            restarted = app.project.cards[-1]
+            self.assertEqual(restarted.result['permission_mode'], 'readonly')
+            self.assertEqual(restarted.result['task_state']['parent_run'], Path(recovered.result['run_dir']).name)
 
             def broken_update(_):
                 raise RuntimeError('fixture Tk callback failure')

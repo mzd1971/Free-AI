@@ -24,7 +24,7 @@ class ScriptedModel:
         self.turns = list(turns)
         self.calls = []
         self._api_key = 'project-test-model-key'
-        self.expected_tools = {'list_files', 'read_file', 'write_file', 'replace_text', 'run_command', 'update_plan'}
+        self.expected_tools = {'list_files', 'search_text', 'read_file', 'write_file', 'replace_text', 'run_command', 'update_plan'}
 
     def complete_tools(self, messages, tools, *, cancel_event, context):
         self.calls.append(messages[:])
@@ -295,7 +295,8 @@ class ProjectAgentTests(unittest.TestCase):
     def test_rollback_conflicts_and_tampered_manifest(self):
         source = self.project / 'file.txt'
         source.write_text('original')
-        result = self.start([('write_file', {'path': 'file.txt', 'content': 'edited'})], '结束。')
+        result = self.start([('read_file', {'path': 'file.txt'})],
+                            [('write_file', {'path': 'file.txt', 'content': 'edited'})], '结束。')
         run_dir = Path(result['run_dir'])
         source.write_text('new user edit')
         self.assertEqual(rollback_run(run_dir, self.project), {'restored': [], 'conflicts': ['file.txt']})
@@ -435,7 +436,7 @@ class ProjectAgentTests(unittest.TestCase):
         ]
         result = self.start(
             [('write_file', {'path': 'new.txt', 'content': 'x' * 2100})],
-            '完成。', history=history, context=8192,
+            '完成。', history=history, context=10240,
         )
         self.assertEqual(result['status'], 'completed')
         first, second = self.model.calls

@@ -14,8 +14,8 @@ def latest_stage(test):
     if not report.exists():
         test.skipTest('Run build_lite.ps1 -PrepareOnly first.')
     build = json.loads(report.read_text(encoding='utf-8-sig'))
-    if build['version'] != '2.4.2':
-        test.skipTest('Prepare the 2.4.2 payload first.')
+    if build['version'] != '2.8.0':
+        test.skipTest('Prepare the 2.8.0 payload first.')
     return build, Path(build['stage'])
 
 
@@ -26,7 +26,7 @@ class PackagingTests(unittest.TestCase):
         self.assertNotIn('[InstallDelete]', source)
         self.assertNotIn('[UninstallDelete]', source)
         self.assertIn('PrivilegesRequired=lowest', source)
-        self.assertIn('#define AppVersion "2.4.2"', source)
+        self.assertIn('#define AppVersion "2.8.0"', source)
         self.assertIn('SaveStringsToUTF8File', source)
         self.assertIn('LoadStringsFromFile', source)
         self.assertIn('{param:MODELDIR|}', source)
@@ -39,7 +39,9 @@ class PackagingTests(unittest.TestCase):
         self.assertTrue(report['excludes_model_location'])
         for name in ('Free AI.exe', 'Free AI Trainer.exe', 'api_panel.py', 'api_settings.py',
                      'remote_api.py', 'app_skills.py', 'model_catalog.py', 'paths.py',
+                     'client_settings.py', 'coding_tools.py', 'ui_preferences.py', 'hf_models.py', 'hf_model_panel.py', 'hf_datasets.py', 'hf_dataset_panel.py', 'hf_dataset_catalog.py',
                      'project_agent.py', 'project_chat.py', 'local_project_model.py',
+                     'agent_workspace.py', 'agent_task_state.py', 'agent_review.py',
                      'agent_memory.py', 'memory_learning.py', 'memory_panel.py',
                      'assets/free-ai.ico', 'assets/free-ai-ui.png',
                      'runtime/python/Lib/venv/__init__.py', 'runtime/python/Lib/ensurepip/__init__.py'):

@@ -21,7 +21,8 @@ from api_settings import APISettings
 from desktop_app import DesktopApp as ExistingActions, size_text
 from epistemology import KnowledgeStore
 from paths import ROOT, ARTIFACTS
-from ui_kit import COLORS as C, CLIENT_SKINS, FONT, FlatButton, RoundedFrame, ScrollArea, label, setup_theme
+from ui_kit import COLORS as C, CLIENT_SKINS, FONT, FlatButton, RoundedFrame, ScrollArea, label, setup_theme, ui_font, set_text_size, text_scale
+from ui_preferences import TEXT_SIZES, load_text_size, save_text_size
 
 
 class ClientApp(ExistingActions):
@@ -32,7 +33,7 @@ class ClientApp(ExistingActions):
         self.theme = self.sessions.get('client_theme', 'cyberpunk')
         if self.theme not in CLIENT_SKINS.values():
             self.theme = 'cyberpunk'
-        setup_theme(root, 'Free AI', (1440, 900), theme=self.theme)
+        setup_theme(root, 'Free AI', (1440, 900), theme=self.theme, text_size=load_text_size())
         self.events, self.buttons = queue.Queue(), []
         self.busy, self.cancellable, self.downloading = False, False, None
         self.generation_cancel, self.download_cancel = threading.Event(), threading.Event()
@@ -89,7 +90,7 @@ class ClientApp(ExistingActions):
         bottom = tk.Frame(self.sidebar, bg=C['side'])
         bottom.pack(side='bottom', fill='x', padx=14, pady=18)
         FlatButton(bottom, '设置', lambda: self.select_page(2), variant='ghost', anchor='w', height=36).pack(fill='x')
-        label(bottom, 'Free AI  /  2.4.2', size=10, color=C['muted']).pack(anchor='w', padx=16, pady=(8, 0))
+        label(bottom, 'Free AI  /  2.8.0', size=10, color=C['muted']).pack(anchor='w', padx=16, pady=(8, 0))
         self.recent_area = ScrollArea(self.sidebar, bg=C['side'])
         self.recent_area.pack(fill='both', expand=True, padx=14)
         main = self.main = tk.Frame(root, bg=C['bg'])
@@ -111,7 +112,9 @@ class ClientApp(ExistingActions):
             circuit.bind('<Configure>', lambda event: paint_circuit(event.widget))
         self.footer = tk.Frame(main, bg=C['bg'])
         self.footer.pack(side='bottom', fill='x', padx=24, pady=(2, 7))
-        label(self.footer, textvariable=self.status, size=10, color=C['muted'], anchor='w', wraplength=740).pack(side='left', fill='x', expand=True)
+        footer_notice = label(self.footer, textvariable=self.status, size=10, color=C['muted'], anchor='w', justify='left')
+        footer_notice.pack(side='left', fill='x', expand=True)
+        footer_notice.bind('<Configure>', lambda event: footer_notice.configure(wraplength=max(80, event.width)))
         self.stop_task_button = FlatButton(self.footer, '停止', self.stop_generation, variant='ghost', width=60, height=28)
         self.progress = ttk.Progressbar(main, mode='indeterminate', length=30)
         self.host = tk.Frame(main, bg=C['bg'])
@@ -132,11 +135,18 @@ class ClientApp(ExistingActions):
             self.new_conversation()
         self.refresh_capabilities()
         self.select_page(0)
+        self.apply_text_layout()
+        root.bind('<<FreeAITextSizeChanged>>', lambda event: self.apply_text_layout(), add='+')
         root.protocol('WM_DELETE_WINDOW', self.close)
         root.report_callback_exception = self.callback_error
         self.poll_id = root.after(60, self.poll)
 
     def select_page(self, index):
+        if index == 2 and self.current_page != 2:
+            self._sidebar_before_settings = bool(self.sidebar.winfo_manager())
+            self.sidebar.pack_forget()
+        elif index != 2 and self.current_page == 2 and getattr(self, '_sidebar_before_settings', False):
+            self.sidebar.pack(side='left', fill='y', before=self.main)
         for page in self.pages:
             page.pack_forget()
         self.pages[index].pack(fill='both', expand=True)
@@ -144,6 +154,8 @@ class ClientApp(ExistingActions):
         self.page_title.set(dict(self.recent_rows).get(self.session_id, '新的对话') if index == 0 else ['对话', '能力中心', '设置'][index])
         if index == 0:
             self.layout_chat()
+        elif index == 2 and hasattr(self, 'settings_panel'):
+            self.settings_panel.sync_busy()
 
     def build_chat(self, page):
         self.show_project_details = True
@@ -162,7 +174,8 @@ class ClientApp(ExistingActions):
             grid.bind('<Configure>', draw_grid)
         self.hero_content = tk.Frame(self.hero, bg=C['bg'])
         self.hero_content.place(relx=.5, rely=.46, anchor='center')
-        label(self.hero_content, '一起完成下一件事', size=25, bold=True).pack()
+        self.hero_title = label(self.hero_content, '一起完成下一件事', size=28, bold=True, wraplength=650, justify='center')
+        self.hero_title.pack()
         label(self.hero_content, '聊想法，写代码，让项目向前一步。', size=12, color=C['muted']).pack(pady=(12, 22))
         suggestions = tk.Frame(self.hero_content, bg=C['bg'])
         suggestions.pack(pady=(0, 20))
@@ -170,21 +183,27 @@ class ClientApp(ExistingActions):
                               ('润色文字', '帮我润色下面这段文字，保留原来的意思：\n'),
                               ('解释代码', '请解释下面的代码，并指出需要注意的地方：\n')]:
             FlatButton(suggestions, title, lambda p=prompt: self.fill_prompt(p), variant='ghost', height=34, width=116, font_size=11).pack(side='left', padx=5)
-        self.transcript = tk.Text(self.chat_stack, bg=C['bg'], fg=C['text'], wrap='word', bd=0,
-             highlightthickness=0, padx=12, pady=10, font=(FONT, 12), spacing1=2, spacing3=5,
+        self.transcript_area = tk.Frame(self.chat_stack, bg=C['bg'])
+        transcript_scroll = ttk.Scrollbar(self.transcript_area, orient='vertical')
+        transcript_scroll.pack(side='right', fill='y')
+        self.transcript = tk.Text(self.transcript_area, bg=C['bg'], fg=C['text'], wrap='word', bd=0,
+             highlightthickness=0, padx=12, pady=14, font=ui_font(self.root, 14), spacing1=3, spacing3=8,
              selectbackground=C['selection_bg'], selectforeground=C['selection_fg'], state='disabled', height=8)
-        self.transcript.tag_configure('user', font=(FONT, 12, 'bold'), foreground=C['text'], spacing1=14)
-        self.transcript.tag_configure('assistant', foreground=C.get('secondary', C['muted']), font=(FONT, 11), spacing1=14)
+        self.transcript.pack(side='left', fill='both', expand=True)
+        self.transcript.configure(yscrollcommand=transcript_scroll.set)
+        transcript_scroll.configure(command=self.transcript.yview)
+        self.transcript.tag_configure('user', font=ui_font(self.root, 14, bold=True), foreground=C['text'], spacing1=18)
+        self.transcript.tag_configure('assistant', foreground=C.get('secondary', C['muted']), font=ui_font(self.root, 12), spacing1=18)
         self.transcript.tag_configure('md_marker', elide=True)
-        self.transcript.tag_configure('md_heading', font=(FONT, 14, 'bold'), spacing1=8, spacing3=3)
-        self.transcript.tag_configure('md_bold', font=(FONT, 12, 'bold'))
-        self.transcript.tag_configure('md_code', font=('Consolas', 11), background=C['surface'], spacing1=0, spacing3=0)
+        self.transcript.tag_configure('md_heading', font=ui_font(self.root, 17, bold=True), spacing1=12, spacing3=6)
+        self.transcript.tag_configure('md_bold', font=ui_font(self.root, 14, bold=True))
+        self.transcript.tag_configure('md_code', font=ui_font(self.root, 12, family='Consolas'), background=C['surface'], spacing1=2, spacing3=2)
         self.composer = RoundedFrame(self.chat_stack, bg=C['input'], radius=20, padding=(14, 10), border=C['line'])
         self.composer.pack(fill='x')
-        self.input = tk.Text(self.composer.body, bg=C['input'], fg=C['text'], font=(FONT, 13), height=2,
+        self.input = tk.Text(self.composer.body, bg=C['input'], fg=C['text'], font=ui_font(self.root, 14), height=3,
             wrap='word', bd=0, highlightthickness=0, insertbackground=C['accent'], padx=3, pady=7, undo=True)
         self.input.pack(fill='x')
-        self.placeholder = label(self.input, '输入需求，让 Free AI 帮你完成…', size=13, color=C['muted'], cursor='xterm')
+        self.placeholder = label(self.input, '输入需求，让 Free AI 帮你完成…', size=14, color=C['muted'], cursor='xterm')
         self.placeholder.place(x=4, y=8)
         self.placeholder.bind('<Button-1>', lambda e: self.input.focus_set())
         self.input.bind('<KeyRelease>', lambda e: self.update_placeholder())
@@ -192,12 +211,12 @@ class ClientApp(ExistingActions):
         self.input.bind('<FocusOut>', lambda e: self.update_placeholder())
         self.input.bind('<Return>', self.enter_send)
         self.input.bind('<Control-Return>', lambda e: (self.send_chat(), 'break')[-1])
-        tools = tk.Frame(self.composer.body, bg=C['input'])
+        tools = self.composer_tools = tk.Frame(self.composer.body, bg=C['input'])
         tools.pack(fill='x', pady=(5, 0))
         self.add_button = FlatButton(tools, '+', self.attachment_menu, variant='ghost', width=34, height=34, font_size=20)
         self.add_button.pack(side='left')
         self.buttons.append(self.add_button)
-        self.model_button = FlatButton(tools, '选择模型', self.model_menu, variant='ghost', width=140, height=34, font_size=10)
+        self.model_button = FlatButton(tools, '选择模型', self.model_menu, variant='ghost', width=140, max_width=220, height=34, font_size=10)
         self.model_button.pack(side='left', padx=(4, 0))
         self.context_button = FlatButton(tools, self.context.get().split(' · ')[0] + ' ▾', self.context_menu,
                                         variant='ghost', width=100, height=34, font_size=10)
@@ -209,11 +228,61 @@ class ClientApp(ExistingActions):
         self.send_button.pack(side='right')
         self.more_button = FlatButton(tools, '···', self.answer_menu, variant='ghost', width=40, height=34, font_size=18)
         self.more_button.pack(side='right', padx=8)
+        tools.bind('<Configure>', lambda event: self.layout_composer_tools())
         self.hint_label = label(self.chat_stack, textvariable=self.chat_hint, size=10, color=C['muted'], wraplength=760)
         self.hint_label.pack(pady=(7, 0))
         self.setup_button = FlatButton(self.chat_stack, '下载模型或连接 API', lambda: self.show_capabilities('models'),
                                       variant='accent', width=238, height=34, font_size=10)
         page.bind('<Configure>', lambda e: self.layout_chat())
+
+    def apply_text_layout(self):
+        scale = text_scale(self.root)
+        self.sidebar.configure(width=round(224 * scale))
+        if hasattr(self, 'settings_panel'):
+            self.settings_panel.navigation.configure(width=round(156 * scale))
+        self.layout_chat()
+        self.layout_composer_tools()
+        if hasattr(self, 'project'):
+            self.project.resize_cards()
+
+    def change_text_size(self, event=None):
+        choice = TEXT_SIZES.get(self.text_size_choice.get())
+        if choice:
+            try:
+                save_text_size(choice)
+                set_text_size(self.root, choice)
+                self.apply_text_layout()
+                self.status.set('文字大小已更新。训练端下次打开也会使用这个大小。')
+            except (OSError, ValueError) as exc:
+                self.status.set('无法保存文字大小：' + str(exc))
+
+    def layout_composer_tools(self):
+        tools = self.composer_tools
+        width = tools.winfo_width()
+        buttons = (self.add_button, self.model_button, self.context_button, self.skill_button,
+                   self.more_button, self.send_button)
+        compact = width < sum(button.winfo_reqwidth() for button in buttons) + 36
+        layout = (compact, tuple(button.winfo_reqwidth() for button in buttons))
+        if getattr(self, '_composer_layout', None) == layout:
+            return
+        self._composer_layout = layout
+        for button in buttons:
+            button.pack_forget()
+            button.grid_forget()
+        for index in range(6):
+            tools.columnconfigure(index, weight=0)
+        if compact:
+            tools.columnconfigure(2, weight=1)
+            self.add_button.grid(row=0, column=0, sticky='w')
+            self.model_button.grid(row=0, column=1, columnspan=2, sticky='w', padx=4)
+            self.send_button.grid(row=0, column=3, sticky='e')
+            self.context_button.grid(row=1, column=0, columnspan=2, sticky='w', pady=(4, 0))
+            self.skill_button.grid(row=1, column=2, sticky='w', pady=(4, 0))
+            self.more_button.grid(row=1, column=3, sticky='e', pady=(4, 0))
+        else:
+            tools.columnconfigure(4, weight=1)
+            for index, button in enumerate(buttons):
+                button.grid(row=0, column=index, sticky='e' if index >= 4 else 'w', padx=2)
 
     def update_placeholder(self):
         if self.input.get('1.0', 'end').strip():
@@ -227,11 +296,12 @@ class ClientApp(ExistingActions):
         page_width = self.pages[0].winfo_width()
         project_mode = hasattr(self, 'project') and self.project.enabled.get()
         memory_open = hasattr(self, 'memories') and self.memories.opened
-        aside = 328 if memory_open else 220 if project_mode and self.show_project_details and page_width >= 850 else 0
-        width = max(440, min(850, page_width - aside - 54))
+        scale = text_scale(self.root)
+        aside = round(328 * scale) if memory_open else round(220 * scale) if project_mode and self.show_project_details and page_width >= 1000 * scale else 0
+        width = max(260, min(round(900 * scale), page_width - aside - 54))
         if memory_open:
             self.project_summary.place_forget()
-            self.memories.frame.place(relx=1, x=-10, y=8, anchor='ne', width=318, relheight=.97)
+            self.memories.frame.place(relx=1, x=-10, y=8, anchor='ne', width=aside - 10, relheight=.97)
         elif aside:
             self.project_summary.place(relx=1, x=-14, y=14, anchor='ne', width=aside - 8)
         else:
@@ -240,14 +310,19 @@ class ClientApp(ExistingActions):
             self.memories.frame.place_forget()
         self.chat_stack.place(x=max(12, (page_width - aside - width) // 2), y=4, width=width, relheight=.98)
         self.hint_label.configure(wraplength=width - 24)
+        self.hero_title.configure(wraplength=max(200, width - 32))
+        self.placeholder.configure(wraplength=max(180, width - 50))
         if self.history:
             self.hero.pack_forget()
-            self.transcript.pack(fill='both', expand=True, before=self.composer, pady=(0, 10))
+            self.transcript_area.pack(fill='both', expand=True, before=self.composer, pady=(0, 16))
         else:
-            self.transcript.pack_forget()
+            self.transcript_area.pack_forget()
             self.hero.pack(fill='both', expand=True, before=self.composer)
 
     def toggle_sidebar(self):
+        if self.current_page == 2:
+            self.settings_panel.toggle_navigation()
+            return
         if self.sidebar.winfo_manager():
             self.sidebar.pack_forget()
         else:
@@ -368,6 +443,7 @@ class ClientApp(ExistingActions):
 
     def show_api_settings(self):
         self.select_page(2)
+        self.settings_panel.select_category('models')
         self.root.update_idletasks()
         self.settings_area.canvas.yview_moveto(0)
 
@@ -762,20 +838,37 @@ class ClientApp(ExistingActions):
         os.startfile(path)
 
     def build_capabilities(self, page):
-        area = ScrollArea(page)
-        area.pack(fill='both', expand=True, padx=40, pady=(8, 16))
+        area = ScrollArea(page, max_width=1100, scrollbar=True)
+        area.pack(fill='both', expand=True, padx=24, pady=(8, 16))
         self.cap_area, self.cap_host = area, area.body
         label(self.cap_host, '挑选模型和技能', size=24, bold=True).pack(anchor='w', pady=(8, 8))
-        label(self.cap_host, '模型按需下载，技能按任务切换。打开应用不会自动加载模型。', color=C['muted']).pack(anchor='w', pady=(0, 16))
+        cap_intro = label(self.cap_host, '模型按需下载，也可以联网搜索 Hugging Face。打开应用不会自动加载模型。', color=C['muted'], justify='left', anchor='w')
+        cap_intro.pack(fill='x', pady=(0, 16))
+        cap_intro.bind('<Configure>', lambda event: cap_intro.configure(wraplength=max(80, event.width)))
         tabs = tk.Frame(self.cap_host, bg=C['bg'])
         tabs.pack(fill='x', pady=(0, 12))
         self.cap_tabs = {}
-        for section, title in [('models', '聊天模型'), ('skills', '技能'), ('extensions', '扩展能力')]:
+        for section, title in [('models', '聊天模型'), ('hf-models', '联网找模型'), ('skills', '技能'), ('extensions', '扩展能力')]:
             button = FlatButton(tabs, title, lambda s=section: self.show_capabilities(s), variant='ghost', width=120, height=36)
             button.pack(side='left', padx=(0, 8))
             self.cap_tabs[section] = button
+        def layout_tabs(event=None):
+            columns = 4 if tabs.winfo_width() >= sum(b.winfo_reqwidth() for b in self.cap_tabs.values()) + 32 else 2
+            if getattr(self, '_cap_tab_columns', None) == columns:
+                return
+            self._cap_tab_columns = columns
+            for button in self.cap_tabs.values():
+                button.pack_forget()
+                button.grid_forget()
+            for index, button in enumerate(self.cap_tabs.values()):
+                button.grid(row=index // columns, column=index % columns, sticky='ew', padx=(0, 8), pady=(0, 6))
+            for index in range(4):
+                tabs.columnconfigure(index, weight=1 if index < columns else 0)
+        tabs.bind('<Configure>', layout_tabs)
         self.cap_cards = tk.Frame(self.cap_host, bg=C['bg'])
         self.cap_cards.pack(fill='x')
+        from hf_model_panel import HuggingFacePanel
+        self.hf_model_panel = HuggingFacePanel(self, self.cap_cards)
         self.download_panel = RoundedFrame(self.cap_host, bg=C['side'], padding=16)
         self.download_panel.pack(fill='x', pady=(12, 8))
         label(self.download_panel.body, textvariable=self.download_status, size=11, wraplength=790, justify='left', anchor='w').pack(fill='x')
@@ -787,7 +880,7 @@ class ClientApp(ExistingActions):
         label(self.cap_host, textvariable=self.space, size=10, color=C['muted'], wraplength=800, anchor='w', justify='left').pack(anchor='w', pady=(10, 16))
 
     def show_capabilities(self, section='models'):
-        if section not in ('models', 'skills', 'extensions'):
+        if section not in ('models', 'hf-models', 'skills', 'extensions'):
             raise ValueError('未知能力页面')
         self.cap_section = section
         self.refresh_capabilities()
@@ -802,19 +895,28 @@ class ClientApp(ExistingActions):
         right.pack(side='right', padx=(14, 0))
         words = tk.Frame(card.body, bg=C['surface'])
         words.pack(side='left', fill='x', expand=True)
-        label(words, title, size=13, bold=True, anchor='w', wraplength=470, justify='left').pack(anchor='w')
-        label(words, description, size=10, color=C['muted'], anchor='w', justify='left', wraplength=450).pack(anchor='w', pady=(5, 0))
+        texts = [label(words, title, size=13, bold=True, anchor='w', justify='left'),
+                 label(words, description, size=11, color=C['muted'], anchor='w', justify='left')]
         if detail:
-            label(words, detail, size=10, color=C['muted'], anchor='w', justify='left', wraplength=450).pack(anchor='w', pady=(5, 0))
+            texts.append(label(words, detail, size=10, color=C['muted'], anchor='w', justify='left'))
+        for index, text in enumerate(texts):
+            text.pack(fill='x', pady=(5 if index else 0, 0))
+        words.bind('<Configure>', lambda event: [text.configure(wraplength=max(80, event.width)) for text in texts])
         return right
 
     def refresh_capabilities(self):
         for widget in self.cap_cards.winfo_children():
-            widget.destroy()
+            if widget is self.hf_model_panel:
+                widget.pack_forget()
+            else:
+                widget.destroy()
         self.package_rows = {row['id']: row for row in self.manager.list_packages()}
         for section, button in self.cap_tabs.items():
             button.configure(variant='selected' if section == self.cap_section else 'ghost')
-        if self.cap_section == 'skills':
+        if self.cap_section == 'hf-models':
+            self.hf_model_panel.pack(fill='x')
+            self.hf_model_panel.sync_busy()
+        elif self.cap_section == 'skills':
             label(self.cap_cards, '内置技能无需额外下载。AI 工作方式可使用本机模型或 API，本机小工具可以直接运行。',
                   size=11, color=C['muted'], wraplength=800, justify='left').pack(anchor='w', pady=(0, 12))
             for spec in skill_catalog():
@@ -840,7 +942,7 @@ class ClientApp(ExistingActions):
                     title += ' · 日常推荐'
                 detail = ''
                 if is_model:
-                    detail = '适合：' + '、'.join(row.get('use_cases', []))
+                    detail = '适合：' + '、'.join(row.get('use_cases', [])) if row.get('use_cases') else '联网添加的模型，实际表现与运行兼容性需要验证。'
                     if row.get('recommended_ram_gb'):
                         detail += f"\n内存建议 {row['recommended_ram_gb']} GB · 显卡加速建议 {row.get('recommended_vram_gb', '—')} GB 显存"
                 if identity == 'vision':
@@ -942,39 +1044,24 @@ class ClientApp(ExistingActions):
         self.status.set(message)
 
     def build_settings(self, page):
-        from api_panel import APISettingsPanel
-        area = ScrollArea(page)
-        self.settings_area = area
-        area.pack(fill='both', expand=True, padx=40, pady=16)
-        label(area.body, '让使用更顺手', size=24, bold=True).pack(anchor='w', pady=(0, 24))
-        appearance = RoundedFrame(area.body, padding=22)
-        appearance.pack(fill='x', pady=(0, 14))
-        label(appearance.body, '界面皮肤', size=14, bold=True, color=C.get('brand', C['text'])).pack(anchor='w')
-        self.skin_choice = tk.StringVar(value=next(name for name, value in CLIENT_SKINS.items() if value == self.theme))
-        self.skin_picker = ttk.Combobox(appearance.body, values=list(CLIENT_SKINS), textvariable=self.skin_choice,
-                                       state='readonly', width=24)
-        self.skin_picker.pack(anchor='w', pady=(12, 8))
-        self.skin_notice = tk.StringVar(value='边缘行者：黑底、青色电路、切角面板、荧光绿按钮与黄色点缀。选择后，重新打开应用生效。')
-        label(appearance.body, textvariable=self.skin_notice, size=11, color=C['muted'],
-              wraplength=760, justify='left').pack(anchor='w')
-        self.skin_picker.bind('<<ComboboxSelected>>', self.save_skin)
-        self.api_panel = APISettingsPanel(self, area.body)
-        for title, detail, actions in [
-            ('文件放在哪里', '聊天和训练记录：' + str(ARTIFACTS) + '\n模型和扩展：' + str(self.manager.root) +
-             '\n模型位置可在安装时选择；未另选时放在 FreeAI 文件夹内。',
-             [('打开记录文件夹', lambda: os.startfile(ARTIFACTS)), ('打开模型文件夹', self.open_model_folder), ('更改记录位置', self.choose_storage)]),
-            ('模型占用', '启动时不加载模型。释放内存会保留选择；停用模型会清除选择，文件仍保留。', [('释放模型', self.release_model), ('停用模型', self.disable_model)]),
-            ('独立训练端', '准备资料、训练、评估与经验改进，都在 Free AI Trainer 中完成。', [('打开训练端', self.open_training)]),
-            ('关于 Free AI', '2.4.2  ·  在对话里做项目，也能管理长期记忆。', [('使用说明', lambda: os.startfile(ROOT / '使用说明.md'))])]:
-            card = RoundedFrame(area.body, padding=22)
-            card.pack(fill='x', pady=(0, 14))
-            label(card.body, title, size=14, bold=True).pack(anchor='w')
-            label(card.body, detail, size=11, color=C['muted'], wraplength=760, justify='left').pack(anchor='w', pady=(10, 12))
-            row = tk.Frame(card.body, bg=C['surface'])
-            row.pack(fill='x')
-            for text, action in actions:
-                FlatButton(row, text, action, variant='secondary', height=34, font_size=11).pack(side='left', padx=(0, 10))
-        area.bind_wheel(area.body)
+        from client_settings import SettingsPanel
+        self.settings_panel = SettingsPanel(self, page)
+
+    def open_project_in_editor(self, folder=None):
+        from coding_tools import launch_editor, load_preferences
+        try:
+            opened = launch_editor(folder or self.project.workspace.get(), load_preferences(self.sessions))
+            self.status.set('已用 ' + opened['tool'] + ' 打开项目。')
+        except (OSError, ValueError):
+            self.status.set('无法打开编辑器。请先选择项目，并在“设置 → 编程工具”检查程序位置。')
+
+    def open_project_terminal(self, folder=None):
+        from coding_tools import launch_terminal, load_preferences
+        try:
+            opened = launch_terminal(folder or self.project.workspace.get(), load_preferences(self.sessions))
+            self.status.set('已在项目目录打开 ' + opened['tool'] + '。')
+        except (OSError, ValueError):
+            self.status.set('无法打开终端。请先选择项目，并检查所选终端程序是否存在。')
 
     def save_skin(self, event=None):
         choice = CLIENT_SKINS.get(self.skin_choice.get())
@@ -1004,6 +1091,10 @@ class ClientApp(ExistingActions):
             return
         self.busy, self.cancellable = True, cancellable
         self.project.sync_busy()
+        if hasattr(self, 'settings_panel'):
+            self.settings_panel.sync_busy()
+        if hasattr(self, 'hf_model_panel'):
+            self.hf_model_panel.sync_busy()
         self.memories.sync_busy()
         self.generation_cancel.clear()
         self.status.set(title + '…')
@@ -1029,6 +1120,10 @@ class ClientApp(ExistingActions):
                     continue
                 self.busy = False
                 self.project.sync_busy()
+                if hasattr(self, 'settings_panel'):
+                    self.settings_panel.sync_busy()
+                if hasattr(self, 'hf_model_panel'):
+                    self.hf_model_panel.sync_busy()
                 self.memories.sync_busy()
                 self.send_button.configure(text='↑', state='normal')
                 self.stop_task_button.pack_forget()

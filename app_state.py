@@ -6,9 +6,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from contextlib import contextmanager
 
-PROJECT_SETTING_TYPES = {'enabled': bool, 'workspace': str, 'allow_write': bool, 'use_memory': bool}
-PROJECT_RESULT_FIELDS = ('status', 'answer', 'run_dir', 'changes', 'episode_id', 'memory_updates')
+PROJECT_PERMISSION_MODES = frozenset({'standard', 'readonly', 'automatic'})
+PROJECT_SETTING_TYPES = {'enabled': bool, 'workspace': str, 'allow_write': bool, 'use_memory': bool,
+                         'permission_mode': str}
+PROJECT_RESULT_FIELDS = ('status', 'answer', 'run_dir', 'changes', 'episode_id', 'memory_updates',
+                         'task_state', 'continuation_available', 'permission_mode')
 PROJECT_RECORD_LIMIT = 512 * 1024
+PROJECT_STATE_FIELDS = ('task', 'status', 'phase', 'parent_run', 'uncertain')
 
 CONTEXTS = {'日常聊天 · 4K': 4096, '阅读长文 · 16K': 16384, '深入讨论 · 32K': 32768}
 
@@ -75,10 +79,10 @@ class Sessions:
         return json.loads(row[0]) if row else {}
 
     def set_project_settings(self, session_id, settings):
-        if not isinstance(settings, dict) or any(
-            key not in PROJECT_SETTING_TYPES or type(value) is not PROJECT_SETTING_TYPES[key]
-            for key, value in settings.items()
-        ):
+        if (not isinstance(settings, dict) or any(
+                key not in PROJECT_SETTING_TYPES or type(value) is not PROJECT_SETTING_TYPES[key]
+                for key, value in settings.items()
+        ) or ('permission_mode' in settings and settings['permission_mode'] not in PROJECT_PERMISSION_MODES)):
             raise ValueError('项目会话设置无效。')
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -87,6 +91,9 @@ class Sessions:
             row = db.execute('SELECT settings_json FROM session_project WHERE session_id=?',
                              (session_id,)).fetchone()
             merged = json.loads(row[0]) if row else {}
+            if ('workspace' in settings and 'permission_mode' in merged and 'permission_mode' not in settings
+                    and Path(settings['workspace']) != Path(merged.get('workspace', ''))):
+                merged.update(permission_mode='standard', allow_write=True)
             merged.update(settings)
             encoded = json.dumps(merged, ensure_ascii=False)
             if len(encoded.encode('utf-8')) > PROJECT_RECORD_LIMIT:
@@ -108,6 +115,22 @@ class Sessions:
     @staticmethod
     def _encode_project_run(result, workspace, activity):
         public = {field: result[field] for field in PROJECT_RESULT_FIELDS if field in result}
+        state = public.get('task_state')
+        if isinstance(state, dict):
+            structured = {field: state[field] for field in PROJECT_STATE_FIELDS if field in state}
+            for group, fields in (('plan', ('text', 'status')), ('edits', ('path', 'sha256'))):
+                if group in state:
+                    structured[group] = [{field: row[field] for field in fields if field in row}
+                                         for row in state[group]]
+            if 'verification' in state:
+                verification = state['verification']
+                check_fields = ('command', 'cwd', 'status', 'returncode', 'detail', 'current')
+                structured['verification'] = {
+                    'status': verification['status'],
+                    'checks': [{field: row[field] for field in check_fields if field in row}
+                               for row in verification.get('checks', [])],
+                }
+            public['task_state'] = structured
         try:
             encoded = json.dumps(public, ensure_ascii=False, allow_nan=False)
             size = sum(len(value.encode('utf-8')) for value in (encoded, workspace, activity))
@@ -134,6 +157,23 @@ class Sessions:
             db.execute('UPDATE sessions SET updated=? WHERE id=?', (self.now(), session_id))
             self._write_project_run(db, session_id, index, encoded, workspace, activity)
         return index
+
+    def update_project_reply(self, session_id, assistant_index, result, workspace, activity):
+        if (type(assistant_index) is not int or assistant_index < 0 or not isinstance(result, dict)
+                or not isinstance(result.get('answer'), str)):
+            raise ValueError('项目回复无效。')
+        encoded = self._encode_project_run(result, workspace, activity)
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            run = db.execute('SELECT workspace FROM session_project_runs WHERE session_id=? AND assistant_index=?',
+                             (session_id, assistant_index)).fetchone()
+            reply = db.execute('SELECT id,role FROM messages WHERE session_id=? ORDER BY id LIMIT 1 OFFSET ?',
+                               (session_id, assistant_index)).fetchone()
+            if run is None or run[0] != workspace or reply is None or reply[1] != 'assistant':
+                raise ValueError('项目运行记录必须关联原工作区的助手消息。')
+            db.execute('UPDATE messages SET content=? WHERE id=?', (result['answer'], reply[0]))
+            self._write_project_run(db, session_id, assistant_index, encoded, workspace, activity)
+            db.execute('UPDATE sessions SET updated=? WHERE id=?', (self.now(), session_id))
 
     def annotate_project_reply(self, session_id, assistant_index, note, activity):
         if type(assistant_index) is not int or assistant_index < 0 or not isinstance(note, str) or not note.strip():

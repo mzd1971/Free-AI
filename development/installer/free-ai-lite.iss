@@ -7,7 +7,7 @@
 #ifndef ReleaseDir
   #error ReleaseDir is required
 #endif
-#define AppVersion "2.4.2"
+#define AppVersion "2.8.0"
 [Setup]
 AppId={{3EAACF9D-4709-48F0-AF84-0275969D1600}
 AppName=Free AI

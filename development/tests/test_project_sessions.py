@@ -4,6 +4,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from app_state import Sessions
 
@@ -49,11 +50,27 @@ class ProjectSessionTests(unittest.TestCase):
             'enabled': True, 'allow_write': True, 'workspace': 'D:/new', 'use_memory': False,
         })
         self.assertEqual(reopened.project_settings(second), {})
-        for invalid in [{'allow_write': 1}, {'enabled': 'true'}, {'api_key': 'placeholder'}, []]:
+        for invalid in [{'allow_write': 1}, {'enabled': 'true'}, {'api_key': 'placeholder'},
+                        {'permission_mode': 'fullaccess'}, {'permission_mode': []}, []]:
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 sessions.set_project_settings(first, invalid)
         with self.assertRaises(ValueError):
             sessions.set_project_settings('missing', {'enabled': True})
+
+    def test_permission_mode_stays_with_its_workspace(self):
+        sessions = Sessions(self.root)
+        first, second = sessions.create(), sessions.create()
+        sessions.set_project_settings(first, {'workspace': 'D:/one', 'permission_mode': 'automatic'})
+        sessions.set_project_settings(first, {'use_memory': True})
+        reopened = Sessions(self.root)
+        self.assertEqual(reopened.project_settings(first)['permission_mode'], 'automatic')
+        self.assertEqual(reopened.project_settings(second), {})
+        reopened.set_project_settings(first, {'workspace': 'D:/one'})
+        self.assertEqual(reopened.project_settings(first)['permission_mode'], 'automatic')
+        reopened.set_project_settings(first, {'workspace': 'D:/two'})
+        self.assertEqual(reopened.project_settings(first), {
+            'workspace': 'D:/two', 'permission_mode': 'standard', 'allow_write': True, 'use_memory': True,
+        })
 
     def test_public_run_metadata_loads_at_assistant_message_index(self):
         sessions = Sessions(self.root)
@@ -61,7 +78,7 @@ class ProjectSessionTests(unittest.TestCase):
         sessions.append(first, 'user', '任务')
         sessions.append(second, 'assistant', '独立消息')
         sessions.append(first, 'assistant', '结果')
-        public = {'status': 'completed', 'answer': '结果', 'run_dir': 'D:/runs/first',
+        public = {'status': 'completed', 'answer': '结果', 'run_dir': 'D:/runs/first', 'permission_mode': 'readonly',
                   'changes': [{'path': 'main.py'}], 'episode_id': None}
         sessions.save_project_run(
             first, 1, {**public, 'request_headers': {'Authorization': 'placeholder'}}, 'D:/project', '运行活动',
@@ -78,6 +95,45 @@ class ProjectSessionTests(unittest.TestCase):
             sessions.save_project_run(first, 1, public, 'D:/project', '广' * (512 * 1024 // 3))
         with self.assertRaises(ValueError):
             sessions.save_project_run('missing', 1, public, 'D:/project', '')
+
+    def test_update_running_reply_preserves_message_index_and_commits_with_card(self):
+        sessions = Sessions(self.root)
+        first, second = sessions.create(), sessions.create()
+        sessions.append(first, 'user', '任务')
+        workspace = str(self.root)
+        running = {'status': 'running', 'answer': '项目任务执行中。', 'run_dir': '',
+                   'continuation_available': False}
+        index = sessions.append_project_reply(first, running, workspace, '')
+        sessions.append(second, 'assistant', '其他会话')
+        finished = {'status': 'needs_work', 'answer': '检查失败。', 'run_dir': 'D:/runs/first',
+                    'continuation_available': True, 'task_state': {
+                        'uncertain': True,
+                        'plan': [{'text': '修复检查', 'status': 'pending'}],
+                        'verification': {'status': 'failed', 'checks': [
+                            {'command': 'check', 'status': 'exited', 'returncode': 1, 'current': True},
+                        ]},
+                    }}
+        with patch.object(sessions, '_write_project_run', side_effect=OSError('fixture failure')):
+            with self.assertRaises(OSError):
+                sessions.update_project_reply(first, index, finished, workspace, '失败')
+        self.assertEqual(sessions.messages(first)[index]['content'], running['answer'])
+        self.assertEqual(sessions.project_runs(first)[0]['result'], running)
+
+        for session, message, folder in [(first, 0, workspace), (first, index, 'D:/different'),
+                                         (second, 0, workspace)]:
+            with self.subTest(session=session, message=message, folder=folder), self.assertRaises(ValueError):
+                sessions.update_project_reply(session, message, finished, folder, '')
+        sessions.update_project_reply(first, index, {**finished, 'api_key': 'placeholder', 'task_state': {
+            **finished['task_state'], 'request_headers': {'Authorization': 'placeholder'},
+        }}, workspace, '失败')
+        reopened = Sessions(self.root)
+        self.assertEqual(reopened.messages(first), [
+            {'role': 'user', 'content': '任务'}, {'role': 'assistant', 'content': '检查失败。'},
+        ])
+        self.assertEqual(reopened.project_runs(first), [{
+            'assistant_index': index, 'result': finished, 'workspace': workspace, 'activity': '失败',
+        }])
+        self.assertEqual(reopened.messages(second)[0]['content'], '其他会话')
 
 
 if __name__ == '__main__':

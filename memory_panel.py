@@ -3,7 +3,7 @@ import re
 import tkinter as tk
 from tkinter import ttk
 
-from ui_kit import COLORS as C, FONT, FlatButton, RoundedFrame, ScrollArea, label
+from ui_kit import COLORS as C, FONT, FlatButton, RoundedFrame, ScrollArea, label, ui_font
 
 KINDS = {'偏好': 'preference', '事实': 'fact', '做法': 'procedure', '备忘': 'note'}
 SCOPES = {'这个助手': 'agent', '所有助手': 'global', '当前项目': 'project'}
@@ -35,13 +35,13 @@ class MemoryPanel:
                                ('联网模型也可读写记忆', self.remote_enabled)]:
             check = tk.Checkbutton(host, text=text, variable=variable, command=self.save_options,
                 bg=C['surface'], fg=C['text'], activebackground=C['surface'], activeforeground=C['text'],
-                selectcolor=C['input'], font=(FONT, 10), anchor='w', bd=0)
+                selectcolor=C['input'], font=ui_font(self.app.root, 10), anchor='w', bd=0)
             check.pack(fill='x')
             self.options.append(check)
         label(host, '自动记忆会在回答后再整理一次；联网整理可能产生额外调用费用。',
               size=9, color=C['muted'], wraplength=270, justify='left').pack(anchor='w', pady=(5, 9))
         label(host, '当前助手 / 当前项目的记忆', size=10, color=C['muted']).pack(anchor='w', pady=(2, 6))
-        self.listbox = tk.Listbox(host, height=5, font=(FONT, 10), bg=C['input'], fg=C['text'],
+        self.listbox = tk.Listbox(host, height=5, font=ui_font(self.app.root, 10), bg=C['input'], fg=C['text'],
             selectbackground=C['tint'], selectforeground=C['text'], bd=0, highlightthickness=0, exportselection=False)
         self.listbox.pack(fill='x')
         self.listbox.bind('<<ListboxSelect>>', self.select)
@@ -56,7 +56,7 @@ class MemoryPanel:
         label(host, '记忆名称', size=10).pack(anchor='w')
         self.title_input = ttk.Entry(host, textvariable=self.title)
         self.title_input.pack(fill='x', pady=(4, 8))
-        self.content = tk.Text(host, height=5, width=1, wrap='word', font=(FONT, 11), bg=C['input'],
+        self.content = tk.Text(host, height=5, width=1, wrap='word', font=ui_font(self.app.root, 11), bg=C['input'],
                                fg=C['text'], insertbackground=C['text'], bd=0, padx=7, pady=6)
         self.content.pack(fill='x')
         selectors = tk.Frame(host, bg=C['surface'])

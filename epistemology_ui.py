@@ -2,6 +2,8 @@
 import tkinter as tk
 from tkinter import ttk
 
+from ui_kit import text_scale, ui_font
+
 
 STATUS = {'candidate': '待确认建议', 'active': '正在使用', 'suspended': '已停用', 'superseded': '已替换'}
 VERIFY = {'unverified': '尚未核验', 'execution_only': '只确认工具成功运行', 'objective': '已用客观结果核验', 'user_reported': '你已反馈'}
@@ -28,14 +30,14 @@ def domain_value(value):
 
 
 class EpistemologyPanel:
-    def __init__(self, app, page):
+    def __init__(self, app, page, *, responsive=False):
         self.app, self.store = app, app.knowledge
+        self.responsive = responsive
         self.episodes, self.rules = {}, {}
         self.selected_episode = None
-        ttk.Label(page, text='实际使用 → 你的反馈 → 可复用做法 → 下次自动查找',
-                  font=('Microsoft YaHei UI', 14, 'bold')).pack(anchor='w', pady=(0, 5))
-        ttk.Label(page, text='覆盖编程、写作、电脑环境、教 AI 学习等问题；新建议经你确认后才会使用，也可以随时修正。',
-                  foreground='#63728b').pack(anchor='w')
+        self._copy(page, '实际使用 → 你的反馈 → 可复用做法 → 下次自动查找',
+                   size=14, bold=True).pack(fill='x', pady=(0, 5))
+        self._copy(page, '覆盖编程、写作、电脑环境、教 AI 学习等问题；新建议经你确认后才会使用，也可以随时修正。').pack(fill='x')
         self.notebook = ttk.Notebook(page)
         self.notebook.pack(fill='both', expand=True, pady=8)
         self.practice_page = ttk.Frame(self.notebook, padding=6)
@@ -48,82 +50,121 @@ class EpistemologyPanel:
             ('Notebook.padding', {'side': 'top', 'sticky': 'nswe', 'children': [
                 ('Notebook.label', {'side': 'top', 'sticky': ''})]})]})])
         style.configure('Knowledge.TNotebook.Tab', padding=(16, 8))
-        style.configure('Knowledge.Treeview', rowheight=29, font=('Microsoft YaHei UI', 11))
+        if not responsive:
+            style.configure('Knowledge.Treeview', rowheight=29, font=('Microsoft YaHei UI', 11))
         self.notebook.configure(style='Knowledge.TNotebook')
         self._practice()
         self._rules()
         self.notice = tk.StringVar(value='先在“中文聊天”或“自动办事”中完成一次任务，再选择记录进行反馈。')
-        ttk.Label(page, textvariable=self.notice, foreground='#63728b', wraplength=950).pack(side='bottom', fill='x', pady=(4, 0), before=self.notebook)
+        self._copy(page, textvariable=self.notice, legacy_wraplength=950).pack(
+            side='bottom', fill='x', pady=(4, 0), before=self.notebook)
         app.root.after_idle(self.refresh)
+
+    def _copy(self, parent, text='', size=12, bold=False, legacy_wraplength=0, **kwargs):
+        if self.responsive:
+            return self.app.wrap_label(parent, text, size=size, bold=bold,
+                                       color=self.app.colors['muted'], **kwargs)
+        options = {'font': ui_font(parent, size, bold)} if bold else {}
+        return ttk.Label(parent, text=text, foreground='#63728b', wraplength=legacy_wraplength,
+                         **options, **kwargs)
+
+    def _action_row(self, parent, pady=4):
+        row = self.app.button_row(parent) if self.responsive else ttk.Frame(parent)
+        row.pack(fill='x', pady=pady)
+        return row
+
+    def _table(self, parent, pady, expand=False, **options):
+        if self.responsive:
+            return self.app.tree(parent, pady=pady, **options)
+        tree = ttk.Treeview(parent, **options)
+        tree.pack(fill='both' if expand else 'x', expand=expand, pady=pady)
+        return tree
 
     def _text(self, parent, height, editable=False):
         text = self.app.text(parent, height=height, editable=editable)
-        text.pack_configure(expand=False, pady=3)
-        text.configure(width=60, padx=9, pady=6)
+        if not self.responsive:
+            text.pack_configure(expand=False, pady=3)
+        text.configure(width=28 if self.responsive else 60, padx=9, pady=6)
         return text
 
     def _practice(self):
         left = ttk.Frame(self.practice_page, width=260)
-        left.pack(side='left', fill='y', padx=(0, 14))
-        left.pack_propagate(False)
+        right = ttk.Frame(self.practice_page)
+        self.practice_records, self.practice_form = left, right
+        if self.responsive:
+            self.practice_page.bind('<Configure>', self.arrange_practice)
+            self.arrange_practice()
+        else:
+            left.pack(side='left', fill='y', padx=(0, 14))
+            left.pack_propagate(False)
+            right.pack(side='left', fill='both', expand=True)
         ttk.Label(left, text='实际使用记录').pack(anchor='w')
-        self.episode_tree = ttk.Treeview(left, columns=('task',), show='headings', height=10,
-                                       selectmode='browse', style='Knowledge.Treeview')
+        self.episode_tree = self._table(left, 6, expand=True, columns=('task',), show='headings',
+                                        height=5 if self.responsive else 10,
+                                        selectmode='browse', style='Knowledge.Treeview')
         self.episode_tree.heading('task', text='选择一条使用记录')
         self.episode_tree.column('task', width=240, stretch=True)
-        self.episode_tree.pack(fill='both', expand=True, pady=6)
         self.episode_tree.bind('<<TreeviewSelect>>', self._episode_selected)
-        row = ttk.Frame(left)
-        row.pack(fill='x', pady=4)
+        row = self._action_row(left)
         self.app.button(row, '刷新记录', self.refresh)
         self.app.button(row, '查看可用做法', lambda: self.notebook.select(self.rules_page))
-        row = ttk.Frame(left)
-        row.pack(fill='x', pady=4)
+        row = self._action_row(left)
         self.app.button(row, '撤回所选记录', self._retire_episode)
-        right = ttk.Frame(self.practice_page)
-        right.pack(side='left', fill='both', expand=True)
         self.episode_hint = tk.StringVar(value='尚未选择使用记录')
-        ttk.Label(right, textvariable=self.episode_hint, foreground='#63728b').pack(anchor='w')
+        self._copy(right, textvariable=self.episode_hint).pack(fill='x')
         self.original = self._text(right, 3)
-        row = ttk.Frame(right)
-        row.pack(fill='x', pady=3)
-        ttk.Label(row, text='反馈').pack(side='left')
+        row = self._action_row(right, 3)
+        feedback = ttk.Frame(row) if self.responsive else row
+        domain = ttk.Frame(row) if self.responsive else row
+        ttk.Label(feedback, text='反馈').pack(side='left')
         self.outcome = tk.StringVar(value='纠正错误')
-        ttk.Combobox(row, textvariable=self.outcome, values=('纠正错误', '确认结果正确'),
-                     state='readonly', width=13).pack(side='left', padx=(6, 16))
-        ttk.Label(row, text='问题类型').pack(side='left')
+        ttk.Combobox(feedback, textvariable=self.outcome, values=('纠正错误', '确认结果正确'),
+                     state='readonly', width=13).pack(side='left', padx=(6, 8))
+        ttk.Label(domain, text='问题类型').pack(side='left')
         self.domain = tk.StringVar(value=DOMAIN['general'])
-        ttk.Entry(row, textvariable=self.domain, width=18).pack(side='left', padx=6)
-        ttk.Label(right, text='正确答案 / 正确做法（纠错必填；确认成功时可留空）').pack(anchor='w')
+        ttk.Entry(domain, textvariable=self.domain, width=18).pack(side='left', padx=6)
+        self._copy(right, '正确答案 / 正确做法（纠错必填；确认成功时可留空）').pack(fill='x')
         self.correction = self._text(right, 2, True)
-        ttk.Label(right, text='适用条件与关键词（例如：Python 列表 遍历时删除元素）').pack(anchor='w')
+        self._copy(right, '适用条件与关键词（例如：Python 列表 遍历时删除元素）').pack(fill='x')
         self.scope = tk.StringVar()
         ttk.Entry(right, textvariable=self.scope).pack(fill='x', pady=3)
-        ttk.Label(right, text='可复用做法：什么情况下、怎么做、如何检查').pack(anchor='w')
+        self._copy(right, '可复用做法：什么情况下、怎么做、如何检查').pack(fill='x')
         self.lesson = self._text(right, 2, True)
-        row = ttk.Frame(right)
-        row.pack(fill='x', pady=(5, 0))
+        row = self._action_row(right, (5, 0))
         self.app.button(row, '只保存反馈', lambda: self._save(False))
         self.app.button(row, '反馈并存为待确认建议', lambda: self._save(True))
-        row = ttk.Frame(right)
-        row.pack(fill='x', pady=5)
+        row = self._action_row(right, 5)
         self.app.button(row, '让 AI 总结成建议', self._propose_model)
-        ttk.Label(row, text='先保存反馈；AI 总结后仍需你确认。', foreground='#63728b').pack(side='left')
+        if self.responsive:
+            self._copy(right, '先保存反馈；AI 总结后仍需你确认。').pack(fill='x')
+        else:
+            self._copy(row, '先保存反馈；AI 总结后仍需你确认。').pack(side='left')
+
+    def arrange_practice(self, event=None):
+        width = self.practice_page.winfo_width()
+        factor = text_scale(self.practice_page)
+        wide = width >= round(780 * factor)
+        if wide == getattr(self, '_wide_practice', None):
+            return
+        self._wide_practice = wide
+        self.practice_page.columnconfigure(0, weight=0 if wide else 1, minsize=round(258 * factor) if wide else 0)
+        self.practice_page.columnconfigure(1, weight=int(wide))
+        self.practice_records.grid(row=0, column=0, sticky='nsew', padx=(0, 14 if wide else 0))
+        self.practice_form.grid(row=0 if wide else 1, column=int(wide), sticky='nsew',
+                                pady=(0 if wide else 12, 0))
 
     def _rules(self):
-        self.rule_tree = ttk.Treeview(self.rules_page, columns=('status', 'domain', 'scope'),
+        self.rule_tree = self._table(self.rules_page, (0, 6), columns=('status', 'domain', 'scope'),
                                       show='headings', height=4, selectmode='browse', style='Knowledge.Treeview')
         for name, title, width in [('status', '使用状态', 100), ('domain', '问题类型', 130), ('scope', '适用条件', 580)]:
             self.rule_tree.heading(name, text=title)
             self.rule_tree.column(name, width=width, stretch=name == 'scope')
-        self.rule_tree.pack(fill='x', pady=(0, 6))
         self.rule_tree.bind('<<TreeviewSelect>>', self._rule_selected)
         self.rule_detail = self._text(self.rules_page, 3)
-        row = ttk.Frame(self.rules_page)
-        row.pack(fill='x', pady=4)
+        row = self._action_row(self.rules_page)
         self.app.button(row, '确认并使用所选建议', self._activate)
         self.app.button(row, '停用所选做法', self._disable)
-        ttk.Label(self.rules_page, text='修正做法：选择当前正在使用的做法，再用“使用记录与反馈”中选定的记录作为依据。').pack(anchor='w', pady=(6, 3))
+        self._copy(self.rules_page, '修正做法：选择当前正在使用的做法，再用“使用记录与反馈”中选定的记录作为依据。').pack(fill='x', pady=(6, 3))
         row = ttk.Frame(self.rules_page)
         row.pack(fill='x')
         ttk.Label(row, text='问题类型').pack(side='left')
@@ -133,17 +174,18 @@ class EpistemologyPanel:
         self.replace_scope = tk.StringVar()
         ttk.Entry(row, textvariable=self.replace_scope).pack(side='left', fill='x', expand=True, padx=6)
         self.replace_lesson = self._text(self.rules_page, 2, True)
-        row = ttk.Frame(self.rules_page)
-        row.pack(fill='x', pady=4)
+        row = self._action_row(self.rules_page)
         self.app.button(row, '用新依据替换所选做法', self._replace)
         self.app.button(row, '返回使用记录与反馈', lambda: self.notebook.select(self.practice_page))
-        row = ttk.Frame(self.rules_page)
-        row.pack(fill='x', pady=5)
+        row = self._action_row(self.rules_page, 5)
         self.export_details = None
         self.app.button(row, '导出待确认的教学内容', self._export)
         self.app.button(row, '查看导出详情', lambda: self.app.show_details('导出详细记录', self.export_details))
-        ttk.Label(row, text='只导出待确认内容；仍需审核、去重和分组，不会自动开始教 AI 学习。',
-                  foreground='#63728b', wraplength=300).pack(side='left')
+        note = '只导出待确认内容；仍需审核、去重和分组，不会自动开始教 AI 学习。'
+        if self.responsive:
+            self._copy(self.rules_page, note).pack(fill='x')
+        else:
+            self._copy(row, note, legacy_wraplength=300).pack(side='left')
 
     @staticmethod
     def _selection(tree):

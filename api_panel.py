@@ -4,7 +4,7 @@ from tkinter import ttk
 from urllib.parse import urlsplit
 
 from remote_api import APIClient, normalize_base_url
-from ui_kit import COLORS as C, FONT, FlatButton, RoundedFrame, label
+from ui_kit import COLORS as C, FONT, FlatButton, RoundedFrame, label, ui_font
 
 
 class APISettingsPanel:
@@ -26,22 +26,24 @@ class APISettingsPanel:
         card.pack(fill='x', pady=(0, 14))
         self.body = card.body
         label(self.body, 'API 连接 · 使用联网模型', size=14, bold=True).pack(anchor='w')
-        label(self.body, '聊天会发送到你填写的服务地址，费用由该服务商计算。保存和打开应用都不会自动发起请求。',
-              size=11, color=C['muted'], wraplength=740, justify='left').pack(anchor='w', pady=(8, 14))
+        intro = label(self.body, '聊天会发送到你填写的服务地址，费用由该服务商计算。保存和打开应用都不会自动发起请求。',
+                      size=11, color=C['muted'], justify='left', anchor='w')
+        intro.pack(fill='x', pady=(8, 14))
         fields = tk.Frame(self.body, bg=C['surface'])
         fields.pack(fill='x')
         fields.columnconfigure(1, weight=1)
         for index, title in enumerate(('服务商', '服务地址', '模型名', 'API 密钥')):
             label(fields, title, size=11).grid(row=index, column=0, sticky='w', padx=(0, 18), pady=7)
-        provider = ttk.Combobox(fields, textvariable=self.provider, values=list(self.PROVIDERS), state='readonly', font=(FONT, 11))
+        provider = ttk.Combobox(fields, textvariable=self.provider, values=list(self.PROVIDERS), state='readonly', font=ui_font(self.app.root, 11))
         provider.grid(row=0, column=1, sticky='ew', pady=7)
         provider.bind('<<ComboboxSelected>>', self.provider_changed)
-        ttk.Entry(fields, textvariable=self.base_url, font=(FONT, 11)).grid(row=1, column=1, sticky='ew', pady=7)
-        self.model_picker = ttk.Combobox(fields, textvariable=self.model, values=['deepseek-flash', 'deepseek-v4-pro'], font=(FONT, 11))
+        ttk.Entry(fields, textvariable=self.base_url, font=ui_font(self.app.root, 11)).grid(row=1, column=1, sticky='ew', pady=7)
+        self.model_picker = ttk.Combobox(fields, textvariable=self.model, values=['deepseek-flash', 'deepseek-v4-pro'], font=ui_font(self.app.root, 11))
         self.model_picker.grid(row=2, column=1, sticky='ew', pady=7)
-        ttk.Entry(fields, textvariable=self.key, show='●', font=(FONT, 11)).grid(row=3, column=1, sticky='ew', pady=7)
-        label(self.body, '已保存的密钥不会回填显示；留空可保留。更换服务地址后，请重新填写。',
-              size=10, color=C['muted'], wraplength=740, justify='left').pack(anchor='w', pady=(0, 8))
+        ttk.Entry(fields, textvariable=self.key, show='●', font=ui_font(self.app.root, 11)).grid(row=3, column=1, sticky='ew', pady=7)
+        key_hint = label(self.body, '已保存的密钥不会回填显示；留空可保留。更换服务地址后，请重新填写。',
+                         size=10, color=C['muted'], justify='left', anchor='w')
+        key_hint.pack(fill='x', pady=(0, 8))
         ttk.Checkbutton(self.body, text='在本机加密保存密钥（换电脑需重新填写）', variable=self.remember).pack(anchor='w', pady=3)
         ttk.Checkbutton(self.body, text='允许引用本地经验（相关经验会一起发给服务商）', variable=self.include_memory).pack(anchor='w', pady=3)
         self.thinking_check = ttk.Checkbutton(self.body, text='DeepSeek 深入思考（可能更慢）', variable=self.thinking)
@@ -50,20 +52,31 @@ class APISettingsPanel:
         limits.pack(fill='x', pady=(9, 10))
         label(limits, '回答长度上限', size=11).pack(side='left')
         ttk.Combobox(limits, textvariable=self.max_tokens, values=['512', '1024', '2048', '4096', '8192'], width=9,
-                     font=(FONT, 11)).pack(side='left', padx=12)
+                     font=ui_font(self.app.root, 11)).pack(side='left', padx=12)
         label(limits, '越大可回答越长，也可能增加用量', size=10, color=C['muted']).pack(side='left')
         buttons = tk.Frame(self.body, bg=C['surface'])
         buttons.pack(fill='x', pady=(3, 8))
+        self.connection_buttons = []
         for title, callback, variant in [('保存设置', self.save, 'secondary'), ('测试连接', self.test_connection, 'secondary'),
                                           ('使用 API', self.enable, 'primary'), ('切回本机', app.use_local_mode, 'ghost')]:
             button = FlatButton(buttons, title, callback, variant=variant, width=112, height=36)
-            button.pack(side='left', padx=(0, 8))
+            self.connection_buttons.append(button)
             app.buttons.append(button)
+        self.layout_buttons(2)
+        buttons.bind('<Configure>', lambda event: self.layout_buttons(
+            4 if event.width >= sum(button.winfo_reqwidth() + 8 for button in self.connection_buttons) else 2))
         clear = FlatButton(self.body, '清除已存密钥', self.clear_key, variant='ghost', width=125, height=30, font_size=10)
         clear.pack(anchor='w')
         app.buttons.append(clear)
-        label(self.body, textvariable=self.notice, size=10, color=C['muted'], wraplength=740, justify='left').pack(anchor='w', pady=(7, 0))
+        notice = label(self.body, textvariable=self.notice, size=10, color=C['muted'], justify='left', anchor='w')
+        notice.pack(fill='x', pady=(7, 0))
+        for hint in (intro, key_hint, notice):
+            hint.bind('<Configure>', lambda event: event.widget.configure(wraplength=min(740, event.width)))
         self.refresh_notice()
+
+    def layout_buttons(self, columns):
+        for index, button in enumerate(self.connection_buttons):
+            button.grid(row=index // columns, column=index % columns, sticky='w', padx=(0, 8), pady=(0, 5))
 
     def provider_changed(self, event=None):
         if self.provider.get() == 'DeepSeek':

@@ -1,11 +1,14 @@
 """Small, dependency-free desktop components shared by the two Free AI apps."""
 import sys
 import tkinter as tk
-from tkinter import ttk
+from tkinter import font as tkfont, ttk
+from weakref import WeakSet
+
+from ui_preferences import DEFAULT_TEXT_SIZE, TEXT_SCALE
 
 LIGHT_COLORS = {
     'bg': '#faf9f6', 'side': '#f0efeb', 'surface': '#ffffff', 'input': '#ffffff',
-    'text': '#262724', 'muted': '#85877e', 'line': '#e5e5df',
+    'text': '#262724', 'muted': '#61645a', 'line': '#e5e5df',
     'accent': '#7462c8', 'tint': '#efecf9', 'success': '#568064',
     'hover': '#e7e6df', 'primary_bg': '#262724', 'primary_fg': '#ffffff',
     'primary_hover': '#42443e', 'disabled_bg': '#e3e4de', 'disabled_fg': '#a2a49a',
@@ -36,6 +39,46 @@ COLORS = LIGHT_COLORS.copy()
 FONT = 'Microsoft YaHei UI'
 
 
+def _font_registry(root):
+    if not hasattr(root, '_free_ai_fonts'):
+        root._free_ai_text_size = DEFAULT_TEXT_SIZE
+        root._free_ai_fonts = {}
+        root._free_ai_buttons = WeakSet()
+    return root._free_ai_fonts
+
+
+def ui_font(widget, size=12, bold=False, family=FONT):
+    """Return an app-wide named font so existing widgets and tags can resize in place."""
+    root = widget._root()
+    fonts = _font_registry(root)
+    key = (family, size, bold)
+    if key not in fonts:
+        fonts[key] = tkfont.Font(root=root, family=family, weight='bold' if bold else 'normal',
+                                 size=round(size * TEXT_SCALE[root._free_ai_text_size]))
+    return fonts[key]
+
+
+def text_scale(widget):
+    return TEXT_SCALE[getattr(widget._root(), '_free_ai_text_size', DEFAULT_TEXT_SIZE)]
+
+
+def set_text_size(root, choice):
+    if choice not in TEXT_SCALE:
+        raise ValueError('未知字号')
+    root = root._root()
+    fonts = _font_registry(root)
+    root._free_ai_text_size = choice
+    for (_, size, _), font in fonts.items():
+        font.configure(size=round(size * TEXT_SCALE[choice]))
+    if getattr(root, '_free_ai_theme', None):
+        style = ttk.Style(root)
+        style.configure('Treeview', rowheight=max(38, ui_font(root, 11).metrics('linespace') + 14))
+        style.configure('Knowledge.Treeview', rowheight=max(34, ui_font(root, 12).metrics('linespace') + 12))
+    for button in root._free_ai_buttons:
+        button._resize_text()
+    root.event_generate('<<FreeAITextSizeChanged>>')
+
+
 def background(parent):
     try:
         return parent.cget('bg')
@@ -43,7 +86,8 @@ def background(parent):
         return COLORS['bg']
 
 
-def setup_theme(root, title, size=(1320, 880), theme='light'):
+def setup_theme(root, title, size=(1320, 880), theme='light', *,
+                text_size=DEFAULT_TEXT_SIZE, min_size=(940, 640)):
     palettes = {'light': LIGHT_COLORS, 'dark': DARK_COLORS, 'cyberpunk': CYBER_COLORS}
     if theme not in palettes:
         raise ValueError('Unknown application theme')
@@ -51,13 +95,12 @@ def setup_theme(root, title, size=(1320, 880), theme='light'):
     COLORS.update(palettes[theme])
     root._free_ai_theme = theme
     root.title(title)
-    root.tk.call('tk', 'scaling', 1.4)
     width = min(size[0], root.winfo_screenwidth() - 70)
     height = min(size[1], root.winfo_screenheight() - 95)
     root.geometry(f'{width}x{height}+32+28')
-    root.minsize(min(940, width), min(640, height))
+    root.minsize(min(min_size[0], width), min(min_size[1], height))
     root.configure(bg=COLORS['bg'])
-    root.option_add('*Font', (FONT, 12))
+    root.option_add('*Font', ui_font(root))
     root.option_add('*Menu.background', COLORS['surface'])
     root.option_add('*Menu.foreground', COLORS['text'])
     root.option_add('*Menu.activeBackground', COLORS['tint'])
@@ -83,7 +126,7 @@ def setup_theme(root, title, size=(1320, 880), theme='light'):
         root.option_add(f'*{widget}.disabledForeground', COLORS['disabled_fg'])
     style = ttk.Style(root)
     style.theme_use('clam')
-    style.configure('.', font=(FONT, 12), background=COLORS['bg'], foreground=COLORS['text'],
+    style.configure('.', font=ui_font(root), background=COLORS['bg'], foreground=COLORS['text'],
                     bordercolor=COLORS['line'], lightcolor=COLORS['line'], darkcolor=COLORS['line'],
                     focuscolor=COLORS['focus'], selectbackground=COLORS['selection_bg'],
                     selectforeground=COLORS['selection_fg'], insertcolor=COLORS['text'])
@@ -100,14 +143,20 @@ def setup_theme(root, title, size=(1320, 880), theme='light'):
     style.configure('TNotebook.Tab', background=COLORS['side'], padding=(14, 8), borderwidth=0)
     style.map('TNotebook.Tab', background=[('selected', COLORS['surface'])])
     style.configure('Treeview', background=COLORS['surface'], fieldbackground=COLORS['surface'],
-                    borderwidth=0, rowheight=38, font=(FONT, 11))
-    style.configure('Treeview.Heading', background=COLORS['side'], borderwidth=0, font=(FONT, 11))
+                    borderwidth=0, font=ui_font(root, 11))
+    style.configure('Treeview.Heading', background=COLORS['side'], borderwidth=0, font=ui_font(root, 11))
+    style.configure('Knowledge.Treeview', font=ui_font(root))
+    style.configure('Knowledge.TNotebook.Tab', font=ui_font(root))
     style.map('Treeview', background=[('selected', COLORS['tint'])], foreground=[('selected', COLORS['text'])])
     style.configure('TEntry', fieldbackground=COLORS['input'], borderwidth=0, padding=8)
     style.configure('TCombobox', fieldbackground=COLORS['input'], background=COLORS['side'],
-                    arrowcolor=COLORS['text'], borderwidth=0, padding=6)
+                    foreground=COLORS['text'], arrowcolor=COLORS['text'], borderwidth=0, padding=6,
+                    selectforeground=COLORS['selection_fg'], selectbackground=COLORS['selection_bg'])
     style.map('TCombobox',
               fieldbackground=[('disabled', COLORS['disabled_bg']), ('readonly', COLORS['input'])],
+              foreground=[('disabled', COLORS['disabled_fg']), ('readonly', COLORS['text'])],
+              selectforeground=[('readonly', COLORS['selection_fg'])],
+              selectbackground=[('readonly', COLORS['selection_bg'])],
               background=[('active', COLORS['hover']), ('readonly', COLORS['side'])])
     style.configure('TCheckbutton', indicatorbackground=COLORS['input'],
                     indicatorforeground=COLORS['text'])
@@ -118,6 +167,7 @@ def setup_theme(root, title, size=(1320, 880), theme='light'):
     style.map('Vertical.TScrollbar', background=[('active', COLORS['hover'])])
     style.configure('Horizontal.TProgressbar', background=COLORS['accent'], troughcolor=COLORS['side'],
                     borderwidth=0, lightcolor=COLORS['accent'], darkcolor=COLORS['accent'])
+    set_text_size(root, text_size)
     try:
         from paths import ROOT
         root.iconbitmap(str(ROOT / 'assets/free-ai.ico'))
@@ -221,16 +271,21 @@ class RoundedFrame(tk.Frame):
 
 
 class FlatButton(tk.Canvas):
+    """Canvas button with a minimum width and an optional cap for variable captions."""
+
     def __init__(self, parent, text='', command=None, variant='secondary', width=None, height=40,
-                 radius=12, font_size=12, anchor='center', state='normal', **kwargs):
+                 radius=12, font_size=12, anchor='center', state='normal', *, max_width=None, **kwargs):
         self.value, self.command, self.variant = text, command, variant
         self.button_state, self.radius, self.font_size, self.align = state, radius, font_size, anchor
         self.hovered = False
-        if width is None:
-            width = max(66, int(sum(1.8 if ord(c) > 255 else 1 for c in text) * font_size * .7 + 32))
+        self._base_width, self._base_height = width, height
+        self._max_width = max_width
+        self._font = ui_font(parent, font_size)
+        width, height = self._requested_size()
         super().__init__(parent, width=width, height=height, bg=background(parent), bd=0,
                          highlightthickness=0, takefocus=state != 'disabled',
                          cursor='arrow' if state == 'disabled' else 'hand2', **kwargs)
+        self._root()._free_ai_buttons.add(self)
         self.bind('<Configure>', self.draw)
         self.bind('<Enter>', lambda e: self._hover(True))
         self.bind('<Leave>', lambda e: self._hover(False))
@@ -240,6 +295,23 @@ class FlatButton(tk.Canvas):
         self.bind('<space>', self._activate)
         self.bind('<FocusIn>', self.draw)
         self.bind('<FocusOut>', self.draw)
+        self.bind('<Destroy>', lambda e: self._root()._free_ai_buttons.discard(self))
+
+    def _requested_size(self):
+        text_width = self._font.measure(self.value)
+        padding = 28 if self.align == 'w' or self._base_width is None else 20
+        if self._base_width is not None and self.align == 'center' and len(self.value) == 1:
+            padding = 8
+        width = max(self._base_width if self._base_width is not None else 66, text_width + padding)
+        if self._max_width is not None:
+            width = min(width, self._max_width)
+        height = max(self._base_height, self._font.metrics('linespace') + 8)
+        return width, height
+
+    def _resize_text(self):
+        width, height = self._requested_size()
+        super().configure(width=width, height=height)
+        self.draw()
 
     def _focus_on_click(self, event):
         if self.button_state != 'disabled':
@@ -259,12 +331,16 @@ class FlatButton(tk.Canvas):
         for source, target in [('text','value'), ('command','command'), ('variant','variant'), ('state','button_state')]:
             if source in kwargs:
                 setattr(self, target, kwargs.pop(source))
+        if 'width' in kwargs:
+            self._base_width = kwargs.pop('width')
+        if 'height' in kwargs:
+            self._base_height = kwargs.pop('height')
         if self.button_state == 'disabled':
             kwargs.update(takefocus=False, cursor='arrow')
         else:
             kwargs.update(takefocus=True, cursor='hand2')
         result = super().configure(**kwargs)
-        self.draw()
+        self._resize_text()
         return result
     config = configure
 
@@ -293,7 +369,9 @@ class FlatButton(tk.Canvas):
             foreground = COLORS['disabled_fg']
             if self.variant == 'primary':
                 fill = COLORS['disabled_bg']
-        w, h = max(self.winfo_width(), int(float(super().cget('width')))), max(self.winfo_height(), 2)
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 3 or h < 3:
+            return
         cyberpunk = _is_cyberpunk(self)
         if cyberpunk:
             outline = fill
@@ -304,8 +382,16 @@ class FlatButton(tk.Canvas):
             _chamfered(self, 1, 1, w - 1, h - 1, 7, fill=fill, outline=outline)
         else:
             rounded(self, 1, 1, w-1, h-1, self.radius, fill=fill, outline=fill)
-        self.create_text(16 if self.align == 'w' else w/2, h/2, text=self.value,
-                         anchor=self.align, fill=foreground, font=(FONT, self.font_size))
+        text = self.value
+        available = w - (24 if self.align == 'w' else 8)
+        text_width = self._font.measure(text)
+        if text_width > available and len(text) > 1:
+            text = text[:max(0, int(len(text) * available / text_width))]
+            while text and self._font.measure(text + '…') > available:
+                text = text[:-1]
+            text += '…'
+        self.create_text(16 if self.align == 'w' else w/2, h/2, text=text,
+                         anchor=self.align, fill=foreground, font=self._font)
         if self.focus_get() == self and not disabled:
             if cyberpunk:
                 focus = COLORS['primary_fg'] if self.variant == 'primary' else COLORS['focus']
@@ -316,19 +402,24 @@ class FlatButton(tk.Canvas):
 
 def label(parent, text='', size=12, bold=False, color=None, **kwargs):
     return tk.Label(parent, text=text, bg=background(parent), fg=color or COLORS['text'],
-                    font=(FONT, size, 'bold' if bold else 'normal'), bd=0, **kwargs)
+                    font=ui_font(parent, size, bold), bd=0, **kwargs)
 
 
 class ScrollArea(tk.Frame):
-    def __init__(self, parent, bg=None, **kwargs):
+    def __init__(self, parent, bg=None, *, max_width=None, scrollbar=False, **kwargs):
         color = bg or background(parent)
         super().__init__(parent, bg=color, **kwargs)
+        self.max_width = max_width
         self.canvas = tk.Canvas(self, bg=color, bd=0, highlightthickness=0)
-        self.canvas.pack(fill='both', expand=True)
+        if scrollbar:
+            bar = ttk.Scrollbar(self, orient='vertical', command=self.canvas.yview)
+            bar.pack(side='right', fill='y')
+            self.canvas.configure(yscrollcommand=bar.set)
+        self.canvas.pack(side='left', fill='both', expand=True)
         self.body = tk.Frame(self.canvas, bg=color)
-        self.window = self.canvas.create_window((0, 0), window=self.body, anchor='nw')
-        self.body.bind('<Configure>', lambda e: self.canvas.configure(scrollregion=self.canvas.bbox('all')))
-        self.canvas.bind('<Configure>', lambda e: self.canvas.itemconfigure(self.window, width=e.width))
+        self.window = self.canvas.create_window((0, 0), window=self.body, anchor='nw', width=1)
+        self.body.bind('<Configure>', self._update_scroll_region)
+        self.canvas.bind('<Configure>', self._resize_body)
         self.canvas.bind('<MouseWheel>', self.wheel)
         self.body.bind('<MouseWheel>', self.wheel)
 
@@ -337,7 +428,19 @@ class ScrollArea(tk.Frame):
             self.canvas.yview_scroll(int(-event.delta/120), 'units')
         return 'break'
 
+    def _resize_body(self, event):
+        width = min(event.width, self.max_width) if self.max_width else event.width
+        self.canvas.itemconfigure(self.window, width=width)
+        self.canvas.coords(self.window, (event.width - width) // 2, 0)
+        self._update_scroll_region()
+
+    def _update_scroll_region(self, event=None):
+        self.canvas.configure(scrollregion=(0, 0, self.canvas.winfo_width(), self.body.winfo_reqheight()))
+
     def bind_wheel(self, widget):
-        widget.bind('<MouseWheel>', self.wheel, add='+')
+        if isinstance(widget, (tk.Text, ttk.Treeview)):
+            return
+        if widget not in (self.body, self.canvas):
+            widget.bind('<MouseWheel>', self.wheel, add='+')
         for child in widget.winfo_children():
             self.bind_wheel(child)

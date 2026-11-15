@@ -6,7 +6,7 @@ from pathlib import Path
 import queue
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, ttk
 from uuid import uuid4
 
 from paths import ARTIFACTS, DATA_ROOT, ROOT, RUNS_ROOT
@@ -17,10 +17,38 @@ from epistemology import KnowledgeStore
 from epistemology_ui import EpistemologyPanel
 import training_desktop as bridge
 import training_extension as extension
+from ui_kit import (
+    COLORS, FlatButton, RoundedFrame, ScrollArea, background, label,
+    set_text_size, setup_theme, text_scale, ui_font,
+)
+from ui_preferences import TEXT_SIZES, load_text_size, save_text_size
 
 
 DATA_NAMES = {'sft_train.jsonl': '练习题', 'sft_validation.jsonl': '挑选成果用的新题',
               'sft_test.jsonl': '最后检查用的新题', 'sft_general_test.jsonl': '基础能力检查题'}
+TRAINER_CONTENT_WIDTH = 1120
+TRAINER_THEMES = {'跟随客户端': 'client', '边缘行者 · 霓虹': 'cyberpunk', '经典深色': 'dark', '明亮': 'light'}
+
+
+class ControlRow(tk.Frame):
+    """Keep related controls together and wrap them when the available width changes."""
+    def __init__(self, parent):
+        super().__init__(parent, bg=background(parent))
+        self.bind('<Configure>', self.reflow)
+
+    def reflow(self, event=None):
+        x = y = line_height = 0
+        width = self.winfo_width()
+        for widget in self.winfo_children():
+            requested = min(widget.winfo_reqwidth(), width)
+            if x and x + requested > width:
+                x, y, line_height = 0, y + line_height + 5, 0
+            widget.place(x=x, y=y, width=requested)
+            x += requested + 8
+            line_height = max(line_height, widget.winfo_reqheight())
+        height = y + line_height + 5
+        if int(self.cget('height')) != height:
+            self.configure(height=height)
 
 
 def training_runs(directory=RUNS_ROOT):
@@ -68,12 +96,12 @@ def result_text(result):
 
 class TrainingKnowledgePanel(EpistemologyPanel):
     def __init__(self, app, page):
-        super().__init__(app, page)
+        super().__init__(app, page, responsive=True)
         self.summary_scope_notice = (
             '让 AI 总结时，使用客户端当前选择的模型或 API。若选择 API，将把所选这一条记录的题目、'
             '结果与反馈发送到配置服务；其他记录和聊天不会发送。')
-        ttk.Label(page, text=self.summary_scope_notice, wraplength=900,
-                  foreground='#63728b').pack(fill='x', pady=(0, 6), before=self.notebook)
+        app.wrap_label(page, self.summary_scope_notice, size=11, color=app.colors['muted']).pack(
+            fill='x', pady=(0, 6), before=self.notebook)
 
     def _summary_notice(self, message):
         self.notice.set(message)
@@ -155,11 +183,21 @@ class TrainingKnowledgePanel(EpistemologyPanel):
 
 class TrainerApp:
     def __init__(self, root):
-        from ui_kit import COLORS, FlatButton, RoundedFrame, ScrollArea, label, setup_theme
-        self.colors, self.FlatButton, self.label = COLORS, FlatButton, label
-        self.RoundedFrame, self.ScrollArea = RoundedFrame, ScrollArea
+        self.colors = COLORS
         self.root = root
-        setup_theme(root, 'Free AI · 训练工作台', size=(1320, 880))
+        self.settings = Sessions(ARTIFACTS)
+        theme_choice = self.settings.get('trainer_theme', 'client')
+        if theme_choice not in TRAINER_THEMES.values():
+            theme_choice = 'client'
+        self.theme = self.settings.get('client_theme', 'cyberpunk') if theme_choice == 'client' else theme_choice
+        if self.theme not in ('cyberpunk', 'dark', 'light'):
+            self.theme = 'cyberpunk'
+        preference = load_text_size()
+        setup_theme(root, 'Free AI · 训练工作台', size=(1320, 880), min_size=(760, 560), text_size=preference, theme=self.theme)
+        self.theme_choice = tk.StringVar(root, value=next(name for name, value in TRAINER_THEMES.items() if value == theme_choice))
+        self.theme_notice = tk.StringVar(root)
+        self.text_size = tk.StringVar(root, value=next(name for name, value in TEXT_SIZES.items() if value == preference))
+        self.control_rows = []
         self.busy = False
         self.events = queue.Queue()
         self.cancel_event = threading.Event()
@@ -171,11 +209,15 @@ class TrainerApp:
         self.nav = []
         self.manager = PackageManager()
         self.knowledge = KnowledgeStore()
-        self.settings = Sessions(ARTIFACTS)
         selected_model = self.settings.get('trainer_model', '')
         self.trainer_model = tk.StringVar(value=selected_model if selected_model == 'legacy-training-model' else '')
         self.status = tk.StringVar(value='先选择训练模型，再检查练习题。')
-        self.dataset = tk.StringVar(value=str(DATA_ROOT))
+        saved_dataset = self.settings.get('trainer_dataset')
+        try:
+            dataset_path = saved_dataset if isinstance(saved_dataset, str) and Path(saved_dataset).is_dir() else str(DATA_ROOT)
+        except (OSError, ValueError):
+            dataset_path = str(DATA_ROOT)
+        self.dataset = tk.StringVar(value=dataset_path)
         self.adapter = tk.StringVar()
         self.epochs = tk.StringVar(value='1')
         self.learning_rate = tk.StringVar(value='0.0001')
@@ -204,72 +246,156 @@ class TrainerApp:
         c = self.colors
         body = self.frame(self.root)
         body.pack(fill='both', expand=True)
-        side = self.frame(body, c['side'], width=214, padx=18, pady=28)
+        side = self.frame(body, c['side'], width=174, padx=12, pady=28)
+        self.sidebar = side
         side.pack(side='left', fill='y')
         side.pack_propagate(False)
-        self.label(side, 'free ai', size=25, bold=True).pack(anchor='w', padx=12)
-        self.label(side, '训练工作台', size=12, color=c['muted']).pack(anchor='w', padx=14, pady=(3, 34))
+        self._resize_sidebar()
+        self.brand_label = label(side, 'Free AI', size=25, bold=True, color=c.get('brand', c['text']))
+        self.brand_label.pack(anchor='w', padx=8)
+        label(side, '训练工作台', size=12, color=c['muted']).pack(anchor='w', padx=8, pady=(3, 30))
         for index, title in enumerate(('训练', '训练记录', '经验改进')):
-            button = self.FlatButton(side, text=title, command=lambda i=index: self.select_page(i),
-                                     variant='ghost', width=175, height=48)
+            button = FlatButton(side, text=title, command=lambda i=index: self.select_page(i),
+                                variant='ghost', width=138, height=44, anchor='w')
             button.pack(fill='x', pady=4)
             self.nav.append(button)
-        self.label(side, '专注训练与检查\n聊天请使用 Free AI 客户端', size=11,
-                   color=c['muted'], justify='left', wraplength=175).pack(side='bottom', anchor='w', padx=10, pady=8)
-        main = self.frame(body, padx=34, pady=22)
-        main.pack(side='left', fill='both', expand=True)
-        self.page_holder = self.frame(main)
+        self.wrap_label(side, '聊天请使用 Free AI 客户端', size=11, color=c['muted']).pack(
+            side='bottom', fill='x', padx=8, pady=8)
+        viewport = self.frame(body)
+        viewport.pack(side='left', fill='both', expand=True)
+        self.main = self.frame(viewport)
+        self.main.place(relx=.5, y=16, relheight=1, height=-32, anchor='n')
+        viewport.bind('<Configure>', lambda event: self.main.place_configure(
+            width=max(1, min(TRAINER_CONTENT_WIDTH, event.width - 32))))
+        tools = self.button_row(self.main)
+        tools.pack(side='top', fill='x', pady=(0, 10))
+        theme_group = self.frame(tools)
+        label(theme_group, '主题', size=11, color=c['muted']).pack(side='left', padx=(0, 8))
+        self.theme_picker = ttk.Combobox(theme_group, textvariable=self.theme_choice, state='readonly',
+                                        values=tuple(TRAINER_THEMES), width=20, font=ui_font(self.root))
+        self.theme_picker.pack(side='left')
+        self.theme_picker.bind('<<ComboboxSelected>>', self.change_theme)
+        size_group = self.frame(tools)
+        label(size_group, '文字大小', size=11, color=c['muted']).pack(side='left', padx=(8, 8))
+        self.text_size_picker = ttk.Combobox(size_group, textvariable=self.text_size, state='readonly',
+                                            values=tuple(TEXT_SIZES), width=9, font=ui_font(self.root))
+        self.text_size_picker.pack(side='left')
+        self.text_size_picker.current(tuple(TEXT_SIZES).index(self.text_size.get()))
+        self.text_size_picker.bind('<<ComboboxSelected>>', self.change_text_size)
+        self.theme_notice_label = self.wrap_label(self.main, textvariable=self.theme_notice, size=10, color=c['muted'])
+        footer = self.frame(self.main)
+        footer.pack(side='bottom', fill='x', pady=(10, 0))
+        self.stop_button = FlatButton(footer, text='停止当前任务', command=self.stop_training,
+                                      variant='secondary', width=145, height=36, state='disabled')
+        self.stop_button.pack(side='right', padx=(10, 0))
+        self.wrap_label(footer, textvariable=self.status, size=11, color=c['muted']).pack(
+            side='left', fill='x', expand=True)
+        self.stop_buttons.append(self.stop_button)
+        self.page_holder = self.frame(self.main)
         self.page_holder.pack(fill='both', expand=True)
         self.page_holder.pack_propagate(False)
-        for _ in range(3):
-            page = self.frame(self.page_holder)
-            self.pages.append(page)
-        footer = self.frame(main)
-        footer.pack(fill='x', pady=(14, 0))
-        self.label(footer, '', textvariable=self.status, size=11, color=c['muted'], wraplength=800).pack(side='left', anchor='w', fill='x', expand=True)
-        self.stop_button = self.FlatButton(footer, text='停止当前任务', command=self.stop_training,
-                                         variant='secondary', width=145, height=36, state='disabled')
-        self.stop_button.pack(side='right', padx=(10, 0))
-        self.stop_buttons.append(self.stop_button)
-        self.train_scroll = self.ScrollArea(self.pages[0])
-        self.train_scroll.pack(fill='both', expand=True)
+        self.pages = [ScrollArea(self.page_holder, scrollbar=True) for _ in range(3)]
+        self.train_scroll, self.records_scroll, self.knowledge_scroll = self.pages
         self._training_page(self.train_scroll.body)
-        self.train_scroll.bind_wheel(self.train_scroll.body)
-        self._records_page(self.pages[1])
-        self.knowledge_scroll = self.ScrollArea(self.pages[2])
-        self.knowledge_scroll.pack(fill='both', expand=True)
+        self._records_page(self.records_scroll.body)
         self._knowledge_page(self.knowledge_scroll.body)
-        self.knowledge_scroll.bind_wheel(self.knowledge_scroll.body)
+        for page in self.pages:
+            page.bind_wheel(page.body)
+        self.root.bind('<<FreeAITextSizeChanged>>', lambda event: self.root.after_idle(self.reflow), add='+')
+
+    def change_text_size(self, event=None):
+        choice = TEXT_SIZES[self.text_size.get()]
+        set_text_size(self.root, choice)
+        try:
+            save_text_size(choice)
+        except OSError:
+            self.status.set('本次已应用字号，未能保存设置。')
+            logging.exception('Unable to save desktop text size')
+
+    def change_theme(self, event=None):
+        choice = TRAINER_THEMES.get(self.theme_choice.get())
+        if choice is None:
+            return
+        try:
+            self.settings.set('trainer_theme', choice)
+        except Exception:
+            logging.exception('Unable to save trainer theme')
+            self.status.set('主题偏好未能保存。')
+            return
+        self.theme_notice.set('已保存主题，下次打开训练端时生效。')
+        self.theme_notice_label.pack(fill='x', pady=(0, 8), before=self.page_holder)
+
+    def reflow(self):
+        self._resize_sidebar()
+        for row in self.control_rows:
+            row.reflow()
+        self._arrange_comparisons()
+        self.knowledge_panel.arrange_practice()
+
+    def _resize_sidebar(self):
+        title_width = max(ui_font(self.sidebar, 25, bold=True).measure('Free AI'),
+                          ui_font(self.sidebar, 12).measure('训练工作台'))
+        self.sidebar.configure(width=max(174, title_width + 48))
+
+    def button_row(self, parent):
+        row = ControlRow(parent)
+        self.control_rows.append(row)
+        return row
+
+    @staticmethod
+    def wrap_label(parent, text='', **kwargs):
+        widget = label(parent, text, wraplength=480, anchor='w', justify='left', **kwargs)
+        widget.bind('<Configure>', lambda event: widget.configure(wraplength=max(1, event.width - 4)))
+        return widget
 
     def heading(self, page, title, subtitle):
-        self.label(page, title, size=27, bold=True).pack(anchor='w')
-        self.label(page, subtitle, size=12, color=self.colors['muted'], wraplength=980,
-                   justify='left').pack(anchor='w', pady=(8, 18))
+        self.wrap_label(page, title, size=25, bold=True).pack(fill='x')
+        self.wrap_label(page, subtitle, size=12, color=self.colors['muted']).pack(fill='x', pady=(6, 16))
 
     def card(self, parent, title):
-        container = self.RoundedFrame(parent, bg=self.colors['surface'], radius=16,
+        container = RoundedFrame(parent, bg=self.colors['surface'], radius=16,
                                       padding=(20, 14), border=self.colors['line'])
         container.pack(fill='x', pady=(0, 12))
         box = container.body
         box.container = container
-        self.label(box, title, size=15, bold=True).pack(anchor='w', pady=(0, 8))
+        self.wrap_label(box, title, size=15, bold=True).pack(fill='x', pady=(0, 8))
         return box
 
     def button(self, parent, text, command, variant='secondary', width=None):
-        button = self.FlatButton(parent, text=text, command=command, variant=variant,
-                                 width=width or max(108, len(text) * 14 + 26), height=38)
-        button.pack(side='left', padx=(0, 8))
+        button = FlatButton(parent, text=text, command=command, variant=variant, width=width, height=38)
+        if isinstance(parent, ControlRow):
+            parent.reflow()
+        else:
+            button.pack(side='left', padx=(0, 8))
         self.buttons.append(button)
         return button
 
     def text(self, parent, height=5, editable=False):
-        widget = tk.Text(parent, height=height, wrap='word', font=('Microsoft YaHei UI', 12),
+        frame = self.frame(parent, background(parent))
+        frame.pack(fill='both', expand=True, pady=4)
+        widget = tk.Text(frame, width=28, height=height, wrap='word', font=ui_font(parent),
                          bg=self.colors['surface'], fg=self.colors['text'], insertbackground=self.colors['text'],
                          relief='flat', highlightthickness=1, highlightbackground=self.colors['line'],
                          padx=12, pady=10, undo=editable)
-        widget.pack(fill='both', expand=True, pady=4)
+        bar = ttk.Scrollbar(frame, orient='vertical', command=widget.yview)
+        bar.pack(side='right', fill='y')
+        widget.configure(yscrollcommand=bar.set)
+        widget.pack(side='left', fill='both', expand=True)
         if not editable:
             widget.configure(state='disabled')
+        return widget
+
+    def tree(self, parent, *, pady=0, **options):
+        frame = self.frame(parent, background(parent))
+        frame.pack(fill='x', pady=pady)
+        frame.columnconfigure(0, weight=1)
+        widget = ttk.Treeview(frame, **options)
+        vertical = ttk.Scrollbar(frame, orient='vertical', command=widget.yview)
+        horizontal = ttk.Scrollbar(frame, orient='horizontal', command=widget.xview)
+        widget.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        widget.grid(row=0, column=0, sticky='nsew')
+        vertical.grid(row=0, column=1, sticky='ns')
+        horizontal.grid(row=1, column=0, sticky='ew')
         return widget
 
     @staticmethod
@@ -284,11 +410,11 @@ class TrainerApp:
     def _training_page(self, page):
         self.heading(page, '让 AI 学会你的做法', '从一小批可靠的题目开始，每次训练都用没教过的新题检查。')
         self.setup_card = self.card(page, '选择训练模型')
-        self.label(self.setup_card, '', textvariable=self.preparation_notice, size=11,
-                   color=self.colors['muted'], wraplength=930).pack(anchor='w')
-        self.label(self.setup_card, '模型保存位置：' + str(self.manager.root), size=11,
-                   color=self.colors['muted'], wraplength=930).pack(anchor='w', pady=(5, 0))
-        row = self.frame(self.setup_card, self.colors['surface'])
+        self.wrap_label(self.setup_card, textvariable=self.preparation_notice, size=11,
+                        color=self.colors['muted']).pack(fill='x')
+        self.wrap_label(self.setup_card, '模型保存位置：' + str(self.manager.root), size=11,
+                        color=self.colors['muted']).pack(fill='x', pady=(5, 0))
+        row = self.button_row(self.setup_card)
         row.pack(fill='x', pady=(8, 0))
         self.tools_button = self.button(row, '准备训练工具', self.prepare_tools, width=180)
         self.model_button = self.button(row, '下载入门训练模型', self.prepare_model, width=210)
@@ -296,101 +422,119 @@ class TrainerApp:
                                             variant='primary', width=180)
         first = self.card(page, '1   准备练习题')
         self.data_card = first
-        row = self.frame(first, self.colors['surface'])
+        ttk.Entry(first, textvariable=self.dataset, font=ui_font(first)).pack(fill='x', pady=(0, 8))
+        row = self.button_row(first)
         row.pack(fill='x')
-        ttk.Entry(row, textvariable=self.dataset, font=('Microsoft YaHei UI', 12)).pack(side='left', fill='x', expand=True, ipady=7, padx=(0, 10))
         self.button(row, '选择文件夹', self.choose_data)
         self.button(row, '检查数据', self.check_data)
-        row = self.frame(first, self.colors['surface'])
-        row.pack(fill='x', pady=(7, 0))
-        self.label(row, '', textvariable=self.data_notice, size=11, color=self.colors['muted'], wraplength=720).pack(side='left', anchor='w')
         self.button(row, '题目格式', self.data_help, variant='ghost', width=100)
+        self.online_data_button = self.button(row, '联网找训练数据', self.toggle_online_data, variant='accent', width=180)
+        self.wrap_label(first, textvariable=self.data_notice, size=11, color=self.colors['muted']).pack(fill='x')
+        from hf_dataset_panel import HuggingFaceDatasetPanel
+        self.dataset_panel = HuggingFaceDatasetPanel(self, first, self.imported_dataset)
         second = self.card(page, '2   开始训练')
-        self.label(second, '选择模型后才能开始训练。学习成果单独保存，不会替换日常聊天模型。',
-                   size=11, color=self.colors['muted'], wraplength=930).pack(anchor='w')
-        row = self.frame(second, self.colors['surface'])
+        self.wrap_label(second, '选择模型后才能开始训练。学习成果单独保存，不会替换日常聊天模型。',
+                        size=11, color=self.colors['muted']).pack(fill='x')
+        row = self.button_row(second)
         row.pack(fill='x', pady=(10, 0))
         self.start_button = self.button(row, '开始训练', self.finetune, variant='primary', width=140)
-        stop_button = self.FlatButton(row, text='停止', command=self.stop_training,
-                                     variant='secondary', width=90, height=38, state='disabled')
-        stop_button.pack(side='left', padx=(0, 12))
+        stop_button = FlatButton(row, text='停止', command=self.stop_training,
+                                 variant='secondary', width=90, height=38, state='disabled')
         self.stop_buttons.append(stop_button)
-        self.label(row, '', textvariable=self.phase, size=12, color=self.colors['muted']).pack(side='left')
         self.button(row, '更多设置', self.toggle_parameters, variant='ghost', width=115)
+        self.wrap_label(second, textvariable=self.phase, size=12, color=self.colors['muted']).pack(fill='x')
         self.parameters = self.frame(second, self.colors['surface'])
-        row = self.frame(self.parameters, self.colors['surface'])
-        row.pack(fill='x', pady=(12, 7))
-        self.label(row, '完整学习次数', size=12).pack(side='left')
-        ttk.Spinbox(row, from_=1, to=10, textvariable=self.epochs, width=5).pack(side='left', padx=(10, 22))
-        self.label(row, '每次调整幅度', size=12).pack(side='left')
-        ttk.Entry(row, textvariable=self.learning_rate, width=12).pack(side='left', padx=10)
-        ttk.Checkbutton(row, text='保存为工具使用练习成果', variable=self.agent_target).pack(side='left', padx=10)
+        row = self.button_row(self.parameters)
+        row.pack(fill='x', pady=(12, 4))
+        epochs = self.frame(row, self.colors['surface'])
+        label(epochs, '完整学习次数').pack(side='left', padx=(0, 8))
+        ttk.Spinbox(epochs, from_=1, to=10, textvariable=self.epochs, width=6).pack(side='left')
+        rate = self.frame(row, self.colors['surface'])
+        label(rate, '每次调整幅度').pack(side='left', padx=(0, 8))
+        ttk.Entry(rate, textvariable=self.learning_rate, width=10).pack(side='left')
+        ttk.Checkbutton(row, text='保存为工具使用练习成果', variable=self.agent_target)
+        self.wrap_label(self.parameters, '接着以前的成果学习（可留空）', size=11).pack(fill='x')
         row = self.frame(self.parameters, self.colors['surface'])
         row.pack(fill='x', pady=4)
-        self.label(row, '接着以前的成果学习（可留空）', size=11).pack(side='left')
-        ttk.Entry(row, textvariable=self.adapter).pack(side='left', fill='x', expand=True, padx=10)
-        self.button(row, '选择成果', self.choose_adapter)
+        button = self.button(row, '选择成果', self.choose_adapter)
+        button.pack_configure(side='right', padx=(8, 0))
+        ttk.Entry(row, textvariable=self.adapter).pack(side='left', fill='x', expand=True)
         third = self.card(page, '3   查看真实变化')
-        self.label(third, '', textvariable=self.result_notice, size=12,
-                   color=self.colors['muted'], wraplength=920, justify='left').pack(anchor='w')
-        row = self.frame(third, self.colors['surface'])
+        self.wrap_label(third, textvariable=self.result_notice, size=12, color=self.colors['muted']).pack(fill='x')
+        row = self.button_row(third)
         row.pack(fill='x', pady=(8, 0))
         self.button(row, '查看最近结果', self.latest_result, variant='ghost', width=145)
         self.button(row, '打开成果文件夹', self.open_outputs, variant='ghost', width=155)
-        self.log = self.text(page, height=3)
+        label(page, '运行日志', size=14, bold=True).pack(anchor='w', pady=(3, 0))
+        self.log = self.text(page, height=4)
         self.write(self.log, '检查数据后即可训练。停止时会等待当前步骤结束；未完成的实验不会被标成成功。')
+
+    def toggle_online_data(self):
+        if self.dataset_panel.winfo_manager():
+            self.dataset_panel.pack_forget()
+            self.online_data_button.configure(text='联网找训练数据')
+        else:
+            self.dataset_panel.pack(fill='x', pady=(12, 4))
+            self.online_data_button.configure(text='收起在线数据')
+            self.dataset_panel.sync_busy()
+            self.train_scroll.bind_wheel(self.dataset_panel)
+
+    def imported_dataset(self, result):
+        directory = Path(result['path'])
+        counts = bridge.inspect_data(directory)
+        self.dataset.set(str(directory))
+        self.settings.set('trainer_dataset', str(directory))
+        self.data_notice.set('已导入并检查：' + ' · '.join(f'{DATA_NAMES[name]} {count} 条' for name, count in counts.items()))
+        self.status.set('训练数据已准备好。核对内容后，再点击“开始训练”。')
+        self.write(self.log, '\n在线数据保存位置：' + str(directory) + '\n来源与导入记录：' + str(result['report']) + '\n', True)
 
     def _records_page(self, page):
         self.heading(page, '每一次训练，都留有依据', '看训练前后回答的变化，也检查有没有退步。数字变小并不代表每个回答都正确。')
-        toolbar = self.frame(page)
+        toolbar = self.button_row(page)
         toolbar.pack(fill='x', pady=(0, 10))
         self.button(toolbar, '刷新记录', self.refresh_runs)
         self.button(toolbar, '打开所选文件夹', self.open_selected_run)
         self.button(toolbar, '查看详细数值', lambda: self.show_details('训练详细记录', self.finetune_details))
-        self.run_tree = ttk.Treeview(page, columns=('status', 'name'), show='headings', height=4,
-                                     selectmode='browse')
+        self.run_tree = self.tree(page, pady=(0, 12), columns=('status', 'name'),
+                                  show='headings', height=4, selectmode='browse')
         self.run_tree.heading('status', text='结果')
         self.run_tree.column('status', width=110, stretch=False)
         self.run_tree.heading('name', text='训练记录')
-        self.run_tree.column('name', width=700)
-        self.run_tree.pack(fill='x', pady=(0, 12))
+        self.run_tree.column('name', width=700, minwidth=400)
         self.run_tree.bind('<<TreeviewSelect>>', self.select_run)
         self.record_summary = tk.StringVar(value='完成一次训练后，这里会显示实际检查结果。')
-        self.label(page, '', textvariable=self.record_summary, size=12, justify='left', wraplength=980).pack(anchor='w', pady=(0, 12))
+        self.wrap_label(page, textvariable=self.record_summary, size=12).pack(fill='x', pady=(0, 12))
         self.question = tk.StringVar()
         self.question_picker = ttk.Combobox(page, textvariable=self.question, state='readonly')
         self.question_picker.pack(fill='x', ipady=6, pady=(0, 10))
         self.question_picker.bind('<<ComboboxSelected>>', self.select_question)
-        comparisons = self.frame(page)
-        comparisons.pack(fill='both', expand=True)
-        comparisons.columnconfigure(0, weight=1, uniform='answers')
-        comparisons.columnconfigure(1, weight=1, uniform='answers')
-        comparisons.rowconfigure(0, weight=1)
-        before = self.frame(comparisons)
-        before.grid(row=0, column=0, sticky='nsew', padx=(0, 8))
-        after = self.frame(comparisons)
-        after.grid(row=0, column=1, sticky='nsew', padx=(8, 0))
-        self.label(before, '训练前', size=14, bold=True).pack(anchor='w')
-        self.label(after, '训练后', size=14, bold=True).pack(anchor='w')
-        self.before_answer = self.text(before, height=6)
-        self.after_answer = self.text(after, height=6)
+        self.comparisons = self.frame(page)
+        self.comparisons.pack(fill='x')
+        self.before_panel, self.after_panel = self.frame(self.comparisons), self.frame(self.comparisons)
+        label(self.before_panel, '训练前', size=14, bold=True).pack(anchor='w')
+        label(self.after_panel, '训练后', size=14, bold=True).pack(anchor='w')
+        self.before_answer = self.text(self.before_panel, height=6)
+        self.after_answer = self.text(self.after_panel, height=6)
+        self.comparisons.bind('<Configure>', self._arrange_comparisons)
+        self._arrange_comparisons()
         self.reference = tk.StringVar(value='选择一道检查题，查看题目、参考回答以及前后变化。')
-        self.label(page, '', textvariable=self.reference, size=11, color=self.colors['muted'],
-                   wraplength=980, justify='left').pack(anchor='w', pady=(10, 0))
+        self.wrap_label(page, textvariable=self.reference, size=11, color=self.colors['muted']).pack(fill='x', pady=(10, 0))
+
+    def _arrange_comparisons(self, event=None):
+        wide = self.comparisons.winfo_width() >= round(680 * text_scale(self.root))
+        if wide == getattr(self, '_wide_comparisons', None):
+            return
+        self._wide_comparisons = wide
+        self.comparisons.columnconfigure(0, weight=1, uniform='answers' if wide else '')
+        self.comparisons.columnconfigure(1, weight=int(wide), uniform='answers' if wide else '')
+        self.before_panel.grid(row=0, column=0, sticky='nsew', padx=(0, 7 if wide else 0))
+        self.after_panel.grid(row=0 if wide else 1, column=int(wide), sticky='nsew',
+                              padx=(7 if wide else 0, 0), pady=(0 if wide else 8, 0))
 
     def _knowledge_page(self, page):
         self.heading(page, '把一次纠错，变成可复用的做法', '保存实际结果，核对依据，再决定哪些做法值得下次使用。')
         self.knowledge_panel = TrainingKnowledgePanel(self, page)
         self.knowledge_panel.notice.set('训练结果与客户端的使用记录会保存在同一个经验库中。选择记录后即可纠错。')
-        style = ttk.Style(self.root)
-        style.configure('Knowledge.Treeview', font=('Microsoft YaHei UI', 12), rowheight=34)
-        style.configure('Knowledge.TNotebook.Tab', font=('Microsoft YaHei UI', 12), padding=(15, 9))
-        def neutral(widget):
-            if isinstance(widget, ttk.Label):
-                widget.configure(foreground=self.colors['muted'])
-            for child in widget.winfo_children():
-                neutral(child)
-        neutral(page)
 
     def select_page(self, index):
         if not 0 <= index < len(self.pages):
@@ -444,6 +588,7 @@ class TrainerApp:
                                     state='disabled' if model_ready or self.busy else 'normal')
         self.use_model_button.configure(text='已选择此模型' if selected else '使用这个模型',
                                        state='normal' if model_ready and not selected and not self.busy else 'disabled')
+        self.root.after_idle(self.tools_button.master.reflow)
 
     def use_training_model(self):
         if self.busy:
@@ -482,6 +627,7 @@ class TrainerApp:
     def check_data(self):
         directory = self.dataset.get()
         def done(counts):
+            self.settings.set('trainer_dataset', directory)
             self.data_notice.set('检查通过 · ' + ' · '.join(f'{DATA_NAMES[name]} {count} 道' for name, count in counts.items()))
             self.write(self.log, '文件格式、空内容和重复项检查通过。教学内容仍需你核实，检查题不会用于训练。')
         self.submit('正在检查练习题', lambda: bridge.inspect_data(directory), done)
@@ -577,6 +723,8 @@ class TrainerApp:
             self.stop_path.parent.mkdir(parents=True, exist_ok=True)
             self.stop_path.touch()
             self.status.set('已请求安全停止，等待当前训练或检查步骤结束。')
+        elif self.current_job == 'hf-dataset':
+            self.status.set('正在停止数据请求，未完成的导入不会选作训练数据。')
         else:
             self.status.set('正在停止准备任务，已下载的文件会保留。')
         self._set_stop('disabled')
@@ -673,6 +821,8 @@ class TrainerApp:
             self.status.set('当前任务还在进行，请先等待结束或停止。')
             return
         self.busy = True
+        if hasattr(self, 'dataset_panel'):
+            self.dataset_panel.sync_busy()
         self.current_job = kind
         self.cancel_event.clear()
         self.status.set(title)
@@ -694,6 +844,8 @@ class TrainerApp:
                     callback(value)
                     continue
                 self.busy = False
+                if hasattr(self, 'dataset_panel'):
+                    self.dataset_panel.sync_busy()
                 self.current_job = None
                 self.stop_path = None
                 self._set_stop('disabled')

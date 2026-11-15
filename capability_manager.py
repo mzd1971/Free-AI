@@ -79,11 +79,15 @@ class PackageManager:
             from paths import MODELS_ROOT
             root = MODELS_ROOT
         self.root = Path(root).absolute()
-        if catalog is None:
+        default_catalog = catalog is None
+        if default_catalog:
             catalog = json.loads(Path(__file__).with_name('capability_catalog.json').read_text(encoding='utf-8'))
         if 'packages' in catalog:
             catalog = {item['id']: item for item in catalog['packages']}
         self.catalog = dict(catalog)
+        if default_catalog and 'engine-cpu' in self.catalog:
+            from hf_models import load_specs
+            self.catalog.update(load_specs(self))
         self._validate_catalog()
         self._verified = {}
         self._active = set()
