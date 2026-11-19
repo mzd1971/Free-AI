@@ -178,6 +178,7 @@ class SettingsPanel(tk.Frame):
     def sync_busy(self, *_):
         mode = self.app.project.permission_mode.get()
         busy = self.app.busy
+        self.harness.sync_busy()
         for key, button in self.permission_buttons.items():
             button.configure(variant='selected' if key == mode else 'secondary',
                              text=('✓  ' if key == mode else '') + PERMISSION_LABELS[key],
@@ -218,8 +219,14 @@ class SettingsPanel(tk.Frame):
             anchor='w', pady=(10, 5))
         self.description(tools, textvariable=self.coding_notice).pack(fill='x')
 
-        project = self.card('coding', '打开当前项目', '请先在项目对话中选择文件夹。',
-                            '用编辑器打开项目 在项目中打开终端 工作区')
+        from harness_panel import HarnessPanel
+        project = self.card('coding', '项目执行方式', keywords='Free AI 内置 DeepSeek Harness dsh.exe '
+                            '安装执行组件 检查连接 官方说明 打开当前项目 用编辑器打开项目 在项目中打开终端 工作区')
+        self.harness = HarnessPanel(self.app, project, self.description)
+        self.harness.pack(fill='x')
+        ttk.Separator(project).pack(fill='x', pady=12)
+        label(project, '打开当前项目', size=13, bold=True).pack(anchor='w')
+        self.description(project, '请先在项目对话中选择文件夹。').pack(fill='x')
         self.description(project, textvariable=self.app.project.workspace).pack(fill='x')
         self.actions(project, [('用编辑器打开项目', self.app.open_project_in_editor),
                                ('在项目中打开终端', self.app.open_project_terminal)])

@@ -16,9 +16,10 @@ TITLES = {'remember_memory': '保存长期记忆', 'list_files': '查看项目',
           'run_command': '运行命令', 'update_plan': '整理计划'}
 STATES = {'running': '正在执行项目任务', 'executing': '正在执行项目任务', 'checking': '正在验证任务结果',
           'completed': '本轮已结束', 'stopped': '已停止', 'limit': '达到本轮上限', 'failed': '未完成',
-          'unfinished': '仍需处理', 'needs_work': '仍需处理', 'interrupted': '上次任务中断'}
+          'unfinished': '仍需处理', 'needs_work': '仍需处理', 'interrupted': '上次任务中断',
+          'review': '本轮结束 · 待验收'}
 ACTIVE_STATES = {'running', 'executing', 'checking'}
-CONTINUABLE_STATES = {'stopped', 'limit', 'failed', 'unfinished', 'needs_work', 'interrupted'}
+CONTINUABLE_STATES = {'stopped', 'limit', 'failed', 'unfinished', 'needs_work', 'interrupted', 'review'}
 COMMAND_STATES = {'denied': '已拒绝', 'cancelled': '已停止', 'timeout': '已超时',
                   'pending': '尚未执行', 'error': '未能执行', 'limit': '尚未执行'}
 PLAN_STATES = {'completed': '已完成', 'in_progress': '进行中', 'pending': '待处理'}
@@ -97,7 +98,8 @@ class ActivityCard:
         self.arguments.pack(side='left', fill='x', expand=True)
         actions = tk.Frame(self.approval_box, bg=C['tint'])
         actions.pack(fill='x', pady=(7, 0))
-        FlatButton(actions, '执行这条命令', lambda: self.decide(True), variant='primary', height=32, font_size=10).pack(side='left')
+        self.approve_button = FlatButton(actions, '执行这条命令', lambda: self.decide(True), variant='primary', height=32, font_size=10)
+        self.approve_button.pack(side='left')
         FlatButton(actions, '跳过', lambda: self.decide(False), variant='ghost', height=32, font_size=10).pack(side='left', padx=10)
         self.tools = tk.Frame(self.inner, bg=C['bg'])
         self.review_button = FlatButton(self.tools, '查看改动', self.toggle_review, variant='ghost',
@@ -261,6 +263,8 @@ class ActivityCard:
         if tool == 'run_command' and mode == 'automatic':
             title = '自动运行命令'
         if kind == 'start':
+            if event.get('engine') == 'harness':
+                self.result = {**self.result, 'engine': 'harness'}
             if event.get('run_dir'):
                 self.result = {**self.result, 'run_dir': event['run_dir'], 'continuation_available': True}
             if mode in PROJECT_PERMISSION_MODES:
@@ -302,13 +306,16 @@ class ActivityCard:
             if all(isinstance(step, str) for step in steps):
                 self.append('计划：\n' + '\n'.join(steps))
             self.status.set('已整理执行计划')
+        elif kind == 'harness_text':
+            self.append(event.get('message', ''))
+            self.status.set('组件正在回复')
         elif kind in ('instructions', 'context', 'resume'):
             self.status.set(title)
             files = event.get('files', [])
             self.append(title + ('\n' + '\n'.join(files) if files else ''))
         elif kind != 'finish':
             self.status.set(title + '…')
-        if kind in ('start', 'progress', 'tool_result', 'plan', 'instructions', 'context', 'resume'):
+        if kind in ('start', 'progress', 'tool_result', 'plan', 'instructions', 'context', 'resume', 'harness_text'):
             self.controller.save_card(self)
         self.resize()
         self.controller.refresh_summary()
@@ -319,15 +326,20 @@ class ActivityCard:
             return
         self.request = request
         details = request['details']
-        self.command_label.configure(text='需要你确认这条命令\n程序：' + str(details['executable']) +
+        self.approve_button.configure(text='允许此操作' if details.get('engine') == 'harness' else '执行这条命令')
+        self.command_label.configure(text=('需要你确认组件操作\n程序：' if details.get('engine') == 'harness'
+            else '需要你确认这条命令\n程序：') + str(details['executable']) +
             '\n目录：' + str(details['cwd']) +
             '\n最长 ' + str(details['timeout']) + ' 秒。命令以本机账户运行，可能读写项目外的文件。')
         self.arguments.configure(state='normal')
         self.arguments.delete('1.0', 'end')
-        self.arguments.insert('1.0', '完整参数（可滚动和复制）：\n' + json.dumps(details['argv'], ensure_ascii=False))
+        self.arguments.insert('1.0', '操作详情（可滚动和复制）：\n' + details['operation']
+                              if details.get('engine') == 'harness'
+                              else '完整参数（可滚动和复制）：\n' + json.dumps(details['argv'], ensure_ascii=False))
         self.arguments.configure(state='disabled')
         self.approval_box.pack(fill='x', pady=(8, 0))
-        self.status.set('等待确认验证命令' if details.get('purpose') == 'check' else '等待确认命令')
+        self.status.set('等待确认组件操作' if details.get('engine') == 'harness'
+                        else '等待确认验证命令' if details.get('purpose') == 'check' else '等待确认命令')
         self.app.select_page(0)
         self.resize()
         self.app.transcript.see('end')
@@ -341,6 +353,8 @@ class ActivityCard:
             request['ready'].set()
             if self.app.generation_cancel.is_set():
                 self.status.set('正在停止项目任务')
+            elif request['details'].get('engine') == 'harness':
+                self.status.set('操作已批准，等待执行' if allowed else '操作已拒绝')
             elif allowed and request['details'].get('purpose') == 'check':
                 self.status.set(STATES['checking'])
             else:
@@ -357,8 +371,8 @@ class ActivityCard:
             self.status.set('已执行文件撤回 · 展开过程查看结果')
         if self.expanded and result.get('run_dir'):
             self.tools.pack(fill='x', pady=(4, 0))
-        self.review_button.configure(state='normal' if result.get('run_dir') else 'disabled')
-        self.undo_button.configure(state='normal' if count and '[已撤回文件修改]' not in self.activity else 'disabled')
+        self.review_button.configure(state='normal' if result.get('run_dir') and result.get('engine') != 'harness' else 'disabled')
+        self.undo_button.configure(state='normal' if result.get('engine') != 'harness' and count and '[已撤回文件修改]' not in self.activity else 'disabled')
         self.sync_resume()
         self.resize()
 
@@ -376,6 +390,8 @@ class ActivityCard:
             lines.append(check_summary)
         if state.get('uncertain') or (result.get('status') == 'interrupted' and state.get('phase') == 'executing'):
             lines.append('上次操作结果仍需核实')
+        if result.get('engine') == 'harness':
+            lines.append('DeepSeek Harness · 执行结果需验收 · 不支持文件撤回')
         mode = result.get('permission_mode')
         if mode in ('readonly', 'automatic'):
             lines.append('权限 · ' + PERMISSION_LABELS[mode])
@@ -407,7 +423,8 @@ class ActivityCard:
             self.resume_button.configure(state='disabled' if self.app.busy else 'normal')
         else:
             self.resume_button.pack_forget()
-        if self.can_resume() and (self.result.get('task_state') or {}).get('uncertain'):
+        if (self.can_resume() and self.result.get('engine') != 'harness'
+                and (self.result.get('task_state') or {}).get('uncertain')):
             self.recovery_button.pack(anchor='w', pady=(4, 0))
             self.recovery_button.configure(state='disabled' if self.app.busy else 'normal')
         else:
@@ -647,7 +664,7 @@ class ProjectConversation:
         rows = self.app.sessions.project_runs(identity) if identity else []
         for row in rows:
             result = row['result']
-            if result.get('run_dir') and (result.get('status') in ACTIVE_STATES | {'interrupted'}
+            if result.get('engine') != 'harness' and result.get('run_dir') and (result.get('status') in ACTIVE_STATES | {'interrupted'}
                                           or (result.get('task_state') or {}).get('parent_run')):
                 result = {**result, 'changes': recorded_run_changes(result['run_dir'], row['workspace'])}
                 row['result'] = result
@@ -732,6 +749,24 @@ class ProjectConversation:
         if app.image_path or app.skill_file:
             app.status.set('做项目暂时只处理文字文件。请先在 + 菜单移除图片或 CSV 附件，草稿会保留。')
             return
+        from harness_settings import load_preferences as load_execution_preferences
+        execution = load_execution_preferences(app.sessions)
+        engine = execution['engine']
+        if resume_from:
+            source = next((card for card in self.cards if card.result and card.result.get('run_dir') == resume_from), None)
+            if source is None:
+                app.status.set('无法找到原任务，草稿已保留。')
+                return
+            engine = source.result.get('engine', 'builtin')
+        if engine == 'harness':
+            try:
+                from harness_agent import validate_selection, load_harness_run
+                execution['executable'] = validate_selection(execution['executable'], self.permission_mode.get(), self.allow_write.get())
+                if resume_from:
+                    load_harness_run(ARTIFACTS / 'project_runs', resume_from, folder)
+            except (ValueError, OSError, RuntimeError) as error:
+                app.status.set(str(error))
+                return
         local = app.backend == 'local'
         if local:
             from model_catalog import is_chat_model
@@ -779,7 +814,8 @@ class ProjectConversation:
         app.root.update_idletasks()
         card = ActivityCard(self, workspace)
         initial_result = {'status': 'running', 'answer': '项目任务执行中。', 'run_dir': '',
-                          'changes': [], 'continuation_available': False, 'permission_mode': permission_mode}
+                          'changes': [], 'continuation_available': False, 'permission_mode': permission_mode,
+                          'engine': engine}
         card.result = initial_result
         card.history_index = len(app.history)
         app.history.append({'role': 'assistant', 'content': initial_result['answer']})
@@ -815,12 +851,19 @@ class ProjectConversation:
             runner = None
             try:
                 from project_agent import ProjectAgent
-                runner = ProjectAgent(workspace, model, runs_root=ARTIFACTS / 'project_runs',
-                    approve_command=approve, on_event=on_event,
-                    cancel_event=app.generation_cancel, allow_write=allow_write, max_steps=16,
-                    context=context, knowledge=app.knowledge, use_memory=use_memory,
-                    personal_memory=app.personal_memory, read_memory=personal_options['read'],
-                    write_memory=personal_options['write'], permission_mode=permission_mode)
+                if engine == 'harness':
+                    from harness_agent import HarnessAgent
+                    runner = HarnessAgent(workspace, model, executable=execution['executable'],
+                        runs_root=ARTIFACTS / 'project_runs', approve_command=approve, on_event=on_event,
+                        cancel_event=app.generation_cancel, allow_write=allow_write,
+                        context=context, permission_mode=permission_mode)
+                else:
+                    runner = ProjectAgent(workspace, model, runs_root=ARTIFACTS / 'project_runs',
+                        approve_command=approve, on_event=on_event,
+                        cancel_event=app.generation_cancel, allow_write=allow_write, max_steps=16,
+                        context=context, knowledge=app.knowledge, use_memory=use_memory,
+                        personal_memory=app.personal_memory, read_memory=personal_options['read'],
+                        write_memory=personal_options['write'], permission_mode=permission_mode)
                 if resume_from:
                     if recovery_confirmed:
                         return runner.run(model_task, history=history, resume_from=resume_from,
@@ -832,7 +875,7 @@ class ProjectConversation:
                 directory = getattr(runner, 'run_dir', None)
                 return {'status': 'failed', 'answer': '项目任务发生错误，请检查目录、运行记录和磁盘空间。已有改动会保留。',
                         'run_dir': str(directory) if directory else '', 'changes': getattr(runner, 'changes', []),
-                        'episode_id': None, 'continuation_available': directory is not None}
+                        'episode_id': None, 'continuation_available': directory is not None, 'engine': engine}
 
         def done(result):
             self.active = None
@@ -866,7 +909,7 @@ class ProjectConversation:
         self.sync_busy()
 
     def undo(self, card):
-        if (self.app.busy or not card.result or not card.result.get('run_dir') or not card.result.get('changes')
+        if (self.app.busy or not card.result or card.result.get('engine') == 'harness' or not card.result.get('run_dir') or not card.result.get('changes')
                 or '[已撤回文件修改]' in card.activity):
             return
         from project_agent import rollback_run

@@ -41,6 +41,7 @@ class PackagingTests(unittest.TestCase):
                      'remote_api.py', 'app_skills.py', 'model_catalog.py', 'paths.py',
                      'client_settings.py', 'coding_tools.py', 'ui_preferences.py', 'hf_models.py', 'hf_model_panel.py', 'hf_datasets.py', 'hf_dataset_panel.py', 'hf_dataset_catalog.py',
                      'project_agent.py', 'project_chat.py', 'local_project_model.py',
+                     'acp_transport.py', 'harness_agent.py', 'harness_settings.py', 'harness_panel.py',
                      'agent_workspace.py', 'agent_task_state.py', 'agent_review.py',
                      'agent_memory.py', 'memory_learning.py', 'memory_panel.py',
                      'assets/free-ai.ico', 'assets/free-ai-ui.png',

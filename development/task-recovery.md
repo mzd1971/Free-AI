@@ -29,6 +29,8 @@ python -E -s -B -X utf8 -m unittest discover -s development/tests -p 'test_*.py'
 
 ## 后续开源复用
 
+后续进展：可选 Harness 接入已另行实现并实测，见 [接入说明](harness-integration.md)。下文保留当时的方案依据。
+
 用户偏好：缺失的能力优先接入已有开源实现。本轮专注修复现有数据与状态链路，尚未安装或接入 DeepSeek Harness。
 
 拟采用官方 ACP 外部进程接口接入 Harness，复用会话恢复、取消任务、工具执行和权限请求；Free AI 继续负责聊天界面、模型选择、训练端和自身记忆。采用可选组件并固定版本，避免扩大默认安装包。接口文档支持会话恢复，但不提供完整历史回放，因此 Free AI 仍需保存自己的事件记录。正式接入前须验证本地模型工具调用、命令确认、停止与重开流程。
