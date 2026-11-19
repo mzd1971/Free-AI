@@ -68,6 +68,8 @@ python free_ai_bootstrap.py --trainer
 
 自检使用隔离数据；真实模型实验在 `development/tests/run_*_experiment.py`，需先在应用里下载相应模型。打包测试依赖准备后的分发目录，未准备时相关项会跳过。
 
+Windows 回归还会直接测试仓库里的两个 EXE 和随附 Python/Tk，即使没有分发暂存目录也不会跳过。仅用系统 Python 跑通业务测试，不能替代启动程序的自检。`runtime/python/DLLs` 中的 `.pyd` 是必需的原生运行库，应随仓库与分发包一起保留；它们不是 `.pyc`/`.pyo` 缓存。
+
 准备分发文件：
 
 ```powershell

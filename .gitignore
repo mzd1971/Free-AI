@@ -22,7 +22,8 @@ credentials.json
 
 # Python caches and local environments
 __pycache__/
-*.py[cod]
+*.pyc
+*.pyo
 .venv/
 /venv/
 runtime/python/Lib/site-packages/
