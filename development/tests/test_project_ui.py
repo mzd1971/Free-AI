@@ -329,6 +329,7 @@ class NativeProjectScenario(unittest.TestCase):
                 app.project.choose_workspace()
             retry_command = [sys.executable, '-B', '-c', 'print("RECOVERY_CHECK_OK")']
             interrupted_model = FixtureModel([
+                ('write_file', {'path': 'parent-only.txt', 'content': 'original run'}),
                 ('update_plan', {'steps': [{'text': '运行本地检查', 'status': 'in_progress'}]}),
                 ('run_command', {'argv': retry_command, 'purpose': 'check'}),
             ])
@@ -345,12 +346,15 @@ class NativeProjectScenario(unittest.TestCase):
                 self.assertIn('计划进度 0/1', interrupted.progress.cget('text'))
                 self.assertIn('尚未验证', interrupted.progress.cget('text'))
                 self.assertTrue(checkpoint['result']['run_dir'])
+                task_file = Path(checkpoint['result']['run_dir'], 'task.json')
+                interrupted_state = task_file.read_bytes()
                 app.stop_generation()
                 settle(app)
             self.assertEqual(interrupted.result['status'], 'stopped')
             self.assertTrue(interrupted.resume_button.winfo_manager())
 
             # Reopen the last committed checkpoint as if the app closed before the run could finish.
+            task_file.write_bytes(interrupted_state)
             app.sessions.update_project_reply(recovery_id, 1, checkpoint['result'], str(workspace), checkpoint['activity'])
             app.new_conversation()
             with patch('local_project_model.LocalProjectModel', side_effect=AssertionError('restoring ran a task')):
@@ -360,6 +364,17 @@ class NativeProjectScenario(unittest.TestCase):
             self.assertIn('上次任务中断', recovered.status.get())
             self.assertIn('运行本地检查', recovered.progress.cget('text'))
             self.assertTrue(recovered.resume_button.winfo_manager())
+            self.assertTrue(recovered.recovery_button.winfo_manager())
+            self.assertEqual(recovered.undo_button.button_state, 'normal')
+            with patch('project_chat.messagebox.askyesno', return_value=False) as question, patch.object(
+                    app.project, 'send') as send:
+                recovered.recovery_button.invoke()
+                send.assert_not_called()
+                self.assertIn('RECOVERY_CHECK_OK', question.call_args.args[1])
+                self.assertIn('副作用', question.call_args.args[1])
+            with patch('project_chat.messagebox.askyesno', return_value=True), patch.object(app.project, 'send') as send:
+                recovered.recovery_button.invoke()
+                send.assert_called_once_with(resume_from=recovered.result['run_dir'], recovery_confirmed=True)
             self.assertEqual(app.history, app.sessions.messages(recovery_id))
             self.assertEqual(len(app.history), 2)
 
@@ -371,7 +386,8 @@ class NativeProjectScenario(unittest.TestCase):
             self.assertIn('原来的项目文件夹', app.status.get())
             self.assertEqual(app.input.get('1.0', 'end-1c'), resume_draft)
             app.project.workspace.set(str(workspace))
-            resumed_model = FixtureModel([('run_command', {'argv': retry_command, 'purpose': 'check'})])
+            resumed_model = FixtureModel([('run_command', {'argv': retry_command, 'purpose': 'check'}),
+                ('update_plan', {'steps': [{'text': '运行本地检查', 'status': 'completed'}]})])
             with patch.object(app.manager, 'ready', return_value=True), patch(
                     'local_project_model.LocalProjectModel', return_value=resumed_model):
                 app.project.resume(recovered)
@@ -383,9 +399,38 @@ class NativeProjectScenario(unittest.TestCase):
             self.assertIn('RECOVERY_CHECK_OK', resumed.activity)
             self.assertNotEqual(resumed.result['run_dir'], checkpoint['result']['run_dir'])
             self.assertIn('验证 · 已通过', resumed.progress.cget('text'))
+            self.assertFalse(resumed.recovery_button.winfo_manager())
+            self.assertFalse(resumed.result['changes'])
+            self.assertEqual(resumed.undo_button.button_state, 'disabled')
+            resumed.toggle()
+            self.assertIn('parent-only.txt', resumed.detail.get('1.0', 'end'))
             self.assertEqual(app.history[2]['content'], resume_draft)
             self.assertEqual(app.history, app.sessions.messages(recovery_id))
             self.assertEqual([row['assistant_index'] for row in app.sessions.project_runs(recovery_id)], [1, 3])
+            # Recover a stale card containing inherited edits while its own rollback manifest is empty.
+            stale_card = {**resumed.result, 'status': 'running', 'changes': [{'path': 'parent-only.txt'}]}
+            app.sessions.update_project_reply(recovery_id, 3, stale_card, str(workspace), resumed.activity)
+            app.new_conversation()
+            app.load_conversation(recovery_id)
+            replayed_child = app.project.cards[-1]
+            self.assertEqual(replayed_child.undo_button.button_state, 'disabled')
+            self.assertEqual(replayed_child.result['changes'], [])
+            self.assertEqual((workspace / 'parent-only.txt').read_text(), 'original run')
+
+            # Human verification acknowledges side effects without completing the outstanding test.
+            interrupted_card = app.project.cards[0]
+            with patch('project_chat.messagebox.askyesno', return_value=True), patch.object(
+                    app.manager, 'ready', return_value=True), patch('local_project_model.LocalProjectModel',
+                    return_value=FixtureModel([('update_plan', {'steps': [
+                        {'text': '运行本地检查', 'status': 'completed'}]})])):
+                interrupted_card.recovery_button.invoke()
+                settle(app)
+            confirmed = app.project.cards[-1]
+            self.assertEqual(confirmed.result['status'], 'unfinished')
+            self.assertFalse(confirmed.result['task_state']['uncertain'])
+            self.assertFalse(confirmed.recovery_button.winfo_manager())
+            self.assertIn('检查尚未执行', confirmed.progress.cget('text'))
+            self.assertIn('user_confirmation', [row['tool'] for row in confirmed.result['task_state']['observations']])
 
             legacy_id = app.sessions.create()
             app.sessions.set_project_settings(legacy_id, {'enabled': True, 'workspace': str(workspace),

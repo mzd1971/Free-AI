@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -72,7 +73,9 @@ again.close()
 class TrainerDataIntegrationTests(unittest.TestCase):
     def test_native_brand_theme_and_data_handoff(self):
         with tempfile.TemporaryDirectory(prefix='trainer-data-', dir=ROOT/'development') as scratch:
-            result=subprocess.run([str(ROOT/'runtime/python/python.exe'),'-E','-s','-B','-X','utf8','-c',SCENARIO],
+            bundled_python = ROOT/'runtime/python/python.exe'
+            executable = str(bundled_python) if bundled_python.is_file() else sys.executable
+            result=subprocess.run([executable,'-E','-s','-B','-X','utf8','-c',SCENARIO],
                 cwd=ROOT,env=dict(os.environ,AI_TRAINING_DATA=scratch),capture_output=True,text=True,encoding='utf-8',
                 timeout=40,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
             self.assertEqual(result.returncode,0,result.stdout+result.stderr)

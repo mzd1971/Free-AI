@@ -118,7 +118,11 @@ class Sessions:
         state = public.get('task_state')
         if isinstance(state, dict):
             structured = {field: state[field] for field in PROJECT_STATE_FIELDS if field in state}
-            for group, fields in (('plan', ('text', 'status')), ('edits', ('path', 'sha256'))):
+            if 'failed_writes' in state:
+                structured['failed_writes'] = [path for path in state['failed_writes'] if isinstance(path, str)]
+            for group, fields in (('plan', ('text', 'status')), ('edits', ('path', 'sha256')),
+                                  ('observations', ('tool', 'subject', 'status', 'detail')),
+                                  ('unresolved', ('id', 'tool', 'subject'))):
                 if group in state:
                     structured[group] = [{field: row[field] for field in fields if field in row}
                                          for row in state[group]]

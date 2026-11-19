@@ -145,7 +145,8 @@ class AgentWorkflowTests(unittest.TestCase):
         ]
         turns += [[('read_file', {'path': f'fixture-{number}.txt', 'limit': 2800})]
                   for number in range(7)]
-        agent = self.agent(*turns, '目标已处理。', context=10240)
+        agent = self.agent(*turns, [('update_plan', {'steps': [
+            {'text': '检查七项输入', 'status': 'completed'}]})], '目标已处理。', context=10240)
         goal = '写入初始记录并检查七项输入。'
         result = agent.run(goal)
         self.assertEqual(result['status'], 'completed', result)

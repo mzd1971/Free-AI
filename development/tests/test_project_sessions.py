@@ -108,6 +108,8 @@ class ProjectSessionTests(unittest.TestCase):
         finished = {'status': 'needs_work', 'answer': '检查失败。', 'run_dir': 'D:/runs/first',
                     'continuation_available': True, 'task_state': {
                         'uncertain': True,
+                        'failed_writes': ['test.py'],
+                        'unresolved': [{'id': 'a' * 64, 'tool': 'run_command', 'subject': 'python test.py'}],
                         'plan': [{'text': '修复检查', 'status': 'pending'}],
                         'verification': {'status': 'failed', 'checks': [
                             {'command': 'check', 'status': 'exited', 'returncode': 1, 'current': True},

@@ -5,7 +5,7 @@ import os
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 
 from app_state import CONTEXTS, PROJECT_PERMISSION_MODES
 from paths import ARTIFACTS
@@ -19,9 +19,10 @@ STATES = {'running': '正在执行项目任务', 'executing': '正在执行项�
           'unfinished': '仍需处理', 'needs_work': '仍需处理', 'interrupted': '上次任务中断'}
 ACTIVE_STATES = {'running', 'executing', 'checking'}
 CONTINUABLE_STATES = {'stopped', 'limit', 'failed', 'unfinished', 'needs_work', 'interrupted'}
-COMMAND_STATES = {'denied': '已跳过', 'cancelled': '已停止', 'timeout': '已超时'}
+COMMAND_STATES = {'denied': '已拒绝', 'cancelled': '已停止', 'timeout': '已超时',
+                  'pending': '尚未执行', 'error': '未能执行', 'limit': '尚未执行'}
 PLAN_STATES = {'completed': '已完成', 'in_progress': '进行中', 'pending': '待处理'}
-VERIFICATION_STATES = {'passed': '已通过', 'failed': '未通过', 'stale': '需要重新验证', 'not_run': '尚未验证'}
+VERIFICATION_STATES = {'passed': '已通过', 'failed': '未通过', 'stale': '需要重新验证', 'not_run': '尚未验证', 'blocked': '检查尚未执行'}
 PERMISSION_LABELS = {'standard': '逐条确认命令', 'readonly': '只看项目', 'automatic': '自动执行命令'}
 PERMISSION_HINTS = {
     'standard': '命令逐条确认',
@@ -35,7 +36,28 @@ INTERRUPTED_ANSWER = '上次项目任务中断，可以从这张任务卡继续�
 def apply_task_state(result, state):
     if not isinstance(state, dict):
         return result
-    return {**result, 'task_state': state, 'changes': state.get('edits', result.get('changes', []))}
+    return {**result, 'task_state': state}
+
+
+def recorded_run_changes(run_dir, workspace):
+    """Recover this card's file list from its own rollback manifest."""
+    from agent_review import _group_changes
+    from project_agent import _load_changes, _path_parts, _pinned, _target, _workspace
+
+    try:
+        root = _workspace(ARTIFACTS / 'project_runs')
+        project = _workspace(workspace)
+        run = Path(run_dir)
+        if run.parent != root:
+            return []
+        parts = _path_parts(run.name)
+        with _pinned(root, parts, directory=True):
+            manifest = _load_changes(_target(root, parts, directory=True))
+            if os.path.normcase(manifest['workspace']) != os.path.normcase(str(project)):
+                return []
+            return [{'path': change['path']} for change in _group_changes(manifest['changes'], project, root)]
+    except (OSError, ValueError, RuntimeError):
+        return []
 
 
 class ActivityCard:
@@ -58,6 +80,8 @@ class ActivityCard:
         self.progress = label(self.inner, '', size=10, anchor='w', justify='left')
         self.resume_button = FlatButton(self.inner, '继续任务', lambda: self.controller.resume(self),
                                         variant='primary', height=30, font_size=10)
+        self.recovery_button = FlatButton(self.inner, '核实中断后继续', self.confirm_recovery,
+                                          variant='ghost', height=30, font_size=10)
         self.detail = tk.Text(self.inner, bg=C['surface'], fg=C['text'], height=8, width=1,
                               wrap='word', font=ui_font(self.app.root, 10), bd=0, padx=9, pady=8, state='disabled')
         self.approval_box = tk.Frame(self.inner, bg=C['tint'], padx=10, pady=9)
@@ -201,6 +225,10 @@ class ActivityCard:
             sections.append('执行计划\n' + '\n'.join(
                 f'{PLAN_STATES.get(step.get("status"), "待处理")} · {step["text"]}'
                 for step in state['plan']))
+        if state.get('edits'):
+            sections.append('任务累计编辑的文件\n' + '\n'.join(row['path'] for row in state['edits']))
+        if state.get('failed_writes'):
+            sections.append('待完成的文件修改\n' + '\n'.join(state['failed_writes']))
         verification = state.get('verification', {})
         summary = self.verification_summary(state)
         if summary:
@@ -379,6 +407,25 @@ class ActivityCard:
             self.resume_button.configure(state='disabled' if self.app.busy else 'normal')
         else:
             self.resume_button.pack_forget()
+        if self.can_resume() and (self.result.get('task_state') or {}).get('uncertain'):
+            self.recovery_button.pack(anchor='w', pady=(4, 0))
+            self.recovery_button.configure(state='disabled' if self.app.busy else 'normal')
+        else:
+            self.recovery_button.pack_forget()
+
+    def confirm_recovery(self):
+        state = (self.result or {}).get('task_state') or {}
+        if self.app.busy or not self.can_resume() or not state.get('uncertain'):
+            return
+        operations = [TITLES.get(row['tool'], row['tool']) + ' · ' + row['subject']
+                      for row in state.get('unresolved', [])]
+        details = '\n'.join(operations) or '上次记录未提供具体操作，请查看运行记录。'
+        confirmed = messagebox.askyesno('核实中断后继续',
+            '待核实的操作\n' + details + '\n\n请先检查相关文件、命令是否已执行及其副作用。'
+            '你已核实这些操作的实际结果，确认继续任务吗？未完成的检查仍需执行。',
+            parent=self.app.root, default=messagebox.NO)
+        if confirmed:
+            self.controller.resume(self, recovery_confirmed=True)
 
     def confirm_undo(self):
         if not self.app.busy:
@@ -403,7 +450,7 @@ class ActivityCard:
 
     def destroy(self):
         # Release callbacks that retain the card so its Tk variables are freed on the UI thread.
-        for button in (self.expand_button, self.resume_button, self.undo_button, self.review_button):
+        for button in (self.expand_button, self.resume_button, self.recovery_button, self.undo_button, self.review_button):
             button.command = None
         self.frame.destroy()
 
@@ -600,6 +647,10 @@ class ProjectConversation:
         rows = self.app.sessions.project_runs(identity) if identity else []
         for row in rows:
             result = row['result']
+            if result.get('run_dir') and (result.get('status') in ACTIVE_STATES | {'interrupted'}
+                                          or (result.get('task_state') or {}).get('parent_run')):
+                result = {**result, 'changes': recorded_run_changes(result['run_dir'], row['workspace'])}
+                row['result'] = result
             if result.get('status') not in ACTIVE_STATES:
                 continue
             if result.get('run_dir'):
@@ -651,7 +702,7 @@ class ProjectConversation:
             return False
         return self.save_reply(card.identity, card.assistant_index, card.result, card.workspace, card.activity)
 
-    def resume(self, card):
+    def resume(self, card, *, recovery_confirmed=False):
         if self.app.busy or card not in self.cards or not card.can_resume():
             return
         try:
@@ -664,9 +715,9 @@ class ProjectConversation:
             return
         if not self.enabled.get():
             self.set_mode(True)
-        self.send(resume_from=card.result['run_dir'])
+        self.send(resume_from=card.result['run_dir'], recovery_confirmed=recovery_confirmed)
 
-    def send(self, *, resume_from=None):
+    def send(self, *, resume_from=None, recovery_confirmed=False):
         app = self.app
         if app.busy:
             return
@@ -771,6 +822,9 @@ class ProjectConversation:
                     personal_memory=app.personal_memory, read_memory=personal_options['read'],
                     write_memory=personal_options['write'], permission_mode=permission_mode)
                 if resume_from:
+                    if recovery_confirmed:
+                        return runner.run(model_task, history=history, resume_from=resume_from,
+                                          recovery_confirmed=True)
                     return runner.run(model_task, history=history, resume_from=resume_from)
                 return runner.run(model_task, history=history)
             except Exception:
@@ -812,7 +866,7 @@ class ProjectConversation:
         self.sync_busy()
 
     def undo(self, card):
-        if (self.app.busy or not card.result or not card.result.get('run_dir')
+        if (self.app.busy or not card.result or not card.result.get('run_dir') or not card.result.get('changes')
                 or '[已撤回文件修改]' in card.activity):
             return
         from project_agent import rollback_run

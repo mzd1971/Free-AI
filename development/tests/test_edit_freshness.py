@@ -43,8 +43,8 @@ class EditFreshnessTests(unittest.TestCase):
         self.file = self.project / FILE
         self.events = []
 
-    def run_agent(self, *turns, callback=None, **options):
-        self.model = PagingModel(*turns, '操作结束。')
+    def run_agent(self, *turns, callback=None, expected_status='completed', **options):
+        self.model = PagingModel(*turns, '操作结束。', '该操作尚未完成。')
 
         def observe(event):
             self.events.append(event)
@@ -54,7 +54,9 @@ class EditFreshnessTests(unittest.TestCase):
         agent = ProjectAgent(self.project, self.model, runs_root=self.runs, approve_command=None,
                             on_event=observe, **options)
         result = agent.run('按指定步骤操作并保留外部编辑。')
-        self.assertEqual(result['status'], 'completed', result)
+        self.assertEqual(result['status'], expected_status, result)
+        if expected_status == 'unfinished':
+            self.assertTrue(result['continuation_available'], result)
         return result
 
     def results(self, name):
@@ -97,7 +99,7 @@ class EditFreshnessTests(unittest.TestCase):
 
     def test_eof_only_read_does_not_grant_replace(self):
         self.file.write_bytes(b'broken')
-        self.run_agent([read(offset=6)], [replace()])
+        self.run_agent([read(offset=6)], [replace()], expected_status='unfinished')
         attempt, = self.results('replace_text')
         self.assertFalse(attempt['ok'])
         self.assertEqual(self.file.read_bytes(), b'broken')
@@ -107,6 +109,7 @@ class EditFreshnessTests(unittest.TestCase):
         self.file.write_bytes(original)
         outcome = self.run_agent(
             [read(limit=7)], [replace('hidden', 'lost')], [replace()], [OVERWRITE],
+            expected_status='unfinished',
         )
         rejected, replaced = self.results('replace_text')
         self.assertFalse(rejected['ok'])
@@ -171,7 +174,7 @@ class EditFreshnessTests(unittest.TestCase):
 
         outcome = self.run_agent(
             [('read_file', {'path': relative})], [('write_file', {'path': relative, 'content': 'new'})],
-            callback=remove_directory,
+            callback=remove_directory, expected_status='unfinished',
         )
         self.assertIn('已变化', self.results('write_file')[0]['message'])
         self.assertFalse(parent.exists())
@@ -192,7 +195,7 @@ class EditFreshnessTests(unittest.TestCase):
             return real_atomic(path, data, **options)
 
         with patch.object(project_agent, '_atomic_bytes', side_effect=race):
-            outcome = self.run_agent([read()], [replace()])
+            outcome = self.run_agent([read()], [replace()], expected_status='unfinished')
         self.assertEqual(len(checkpoints), 1)
         self.assertFalse(checkpoints[0]['applied'])
         self.assertIn('已变化', self.results('replace_text')[0]['message'])

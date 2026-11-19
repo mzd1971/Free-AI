@@ -56,8 +56,8 @@ class TaskJournalTests(unittest.TestCase):
         self.assertEqual(child_state['status'], 'unfinished')
         self.assertEqual(child_state['task'], loaded.export()['task'])
         self.assertEqual(child_state['plan'], loaded.export()['plan'])
-        self.assertFalse(child_state['edits'])
-        self.assertFalse(child_state['observations'])
+        self.assertEqual(child_state['edits'], loaded.export()['edits'])
+        self.assertEqual(child_state['observations'], loaded.export()['observations'])
         self.assertEqual(child_state['verification']['status'], 'stale')
         child_journal.observe('run_command', {
             'argv': ['test-command'], 'cwd': str(self.workspace), 'purpose': 'check',
@@ -68,7 +68,8 @@ class TaskJournalTests(unittest.TestCase):
         self.journal.observe('run_command', {'argv': ['other']}, {'status': 'exited', 'returncode': 0})
         self.assertEqual(self.status(), 'not_run')
         self.check('ignored', code=None, status='denied')
-        self.assertEqual(self.status(), 'not_run')
+        self.assertEqual(self.status(), 'blocked')
+        self.check('ignored')
         self.check('unit', code=1, stderr='断言失败')
         self.assertEqual(self.status(), 'failed')
         self.assertIn('断言失败', self.journal.handoff())
@@ -83,6 +84,7 @@ class TaskJournalTests(unittest.TestCase):
         self.check('unit')
         self.assertEqual(self.status(), 'stale')
         self.check('integration')
+        self.check('ignored')
         self.assertEqual(self.status(), 'passed')
         self.journal.observe('run_command', {'argv': ['other']}, {'status': 'exited', 'returncode': 1})
         self.assertEqual(self.status(), 'stale')
@@ -116,10 +118,10 @@ class TaskJournalTests(unittest.TestCase):
         self.assertEqual(interrupted.export()['verification']['status'], 'stale')
         self.assertIn('是否实际执行及其副作用尚不确定', interrupted.handoff())
 
-    def test_uncertainty_survives_resume_chain_until_successful_check(self):
-        self.journal.save(phase='executing')
+    def test_uncertainty_survives_resume_chain_until_matching_check(self):
+        self.journal.begin('run_command', {'argv': ['known'], 'purpose': 'check'})
         previous = load_task(self.runs, self.run, self.workspace)
-        self.assertEqual(previous.export()['verification']['status'], 'not_run')
+        self.assertEqual(previous.export()['verification']['status'], 'blocked')
         for name in ('run-two', 'run-three'):
             path = self.runs / name
             path.mkdir()
@@ -135,10 +137,60 @@ class TaskJournalTests(unittest.TestCase):
         self.check('known', code=1)
         self.assertTrue(self.journal.export()['uncertain'])
         self.check('other')
-        self.assertFalse(self.journal.export()['uncertain'])
+        self.assertTrue(self.journal.export()['uncertain'])
         self.assertEqual(self.status(), 'failed')
+        self.check('known')
+        self.assertFalse(self.journal.export()['uncertain'])
+        self.assertEqual(self.status(), 'passed')
         self.journal.save(status='unfinished')
         self.assertFalse(load_task(self.runs, path, self.workspace).export()['uncertain'])
+
+    def test_legacy_resume_chain_recovers_metadata_without_changing_old_files(self):
+        def old_file(journal):
+            journal.save(status='unfinished')
+            path = journal._run_dir / STATE_FILE
+            data = json.loads(path.read_text(encoding='utf-8'))
+            data.update(version=1)
+            del data['inflight'], data['unresolved'], data['failed_writes']
+            for check in data.get('checks', []):
+                check.pop('argv_id', None)
+            path.write_text(json.dumps(data), encoding='utf-8')
+            return path, path.read_bytes()
+
+        self.journal.observe('write_file', {'path': 'early.py'},
+                             {'ok': True, 'changed': True, 'sha256': 'a' * 64})
+        snapshots = [old_file(self.journal)]
+        prior = self.run.name
+        for name in ('old-two', 'old-three'):
+            path = self.runs / name
+            path.mkdir()
+            child = TaskJournal(path, self.workspace, 'original task', parent_run=prior)
+            snapshots.append(old_file(child))  # v1 children lost edits/observations.
+            prior = name
+        loaded = load_task(self.runs, prior, self.workspace)
+        self.assertEqual([row['path'] for row in loaded.export()['edits']], ['early.py'])
+        self.assertIn('early.py', loaded.handoff())
+        self.assertTrue(loaded.export()['observations'])
+        for path, data in snapshots:
+            self.assertEqual(path.read_bytes(), data)
+
+    def test_unknown_legacy_interruption_cannot_be_cleared_by_an_unrelated_check(self):
+        self.journal.save(phase='executing')
+        data = json.loads(self.path.read_text(encoding='utf-8'))
+        data.update(version=1)
+        del data['inflight'], data['unresolved'], data['failed_writes']
+        for check in data.get('checks', []):
+            check.pop('argv_id', None)
+        self.path.write_text(json.dumps(data), encoding='utf-8')
+        prior = load_task(self.runs, self.run, self.workspace)
+        child_path = self.runs / 'child'
+        child_path.mkdir()
+        child = TaskJournal(child_path, self.workspace, 'continue', parent_run=self.run.name)
+        child.inherit(prior)
+        child.observe('run_command', {'argv': ['unrelated'], 'purpose': 'check'},
+                      {'status': 'exited', 'returncode': 0})
+        self.assertTrue(child.export()['uncertain'])
+        self.assertTrue(child.completion_blockers())
 
     def test_rejects_invalid_schema_and_unsafe_paths(self):
         self.journal.save()
@@ -158,8 +210,8 @@ class TaskJournalTests(unittest.TestCase):
             load_task(self.runs, wrong_run, self.workspace)
         for malformed in (
                 b'{', b'\xff', b'x' * (STATE_LIMIT + 1),
-                original.replace(b'"version":1', b'"version":2'),
-                original.replace(b'"version":1', b'"version":1,"version":1'),
+                original.replace(b'"version":2', b'"version":999'),
+                original.replace(b'"version":2', b'"version":2,"version":2'),
                 original.replace(b'"plan":[]', b'"plan":[{"text":"bad","status":[]}]')):
             with self.subTest(length=len(malformed), prefix=malformed[:18]):
                 self.path.write_bytes(malformed)

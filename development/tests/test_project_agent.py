@@ -168,7 +168,9 @@ class ProjectAgentTests(unittest.TestCase):
             [('replace_text', {'path': 'hello.py', 'old': "print('old')", 'new': "print('middle')"}),
              ('replace_text', {'path': 'hello.py', 'old': "print('middle')\n", 'new': "print('new')\n"}),
              ('write_file', {'path': 'sub/new.txt', 'content': '新文件'})],
-            [('run_command', {'argv': [sys.executable, 'hello.py']})],
+            [('run_command', {'argv': [sys.executable, 'hello.py'], 'purpose': 'check'}),
+             ('update_plan', {'steps': [{'text': step, 'status': 'completed'}
+                                        for step in ('读取', '修改和验证')]})],
             '已修改并执行脚本。',
         )
         self.assertEqual(result['status'], 'completed')
