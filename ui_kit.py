@@ -7,13 +7,14 @@ from weakref import WeakSet
 from ui_preferences import DEFAULT_TEXT_SIZE, TEXT_SCALE
 
 LIGHT_COLORS = {
-    'bg': '#faf9f6', 'side': '#f0efeb', 'surface': '#ffffff', 'input': '#ffffff',
-    'text': '#262724', 'muted': '#61645a', 'line': '#e5e5df',
-    'accent': '#7462c8', 'tint': '#efecf9', 'success': '#568064',
-    'hover': '#e7e6df', 'primary_bg': '#262724', 'primary_fg': '#ffffff',
-    'primary_hover': '#42443e', 'disabled_bg': '#e3e4de', 'disabled_fg': '#a2a49a',
-    'focus': '#7462c8', 'selection_bg': '#efecf9', 'selection_fg': '#262724',
-    'card_border': '#ffffff',
+    'bg': '#f8faff', 'side': '#edf4ff', 'surface': '#ffffff', 'input': '#ffffff',
+    'text': '#172554', 'muted': '#53627a', 'line': '#b7c9e2',
+    'accent': '#1d4ed8', 'tint': '#e4efff', 'success': '#18724b',
+    'hover': '#dbeafe', 'primary_bg': '#2563eb', 'primary_fg': '#ffffff',
+    'primary_hover': '#1d4ed8', 'disabled_bg': '#e2e8f0', 'disabled_fg': '#64748b',
+    'focus': '#1d4ed8', 'selection_bg': '#cfe2ff', 'selection_fg': '#102b59',
+    'card_border': '#cfdef1', 'selected_bg': '#dceaff', 'selected_fg': '#1e40af',
+    'brand': '#1d4ed8', 'secondary': '#0369a1',
 }
 DARK_COLORS = {
     'bg': '#161719', 'side': '#202226', 'surface': '#282b30', 'input': '#353940',
@@ -34,7 +35,7 @@ CYBER_COLORS = {
     'card_border': '#32747a', 'selected_bg': '#14494c', 'selected_fg': '#b3ff3b',
     'brand': '#a5ff24', 'secondary': '#fff12a',
 }
-CLIENT_SKINS = {'边缘行者 · 霓虹': 'cyberpunk', '经典深色': 'dark'}
+CLIENT_SKINS = {'白蓝（默认）': 'light', '经典深色': 'dark', '边缘行者 · 霓虹': 'cyberpunk'}
 COLORS = LIGHT_COLORS.copy()
 FONT = 'Microsoft YaHei UI'
 

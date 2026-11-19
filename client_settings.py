@@ -278,7 +278,7 @@ class SettingsPanel(tk.Frame):
         app.text_size_picker.pack(anchor='w', pady=(10, 6))
         app.text_size_picker.bind('<<ComboboxSelected>>', app.change_text_size)
         label(text_body, '阅读预览：把想法变成可以完成的任务。', size=14, anchor='w', justify='left').pack(fill='x', pady=(4, 4))
-        body = self.card('appearance', '界面皮肤', keywords='主题 边缘行者 霓虹 经典深色')
+        body = self.card('appearance', '界面皮肤', keywords='主题 白蓝 蓝色 明亮 边缘行者 霓虹 经典深色')
         app.skin_choice = tk.StringVar(self, next(name for name, value in CLIENT_SKINS.items() if value == app.theme))
         app.skin_picker = ttk.Combobox(body, values=list(CLIENT_SKINS), textvariable=app.skin_choice,
                                       state='readonly', width=24)

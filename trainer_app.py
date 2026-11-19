@@ -27,7 +27,7 @@ from ui_preferences import TEXT_SIZES, load_text_size, save_text_size
 DATA_NAMES = {'sft_train.jsonl': '练习题', 'sft_validation.jsonl': '挑选成果用的新题',
               'sft_test.jsonl': '最后检查用的新题', 'sft_general_test.jsonl': '基础能力检查题'}
 TRAINER_CONTENT_WIDTH = 1120
-TRAINER_THEMES = {'跟随客户端': 'client', '边缘行者 · 霓虹': 'cyberpunk', '经典深色': 'dark', '明亮': 'light'}
+TRAINER_THEMES = {'跟随客户端': 'client', '白蓝': 'light', '经典深色': 'dark', '边缘行者 · 霓虹': 'cyberpunk'}
 
 
 class ControlRow(tk.Frame):
@@ -189,9 +189,9 @@ class TrainerApp:
         theme_choice = self.settings.get('trainer_theme', 'client')
         if theme_choice not in TRAINER_THEMES.values():
             theme_choice = 'client'
-        self.theme = self.settings.get('client_theme', 'cyberpunk') if theme_choice == 'client' else theme_choice
+        self.theme = self.settings.get('client_theme', 'light') if theme_choice == 'client' else theme_choice
         if self.theme not in ('cyberpunk', 'dark', 'light'):
-            self.theme = 'cyberpunk'
+            self.theme = 'light'
         preference = load_text_size()
         setup_theme(root, 'Free AI · 训练工作台', size=(1320, 880), min_size=(760, 560), text_size=preference, theme=self.theme)
         self.theme_choice = tk.StringVar(root, value=next(name for name, value in TRAINER_THEMES.items() if value == theme_choice))

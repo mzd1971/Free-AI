@@ -30,9 +30,9 @@ class ClientApp(ExistingActions):
     def __init__(self, root):
         self.root = root
         self.sessions = Sessions(ARTIFACTS)
-        self.theme = self.sessions.get('client_theme', 'cyberpunk')
+        self.theme = self.sessions.get('client_theme', 'light')
         if self.theme not in CLIENT_SKINS.values():
-            self.theme = 'cyberpunk'
+            self.theme = 'light'
         setup_theme(root, 'Free AI', (1440, 900), theme=self.theme, text_size=load_text_size())
         self.events, self.buttons = queue.Queue(), []
         self.busy, self.cancellable, self.downloading = False, False, None

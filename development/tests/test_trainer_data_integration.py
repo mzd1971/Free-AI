@@ -27,7 +27,7 @@ root.report_callback_exception=lambda kind,error,trace: errors.append(str(error)
 root.geometry('1536x900+2500+1400')
 root.deiconify()
 root.update()
-assert app.theme == 'cyberpunk'
+assert app.theme == 'light'
 assert app.brand_label.cget('text') == 'Free AI'
 for name in ('标准','特大'):
     app.text_size.set(name)
@@ -49,7 +49,7 @@ app.theme_choice.set('经典深色')
 app.change_theme()
 assert app.settings.get('trainer_theme') == 'dark'
 assert app.epochs.get() == '3'
-assert app.theme == 'cyberpunk', 'theme save must not rebuild and discard work'
+assert app.theme == 'light', 'theme save must not rebuild and discard work'
 target=ARTIFACTS/'datasets'/'fixture'
 target.mkdir(parents=True)
 for index,name in enumerate(FILES):
