@@ -7,13 +7,15 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
 import threading
 import uuid
 
 from acp_transport import ACPProcess, ACPError, ACPCancelled
 from agent_task_state import TaskJournal, load_task, _clean
 from harness_settings import checked_executable, child_environment, initialize, supports_resume, launch_directory
-from project_agent import _atomic_json, _workspace, _target, _pinned
+from compute_guard import _lock, _unlock
+from project_agent import _atomic_bytes, _atomic_json, _read_bytes, _workspace, _target, _pinned
 
 GATE = '''export const name = 'freeai-approval-gate';
 export const inject = ['tools'];
@@ -28,7 +30,8 @@ export function apply(ctx) {
 }
 '''
 META_FILE = 'harness.json'
-NOTICE = '本轮已结束，执行结果待验收。Harness 的结束信号不等于检查通过；此模式不提供 Free AI 文件撤回。'
+MAX_TASK_BYTES = 65536
+NOTICE = '本轮已结束，执行结果待验收。Harness 的结束信号不等于检查通过；可在任务卡查看本轮改动并运行项目检查。'
 
 
 def load_harness_run(runs_root, run_dir, workspace):
@@ -37,13 +40,13 @@ def load_harness_run(runs_root, run_dir, workspace):
     directory = Path(run_dir)
     if not directory.is_absolute():
         directory = root / directory
-    if directory.parent != root:
+    if directory.parent != root or len(directory.name) != 32 or any(c not in '0123456789abcdef' for c in directory.name):
         raise ValueError('组件任务记录不在当前记录目录。')
     with _pinned(root, (directory.name, META_FILE)):
-        path = _target(root, (directory.name, META_FILE))
-        if path.stat().st_size > 32768:
-            raise ValueError('组件任务记录过大。')
-        data = json.loads(path.read_text(encoding='utf-8'))
+        raw = _read_bytes(_target(root, (directory.name, META_FILE)), limit=32768)
+        if raw is None:
+            raise ValueError('未找到组件任务记录。')
+        data = json.loads(raw)
     if (not isinstance(data, dict) or data.get('version') != 1 or data.get('engine') != 'harness'
             or data.get('workspace') != os.path.normcase(str(workspace))
             or not isinstance(data.get('home_id'), str) or len(data['home_id']) != 32
@@ -58,6 +61,87 @@ def validate_selection(executable, permission_mode, allow_write):
     if permission_mode not in ('standard', 'automatic') or type(allow_write) is not bool or not allow_write:
         raise ValueError('Harness 暂不支持“只看项目”或关闭文件修改。请使用内置执行方式；草稿已保留。')
     return checked_executable(executable)
+
+
+def validate_task(task):
+    if not isinstance(task, str) or not task.strip():
+        raise ValueError('请输入项目任务。')
+    try:
+        size = len(task.encode('utf-8'))
+    except UnicodeEncodeError:
+        raise ValueError('任务包含不能编码为 UTF-8 的字符，请检查草稿。') from None
+    if size > MAX_TASK_BYTES:
+        raise ValueError('Harness 单轮任务上限为 64 KiB UTF-8 文本，请分段发送。草稿已保留。')
+
+
+def _lineage_parts(home_id):
+    return ('harness', 'lineages', home_id)
+
+
+@contextmanager
+def _session_lock(root, home_id):
+    parts = _lineage_parts(home_id)
+    with _pinned(root.parent, parts, directory=True, create=lambda path, _: path.mkdir(exist_ok=True)):
+        lock = _target(root.parent, (*parts, 'session.lock'))
+        with lock.open('a+b') as stream:
+            try:
+                _lock(stream)
+            except OSError:
+                raise ValueError('此 Harness 会话正在运行或暂不可锁定，请稍后继续。') from None
+            try:
+                yield _target(root.parent, (*parts, 'latest.json'))
+            finally:
+                _unlock(stream)
+
+
+def resolve_resume(runs_root, run_dir, workspace):
+    """Return the Free AI journal matching the current persistent component session."""
+    root = _workspace(runs_root)
+    selected = load_harness_run(root, run_dir, workspace)
+    source = root / Path(run_dir).name
+    parts = (*_lineage_parts(selected['home_id']), 'latest.json')
+    with _pinned(root.parent, parts):
+        pointer = _read_bytes(_target(root.parent, parts), limit=1024)
+    if pointer is not None:
+        try:
+            latest = json.loads(pointer)
+            if not isinstance(latest, str) or uuid.UUID(hex=latest).hex != latest:
+                raise ValueError
+        except (ValueError, TypeError):
+            raise ValueError('组件会话的最新运行记录无效，请检查运行记录。') from None
+        record = load_harness_run(root, latest, workspace)
+        if any(record[key] != selected[key] for key in ('home_id', 'session_id', 'route', 'permission_mode')):
+            raise ValueError('组件会话与最新运行记录不一致。')
+        return root / latest
+    if selected.get('lineage_version'):
+        raise ValueError('组件会话缺少最新运行记录；请检查记录后再继续。')
+    # Old runs only had parent links. A unique linear tip can be migrated without guessing by timestamp.
+    related = {source.name}
+    for folder in root.iterdir():
+        if folder.name == source.name or len(folder.name) != 32:
+            continue
+        try:
+            record = load_harness_run(root, folder, workspace)
+        except (OSError, ValueError):
+            continue
+        if record['home_id'] == selected['home_id']:
+            if record.get('lineage_version') or record['session_id'] != selected['session_id']:
+                raise ValueError('组件会话的历史记录不完整，请检查运行记录。')
+            related.add(folder.name)
+    if len(related) == 1:
+        return source
+    parents = {name: load_task(root, name, workspace).export()['parent_run'] for name in related}
+    tips = related - set(parents.values())
+    if len(tips) == 1:
+        tip, = tips
+        seen = set()
+        node = tip
+        while node in parents and node not in seen:
+            seen.add(node)
+            node = parents[node]
+        if seen == related and node is None:
+            return root / tip
+    raise ValueError('旧版组件会话有分支或缺失记录，无法确定最新进度。请核对后创建新任务。')
 
 
 @contextmanager
@@ -187,7 +271,7 @@ class HarnessAgent:
                     if row.get('type') == 'content' and row.get('content', {}).get('type') == 'text')
                 result = {'ok': status == 'completed', 'status': status, 'message': self.clean(content)}
                 self.journal.observe('harness_tool', {'path': title}, result)
-                self.journal.begin('harness_prompt', {'sessionId': self.metadata['session_id']})
+                self.journal.begin('harness_prompt', self._prompt_operation())
                 self.checkpoint(phase='executing')
                 self.event('tool_result', title, tool='harness_tool', result=result)
             else:
@@ -224,20 +308,48 @@ class HarnessAgent:
         choice = allow if allowed else reject
         return {'outcome': {'outcome': 'selected', 'optionId': choice}} if choice else cancelled
 
-    def run(self, task, history=None, resume_from=None, **unused):
-        if self.run_dir is not None or not isinstance(task, str) or not task.strip():
-            raise ValueError('请输入任务，每轮使用新的执行器。')
+    def _prompt_operation(self):
+        return {'sessionId': self.metadata['session_id'], 'runId': self.run_dir.name,
+                'path': 'Harness 任务 ' + self.run_dir.name}
+
+    def _save_request(self, task):
+        text = self.clean(task, sys.maxsize)
+        parts = (self.run_dir.name, 'request.txt')
+        with _pinned(self.runs_root, parts):
+            _atomic_bytes(_target(self.runs_root, parts), text.encode('utf-8'))
+        return text
+
+    def run(self, task, history=None, resume_from=None, *, recovery_confirmed=False):
+        validate_task(task)
+        if self.run_dir is not None or type(recovery_confirmed) is not bool or (recovery_confirmed and not resume_from):
+            raise ValueError('请使用新的执行器，核实中断仅适用于原任务续跑。')
         self.runs_root.mkdir(parents=True, exist_ok=True)
         self.runs_root = _workspace(self.runs_root)
         if self.runs_root == self.workspace or self.runs_root in self.workspace.parents:
             raise ValueError('运行记录不能作为项目目录。')
+        new_run = uuid.uuid4().hex
+        home_id = load_harness_run(self.runs_root, resume_from, self.workspace)['home_id'] if resume_from else new_run
+        with _session_lock(self.runs_root, home_id) as pointer:
+            selected = Path(resume_from).name if resume_from else None
+            latest = resolve_resume(self.runs_root, resume_from, self.workspace) if resume_from else None
+            redirected = latest is not None and latest.name != selected
+            if redirected and recovery_confirmed:
+                raise ValueError('组件会话已产生新进度，请在最新任务卡核实中断。')
+            if latest is not None and not pointer.exists():
+                _atomic_json(pointer, latest.name)
+            return self._run_locked(task, history, latest, recovery_confirmed, new_run, pointer, redirected)
+
+    def _run_locked(self, task, history, resume_from, recovery_confirmed, new_run, pointer, redirected):
         previous = load_harness_run(self.runs_root, resume_from, self.workspace) if resume_from else None
-        self.run_dir = self.runs_root / uuid.uuid4().hex
+        self.run_dir = self.runs_root / new_run
         self.run_dir.mkdir()
         self.journal = TaskJournal(self.run_dir, self.workspace, self.clean(task, 8192),
             parent_run=Path(resume_from).name if previous else None)
         if previous:
             self.journal.inherit(load_task(self.runs_root, resume_from, self.workspace))
+            if recovery_confirmed and self.journal.export()['uncertain']:
+                self.journal.confirm_recovery()
+        inherited_uncertainty = self.journal.export()['uncertain']
         self.metadata = deepcopy(previous) if previous else {'version': 1, 'engine': 'harness',
             'workspace': os.path.normcase(str(self.workspace)), 'home_id': self.run_dir.name,
             'session_id': '', 'route': '', 'permission_mode': self.permission_mode}
@@ -245,12 +357,14 @@ class HarnessAgent:
         self.event('start', 'DeepSeek Harness 项目任务', run_dir=str(self.run_dir),
             engine='harness', task_state=self.journal.export(), permission_mode=self.permission_mode)
         status, answer = 'failed', '组件未完成任务，请查看记录。'
+        request_text = None
         home = self.runs_root.parent / 'harness' / 'sessions' / self.metadata['home_id']
         try:
             if previous and previous['permission_mode'] != self.permission_mode:
                 raise ValueError('续跑需保留原任务权限；修改权限后请发送新任务。')
             with model_connection(self.model, self.context, self.cancel) as connection:
                 self.secret = connection['key']
+                request_text = self._save_request(task)
                 route = hashlib.sha256(json.dumps(connection['identity'], ensure_ascii=True).encode()).hexdigest()
                 if previous and previous['route'] != route:
                     raise ValueError('续跑需使用原来的模型和服务地址；切换模型后请发送新任务。')
@@ -273,17 +387,20 @@ class HarnessAgent:
                         if not isinstance(identity, str) or not 0 < len(identity) < 256:
                             raise ValueError('组件没有返回有效会话编号。')
                         self.metadata['session_id'] = identity
+                    self.metadata['lineage_version'] = 1
                     self.checkpoint()
+                    _atomic_json(pointer, new_run)
                     session_id = self.metadata['session_id']
                     self.event('resume' if previous else 'instructions',
+                        '已接续此会话的最新运行记录。' if redirected else
                         '已恢复原组件会话及 Free AI 记录。' if previous else '已建立组件会话。')
-                    prompt = self.clean(task, 16000) + '\n\n请检查执行结果并如实说明未完成事项。不要把结束回答等同于测试通过。'
+                    prompt = request_text + '\n\n请检查执行结果并如实说明未完成事项。不要把结束回答等同于测试通过。'
                     if previous:
                         prompt += '\nFree AI 上轮进度：\n' + self.journal.handoff(budget=1800)
                     elif history:
                         recent = [row for row in history[-6:] if row.get('role') in ('user', 'assistant')]
                         prompt += '\n之前的讨论（仅供参考，当前任务优先）：\n' + self.clean(json.dumps(recent, ensure_ascii=False), 6000)
-                    self.journal.begin('harness_prompt', {'sessionId': session_id})
+                    self.journal.begin('harness_prompt', self._prompt_operation())
                     try:
                         result = client.request('session/prompt', {'sessionId': session_id,
                             'prompt': [{'type': 'text', 'text': prompt}]}, timeout=1800,
@@ -302,8 +419,11 @@ class HarnessAgent:
                         status = 'unfinished'
                     if self.denied or self.failed_tools or any(t.get('status') not in ('completed', 'failed') for t in self.tools.values()):
                         status = 'unfinished' if status == 'review' else status
-                    self.journal.observe('harness_prompt', {'sessionId': session_id},
-                                         {'ok': stop == 'end_turn', 'status': str(stop), 'message': NOTICE})
+                    if stop != 'cancelled':
+                        self.journal.observe('harness_prompt', self._prompt_operation(),
+                                             {'ok': stop == 'end_turn', 'status': str(stop), 'message': NOTICE})
+                    if inherited_uncertainty and status == 'review':
+                        status = 'unfinished'
                     answer = self.answer or '组件未返回可显示的回答。'
                     answer += '\n\n' + (NOTICE if status == 'review' else '任务尚未完成，可查看执行记录后继续。')
                     client.request('session/close', {'sessionId': session_id}, timeout=15)
@@ -316,6 +436,8 @@ class HarnessAgent:
         except Exception:
             status = 'failed'
             answer = '组件任务失败，已有操作可能已生效，请检查文件与运行记录。'
+        if request_text is None:
+            self._save_request(task)
         answer = self.clean(answer, 72000)
         self.checkpoint(status='unfinished' if status == 'review' else status,
                         phase='ready' if self.closed and status != 'stopped' else self.journal.export()['phase'])

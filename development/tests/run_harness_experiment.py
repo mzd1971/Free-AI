@@ -17,6 +17,8 @@ from acp_transport import ACPProcess
 from harness_agent import HarnessAgent, load_harness_run
 import harness_settings
 from remote_api import APIClient
+from project_snapshot import start_snapshot, finish_snapshot, restore_snapshot
+from project_verification import run_verification
 
 KEY = 'freeai-harness-experiment-fixture'
 MODEL = 'harness-experiment-model'
@@ -141,7 +143,7 @@ class Experiment:
         self.report = {'scope': 'Official Windows runtime with scripted local SSE. No real model or API credentials.',
                        'probe': None, 'turns': {}, 'wire': [], 'verified': False}
 
-    def run(self, stage, *, parent=None, approval=True, stop=None):
+    def run(self, stage, *, parent=None, approval=True, stop=None, recovery_confirmed=False):
         operations = []
         sent = self.report['wire']
 
@@ -162,7 +164,11 @@ class Experiment:
         user_task = f'{TASK_PREFIX}{stage}\n{TASKS[stage]}'
         runner = HarnessAgent(self.workspace, self.model, executable=self.executable, runs_root=self.runs,
                               approve_command=approve, cancel_event=stop, transport_factory=RecordingTransport)
-        result = runner.run(user_task, resume_from=parent['run_dir'] if parent else None)
+        snapshot = start_snapshot(self.output / 'snapshots', self.workspace)
+        result = runner.run(user_task, resume_from=parent['run_dir'] if parent else None,
+                            recovery_confirmed=recovery_confirmed)
+        result['snapshot_dir'] = snapshot
+        result['snapshot'] = finish_snapshot(self.output / 'snapshots', snapshot, self.workspace)
         note = self.report['turns'][stage] = {'result': result, 'operations': operations}
         metadata = load_harness_run(self.runs, result['run_dir'], self.workspace)
         note['session'] = metadata
@@ -196,15 +202,21 @@ class Experiment:
         baseline = self.run('baseline')
         require('FAILED (failures=1)' in self.tool_result('baseline'), 'Baseline unittest did not fail.')
         require((self.workspace / 'invoice.py').read_text(encoding='utf-8') == BROKEN, 'Baseline altered the source.')
+        check_command = json.dumps([sys.executable, '-B', '-m', 'unittest', 'discover', '-v'])
+        self.report['manual_failed'] = run_verification(self.workspace, check_command)
+        require(self.report['manual_failed']['status'] == 'failed', 'Manual check did not catch the defect.')
 
         repair = self.run('repair', parent=baseline)
         require((self.workspace / 'invoice.py').read_text(encoding='utf-8') == FIXED, 'The repair did not reach disk.')
+        require(repair['snapshot']['files'] == ['invoice.py'], 'Harness file edit was not captured by snapshots.')
 
         verified = self.run('verify', parent=repair)
         require('\nOK' in self.tool_result('verify').replace('\r\n', '\n'),
                 'Unittest did not pass after the write.')
         require(verified['status'] == 'review', 'Passing fixture must still require review.')
         require((self.workspace / 'test_invoice.py').read_text(encoding='utf-8') == TEST, 'Fixture tests changed.')
+        self.report['manual_passed'] = run_verification(self.workspace, check_command)
+        require(self.report['manual_passed']['status'] == 'passed', 'Manual check did not confirm the repair.')
 
         declined = self.run('decline', parent=verified, approval=False)
         require(declined['status'] == 'unfinished' and not (self.workspace / 'declined.txt').exists(),
@@ -231,8 +243,18 @@ class Experiment:
         finally:
             self.fixture.release.set()
         recovered = self.run('after_cancel', parent=stopped)
-        require(recovered['status'] == 'review', 'The original ACP conversation did not resume after cancel.')
+        require(recovered['status'] == 'unfinished' and recovered['task_state']['uncertain'],
+                'An unrelated answer cleared the interrupted operation.')
+        self.report['unconfirmed_resume'] = recovered
+        confirmed = self.run('after_cancel', parent=recovered, recovery_confirmed=True)
+        require(confirmed['status'] == 'review' and not confirmed['task_state']['uncertain'],
+                'Explicitly confirmed recovery did not settle the original ACP conversation.')
         self.check_history()
+        self.report['restored'] = restore_snapshot(self.output / 'snapshots', repair['snapshot_dir'], self.workspace)
+        require(self.report['restored']['restored'] == ['invoice.py'], 'Snapshot did not restore the Harness edit.')
+        require((self.workspace / 'invoice.py').read_text(encoding='utf-8') == BROKEN, 'Snapshot restored wrong bytes.')
+        self.report['manual_after_restore'] = run_verification(self.workspace, check_command)
+        require(self.report['manual_after_restore']['status'] == 'failed', 'Restored baseline unexpectedly passed.')
         self.scan_credentials()
         require(not self.fixture.errors, f'Model fixture errors: {self.fixture.errors}')
         self.report['verified'] = True

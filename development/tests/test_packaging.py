@@ -43,6 +43,7 @@ class PackagingTests(unittest.TestCase):
                      'project_agent.py', 'project_chat.py', 'local_project_model.py',
                      'acp_transport.py', 'harness_agent.py', 'harness_settings.py', 'harness_panel.py',
                      'agent_workspace.py', 'agent_task_state.py', 'agent_review.py',
+                     'project_snapshot.py', 'project_verification.py',
                      'agent_memory.py', 'memory_learning.py', 'memory_panel.py',
                      'assets/free-ai.ico', 'assets/free-ai-ui.png',
                      'runtime/python/Lib/venv/__init__.py', 'runtime/python/Lib/ensurepip/__init__.py'):

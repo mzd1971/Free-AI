@@ -205,6 +205,7 @@ class NativeProjectScenario(unittest.TestCase):
                 self.assertEqual(restored.assistant_index, 3)
                 restored.confirm_undo()
                 self.assertTrue(restored.undo_box.winfo_manager())
+                restored.undo_select_all.invoke()
                 app.project.undo(restored)
                 self.assertEqual(source.read_text(), 'value = 1\n')
                 self.assertIn('[已撤回文件修改]', restored.activity)

@@ -10,7 +10,8 @@ PROJECT_PERMISSION_MODES = frozenset({'standard', 'readonly', 'automatic'})
 PROJECT_SETTING_TYPES = {'enabled': bool, 'workspace': str, 'allow_write': bool, 'use_memory': bool,
                          'permission_mode': str}
 PROJECT_RESULT_FIELDS = ('status', 'answer', 'run_dir', 'changes', 'episode_id', 'memory_updates', 'engine',
-                         'task_state', 'continuation_available', 'permission_mode')
+                         'task_state', 'continuation_available', 'permission_mode',
+                         'snapshot_dir', 'snapshot', 'acceptance')
 PROJECT_RECORD_LIMIT = 512 * 1024
 PROJECT_STATE_FIELDS = ('task', 'status', 'phase', 'parent_run', 'uncertain')
 

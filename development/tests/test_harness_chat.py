@@ -110,6 +110,15 @@ def exercise_chat(test):
                 fixture.assert_not_called()
                 model.assert_not_called()
         app.project.set_permission_mode('standard')
+        too_long = '长' * 22000
+        draft(too_long)
+        before_messages = list(app.history)
+        app.send_chat()
+        test.assertEqual(app.input.get('1.0', 'end-1c'), too_long)
+        test.assertEqual(app.history, before_messages)
+        test.assertIn('64 KiB', app.status.get())
+        test.assertFalse(app.busy)
+        draft(text)
         app.send_chat()
         identity = app.session_id
         test.assertIsNotNone(identity)

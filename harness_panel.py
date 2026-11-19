@@ -28,7 +28,7 @@ class HarnessPanel(tk.Frame):
         self.options = tk.Frame(self, bg=C['surface'])
         description(self.options, 'DeepSeek Harness 是实验选项，沿用聊天中选择的模型或 API。组件约下载 87 MB、占用 153 MB，'
                     '只在点击安装后下载，数据留在 Free AI。标准模式每次工具操作都需确认，自动模式直接执行，均使用当前 Windows 账户权限。'
-                    '执行结果需验收；此模式暂不支持 Free AI 文件撤回及自动读写长期记忆。').pack(fill='x', pady=(6, 5))
+                    '执行结果需验收；聊天任务卡支持项目文本快照与检查，暂未接通自动读写长期记忆。').pack(fill='x', pady=(6, 5))
         label(self.options, '执行组件路径（dsh.exe 或 SDK 运行程序）', size=10).pack(anchor='w')
         row = tk.Frame(self.options, bg=C['surface'])
         row.pack(fill='x')

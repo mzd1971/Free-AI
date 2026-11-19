@@ -40,6 +40,17 @@ def apply_task_state(result, state):
     return {**result, 'task_state': state}
 
 
+def acceptance_summary(result):
+    check = result.get('acceptance') or {}
+    if not check:
+        return ''
+    if check.get('stale'):
+        return '此前的手动检查需重跑确认'
+    return {'passed': '这条检查已通过（对应当时的项目文件）', 'failed': '这条检查未通过，可继续修复',
+            'stopped': '检查已停止', 'timeout': '检查超时', 'error': '检查未能执行',
+            'stale': '文件或覆盖范围发生变化，需重新检查'}.get(check.get('status'), '检查尚未确认')
+
+
 def recorded_run_changes(run_dir, workspace):
     """Recover this card's file list from its own rollback manifest."""
     from agent_review import _group_changes
@@ -108,8 +119,24 @@ class ActivityCard:
         self.undo_button = FlatButton(self.tools, '撤回文件修改', self.confirm_undo, variant='ghost', height=30, font_size=10)
         self.undo_button.pack(side='left', padx=6)
         FlatButton(self.tools, '打开记录文件夹', self.open_records, variant='ghost', height=30, font_size=10).pack(side='left', padx=6)
+        self.check_tools = tk.Frame(self.inner, bg=C['bg'])
+        self.check_button = FlatButton(self.check_tools, '检查项目结果', self.toggle_check,
+                                      variant='ghost', height=30, font_size=10)
+        self.check_button.pack(side='left')
+        self.check_box = tk.Frame(self.inner, bg=C['surface'], padx=9, pady=8)
+        self.check_hint = label(self.check_box, '填写项目的测试命令，点击后在本机运行。通过只代表这条检查，不代表所有需求已完成。',
+                                size=10, anchor='w', justify='left')
+        self.check_hint.pack(fill='x')
+        self.check_command = tk.StringVar(value='python -m unittest discover')
+        self.check_entry = tk.Entry(self.check_box, textvariable=self.check_command, bg=C['input'],
+                                    fg=C['text'], insertbackground=C['text'], font=ui_font(self.app.root, 10))
+        self.check_entry.pack(fill='x', pady=7)
+        self.run_check_button = FlatButton(self.check_box, '运行这条检查', lambda: self.controller.verify(self),
+                                          variant='primary', height=30, font_size=10)
+        self.run_check_button.pack(anchor='w')
         self.review_box = tk.Frame(self.inner, bg=C['bg'])
-        label(self.review_box, '文件工具修改', size=10, color=C['muted'], anchor='w').pack(fill='x', pady=(3, 4))
+        self.review_label = label(self.review_box, '本轮项目文件变化', size=10, color=C['muted'], anchor='w')
+        self.review_label.pack(fill='x', pady=(3, 4))
         self.review_text = tk.Text(self.review_box, bg=C['surface'], fg=C['text'], height=10, width=1,
                                    wrap='word', font=ui_font(self.app.root, 10), bd=0, padx=8, pady=6, state='disabled')
         review_scroll = tk.Scrollbar(self.review_box, command=self.review_text.yview)
@@ -124,6 +151,11 @@ class ActivityCard:
         self.undo_label = label(self.undo_box, '恢复文件工具修改前的内容？后来有改动的文件会跳过。命令产生的改动无法自动撤回。',
                                size=10, anchor='w', justify='left')
         self.undo_label.pack(fill='x')
+        self.undo_files = tk.Listbox(self.undo_box, height=6, selectmode='multiple', exportselection=False,
+            bg=C['surface'], fg=C['text'], selectbackground=C['tint'], selectforeground=C['text'],
+            font=ui_font(self.app.root, 10), bd=0)
+        self.undo_select_all = FlatButton(self.undo_box, '选择全部列出的文件',
+            lambda: self.undo_files.selection_set(0, 'end'), variant='ghost', height=28, font_size=10)
         undo_actions = tk.Frame(self.undo_box, bg=C['tint'])
         undo_actions.pack(fill='x', pady=(7, 0))
         FlatButton(undo_actions, '确认撤回', lambda: self.controller.undo(self), height=30, font_size=10).pack(side='left')
@@ -149,6 +181,7 @@ class ActivityCard:
             self.progress.configure(wraplength=width - 44)
             self.command_label.configure(wraplength=width - 44)
             self.undo_label.configure(wraplength=width - 44)
+            self.check_hint.configure(wraplength=width - 44)
             self.frame.pack_propagate(False)
             self.frame.configure(width=width)
             self.inner.update_idletasks()
@@ -164,9 +197,12 @@ class ActivityCard:
             self.detail.pack(fill='x', pady=(8, 0), after=anchor)
             if self.result and self.result.get('run_dir'):
                 self.tools.pack(fill='x', pady=(4, 0))
+                self.check_tools.pack(fill='x')
         else:
             self.detail.pack_forget()
             self.tools.pack_forget()
+            self.check_tools.pack_forget()
+            self.check_box.pack_forget()
             self.close_review()
             self.cancel_undo()
         self.expand_button.configure(text='收起 ▴' if self.expanded else '详情 ▾')
@@ -175,6 +211,16 @@ class ActivityCard:
     def close_review(self):
         self.review_box.pack_forget()
         self.review_button.configure(text='查看改动')
+
+    def toggle_check(self):
+        if self.check_box.winfo_manager():
+            self.check_box.pack_forget()
+        else:
+            if not self.expanded:
+                self.toggle()
+            self.check_box.pack(fill='x', pady=(6, 0), after=self.check_tools)
+            self.check_entry.focus_set()
+        self.resize()
 
     def toggle_review(self):
         if self.review_box.winfo_manager():
@@ -190,7 +236,11 @@ class ActivityCard:
             self.toggle()
         from agent_review import review_changes
         try:
-            review = review_changes(ARTIFACTS / 'project_runs', self.result['run_dir'], self.workspace)
+            if self.result.get('snapshot_dir') and (self.result.get('snapshot') or {}).get('status') in ('ready', 'partial'):
+                from project_snapshot import review_snapshot
+                review = review_snapshot(ARTIFACTS / 'project_snapshots', self.result['snapshot_dir'], self.workspace)
+            else:
+                review = review_changes(ARTIFACTS / 'project_runs', self.result['run_dir'], self.workspace)
         except (OSError, ValueError, RuntimeError):
             review = {'files': [], 'notice': '无法读取这轮文件修改，请检查运行记录。'}
         self.cancel_undo()
@@ -243,6 +293,13 @@ class ActivityCard:
                     outcome += '（需重新验证）'
                 checks.append(' · '.join(part for part in (check.get('command'), outcome) if part))
             sections.append('\n'.join([summary, *checks]))
+        check = (self.result or {}).get('acceptance')
+        if check:
+            from project_verification import format_verification_context
+            sections.append(acceptance_summary(self.result) + '\n' + format_verification_context(check))
+        snapshot = (self.result or {}).get('snapshot')
+        if snapshot:
+            sections.append('项目文件快照\n' + snapshot.get('notice', ''))
         sections.append(self.activity[-50000:] or '暂无执行记录。')
         self.detail.configure(state='normal')
         self.detail.delete('1.0', 'end')
@@ -263,6 +320,8 @@ class ActivityCard:
         if tool == 'run_command' and mode == 'automatic':
             title = '自动运行命令'
         if kind == 'start':
+            if event.get('snapshot_dir'):
+                self.result = {**self.result, 'snapshot_dir': event['snapshot_dir']}
             if event.get('engine') == 'harness':
                 self.result = {**self.result, 'engine': 'harness'}
             if event.get('run_dir'):
@@ -364,15 +423,21 @@ class ActivityCard:
     def finish(self, result):
         self.decide(False)
         self.result = result
-        count = len({row['path'] for row in result.get('changes', [])})
+        snapshot = result.get('snapshot') or {}
+        supported = bool(result.get('snapshot_dir') and snapshot.get('status') in ('ready', 'partial'))
+        count = snapshot.get('count', 0) if supported else len({row['path'] for row in result.get('changes', [])})
         self.status.set(STATES.get(result.get('status'), '任务结束') + (f' · 修改 {count} 个文件' if count else ''))
         self.show_progress()
         if '[已撤回文件修改]' in self.activity:
             self.status.set('已执行文件撤回 · 展开过程查看结果')
         if self.expanded and result.get('run_dir'):
             self.tools.pack(fill='x', pady=(4, 0))
-        self.review_button.configure(state='normal' if result.get('run_dir') and result.get('engine') != 'harness' else 'disabled')
-        self.undo_button.configure(state='normal' if result.get('engine') != 'harness' and count and '[已撤回文件修改]' not in self.activity else 'disabled')
+            self.check_tools.pack(fill='x')
+        legacy = result.get('engine') != 'harness' and not supported
+        self.review_button.configure(state='normal' if result.get('run_dir') and (supported or legacy) else 'disabled')
+        self.undo_button.configure(state='normal' if (supported or legacy) and count and '[已撤回文件修改]' not in self.activity else 'disabled')
+        if result.get('acceptance', {}).get('argv'):
+            self.check_command.set(json.dumps(result['acceptance']['argv'], ensure_ascii=False))
         self.sync_resume()
         self.resize()
 
@@ -391,7 +456,15 @@ class ActivityCard:
         if state.get('uncertain') or (result.get('status') == 'interrupted' and state.get('phase') == 'executing'):
             lines.append('上次操作结果仍需核实')
         if result.get('engine') == 'harness':
-            lines.append('DeepSeek Harness · 执行结果需验收 · 不支持文件撤回')
+            lines.append('DeepSeek Harness · 执行结果需验收')
+        snapshot = result.get('snapshot') or {}
+        if snapshot.get('status') in ('ready', 'partial'):
+            lines.append('已保存本轮项目文件快照' if snapshot.get('status') == 'ready' else '项目文件快照仅覆盖部分内容，详情可查看范围')
+        elif result.get('snapshot_dir'):
+            lines.append('结束快照未确认；内置文件工具仍可使用原有修改记录')
+        check = acceptance_summary(result)
+        if check:
+            lines.append(check)
         mode = result.get('permission_mode')
         if mode in ('readonly', 'automatic'):
             lines.append('权限 · ' + PERMISSION_LABELS[mode])
@@ -423,12 +496,12 @@ class ActivityCard:
             self.resume_button.configure(state='disabled' if self.app.busy else 'normal')
         else:
             self.resume_button.pack_forget()
-        if (self.can_resume() and self.result.get('engine') != 'harness'
-                and (self.result.get('task_state') or {}).get('uncertain')):
+        if self.can_resume() and (self.result.get('task_state') or {}).get('uncertain'):
             self.recovery_button.pack(anchor='w', pady=(4, 0))
             self.recovery_button.configure(state='disabled' if self.app.busy else 'normal')
         else:
             self.recovery_button.pack_forget()
+        self.run_check_button.configure(state='disabled' if self.app.busy or self.controller.permission_mode.get() == 'readonly' else 'normal')
 
     def confirm_recovery(self):
         state = (self.result or {}).get('task_state') or {}
@@ -446,6 +519,17 @@ class ActivityCard:
 
     def confirm_undo(self):
         if not self.app.busy:
+            if ((self.result or {}).get('snapshot_dir')
+                    and ((self.result or {}).get('snapshot') or {}).get('status') in ('ready', 'partial')):
+                self.undo_label.configure(text='选择要恢复到任务开始前的文件。任务运行期间你自己的编辑也可能列在这里，请逐项核对。任务结束后又改过的文件会保留。未列出的文件和外部操作不受此撤回影响。')
+                self.undo_files.delete(0, 'end')
+                for path in self.result['snapshot']['files']:
+                    self.undo_files.insert('end', path)
+                self.undo_files.pack(fill='x', pady=6, after=self.undo_label)
+                self.undo_select_all.pack(anchor='w', after=self.undo_files)
+            else:
+                self.undo_files.pack_forget()
+                self.undo_select_all.pack_forget()
             if not self.expanded:
                 self.toggle()
             if self.review_box.winfo_manager():
@@ -467,7 +551,8 @@ class ActivityCard:
 
     def destroy(self):
         # Release callbacks that retain the card so its Tk variables are freed on the UI thread.
-        for button in (self.expand_button, self.resume_button, self.recovery_button, self.undo_button, self.review_button):
+        for button in (self.expand_button, self.resume_button, self.recovery_button, self.undo_button, self.review_button,
+                       self.check_button, self.run_check_button, self.undo_select_all):
             button.command = None
         self.frame.destroy()
 
@@ -664,6 +749,15 @@ class ProjectConversation:
         rows = self.app.sessions.project_runs(identity) if identity else []
         for row in rows:
             result = row['result']
+            if result.get('acceptance'):
+                result['acceptance'] = {**result['acceptance'], 'stale': True}
+            if result.get('snapshot_dir') and not result.get('snapshot'):
+                try:
+                    from project_snapshot import describe_snapshot
+                    result['snapshot'] = describe_snapshot(ARTIFACTS / 'project_snapshots', result['snapshot_dir'], row['workspace'])
+                except (OSError, ValueError, RuntimeError):
+                    result['snapshot'] = {'status': 'unavailable', 'files': [], 'count': 0,
+                                          'notice': '无法读取已保存的项目快照，请检查记录文件夹。'}
             if result.get('engine') != 'harness' and result.get('run_dir') and (result.get('status') in ACTIVE_STATES | {'interrupted'}
                                           or (result.get('task_state') or {}).get('parent_run')):
                 result = {**result, 'changes': recorded_run_changes(result['run_dir'], row['workspace'])}
@@ -719,6 +813,90 @@ class ProjectConversation:
             return False
         return self.save_reply(card.identity, card.assistant_index, card.result, card.workspace, card.activity)
 
+    def update_card_answer(self, card, content):
+        """Keep the visible conversation and subsequent model history in step with checks."""
+        previous = card.result.get('answer', '')
+        card.result = {**card.result, 'answer': content}
+        app = self.app
+        index = getattr(card, 'history_index', card.assistant_index)
+        if index is not None and 0 <= index < len(app.history):
+            app.history[index] = {'role': 'assistant', 'content': content}
+            if index == len(app.history) - 1:
+                app.last_answer = content
+        transcript = app.transcript
+        for _, name, position in transcript.dump('1.0', 'end', window=True):
+            if name == str(card.frame):
+                start = transcript.index(position + ' + 2 chars')
+                length = transcript.tk.call('string', 'length', previous)
+                end = transcript.index(f'{start} + {length} chars')
+                if transcript.get(start, end) == previous:
+                    transcript.configure(state='normal')
+                    try:
+                        transcript.delete(start, end)
+                        transcript.insert(start, content)
+                    finally:
+                        transcript.configure(state='disabled')
+                    app.format_transcript()
+                break
+
+    def invalidate_checks(self, workspace):
+        for card in self.cards:
+            if (os.path.normcase(card.workspace) == os.path.normcase(workspace)
+                    and (card.result or {}).get('acceptance')):
+                card.result['acceptance'] = {**card.result['acceptance'], 'stale': True}
+                card.finish(card.result)
+                self.save_card(card)
+
+    def verify(self, card):
+        app = self.app
+        if app.busy or card not in self.cards or not card.result or not card.result.get('run_dir'):
+            return
+        if self.permission_mode.get() == 'readonly':
+            app.status.set('只看项目模式不能运行检查，请先选择命令权限。')
+            return
+        try:
+            if Path(self.workspace.get()).resolve(strict=True) != Path(card.workspace).resolve(strict=True):
+                raise ValueError('请先选择这张任务卡原来的项目文件夹。')
+            from project_verification import parse_command, run_verification, format_verification_context
+            command = card.check_command.get().strip()
+            parse_command(command)
+        except (OSError, ValueError, RuntimeError) as error:
+            app.status.set(str(error))
+            return
+        permission = self.permission_mode.get()
+        self.invalidate_checks(card.workspace)
+        card.status.set('正在运行你指定的检查')
+
+        def work():
+            return run_verification(card.workspace, command, cancel_event=app.generation_cancel,
+                                    permission_mode=permission)
+
+        def done(outcome):
+            card.result = {**card.result, 'acceptance': outcome}
+            if outcome.get('status') != 'passed':
+                resumable = card.result.get('continuation_available', False)
+                if card.result.get('engine') != 'harness':
+                    try:
+                        from agent_task_state import load_task
+                        load_task(ARTIFACTS / 'project_runs', card.result['run_dir'], card.workspace)
+                        resumable = True
+                    except (OSError, ValueError, RuntimeError):
+                        pass
+                card.result.update(status='unfinished', continuation_available=resumable)
+            details = format_verification_context(outcome)
+            card.append('手动检查\n' + details)
+            previous = card.result.get('answer', '').split('\n\n[手动项目检查]\n', 1)[0]
+            self.update_card_answer(card, previous + '\n\n[手动项目检查]\n' + details)
+            card.finish(card.result)
+            card.status.set(acceptance_summary(card.result))
+            if not self.save_card(card):
+                app.status.set('检查已结束，但记录未能保存，请复制详情中的结果。')
+            else:
+                app.status.set(acceptance_summary(card.result))
+            self.sync_busy()
+        app.submit('正在检查项目', work, done, cancellable=True)
+        self.sync_busy()
+
     def resume(self, card, *, recovery_confirmed=False):
         if self.app.busy or card not in self.cards or not card.can_resume():
             return
@@ -752,6 +930,8 @@ class ProjectConversation:
         from harness_settings import load_preferences as load_execution_preferences
         execution = load_execution_preferences(app.sessions)
         engine = execution['engine']
+        source = None
+        resume_notice = ''
         if resume_from:
             source = next((card for card in self.cards if card.result and card.result.get('run_dir') == resume_from), None)
             if source is None:
@@ -760,10 +940,17 @@ class ProjectConversation:
             engine = source.result.get('engine', 'builtin')
         if engine == 'harness':
             try:
-                from harness_agent import validate_selection, load_harness_run
+                from harness_agent import validate_selection, resolve_resume, validate_task
                 execution['executable'] = validate_selection(execution['executable'], self.permission_mode.get(), self.allow_write.get())
+                validate_task(task)
                 if resume_from:
-                    load_harness_run(ARTIFACTS / 'project_runs', resume_from, folder)
+                    latest = str(resolve_resume(ARTIFACTS / 'project_runs', resume_from, folder))
+                    if os.path.normcase(latest) != os.path.normcase(str(resume_from)):
+                        if recovery_confirmed:
+                            raise ValueError('这张卡之后已有新进度，请核实最新任务卡后再继续。')
+                        resume_notice = '已接续本会话最新进度。'
+                        resume_from = latest
+                        source = next((card for card in self.cards if card.result and card.result.get('run_dir') == latest), None)
             except (ValueError, OSError, RuntimeError) as error:
                 app.status.set(str(error))
                 return
@@ -781,9 +968,6 @@ class ProjectConversation:
             except Exception:
                 app.status.set('API 配置不可用，请在设置里检查；草稿会保留。')
                 return
-        if app.session_id is None:
-            app.session_id = app.sessions.create()
-        self.save_settings()
         identity, history = app.session_id, list(app.history)
         workspace = str(Path(folder).absolute())
         previous_workspace = None
@@ -797,6 +981,20 @@ class ProjectConversation:
         model_task = task
         if previous_workspace and os.path.normcase(previous_workspace) != os.path.normcase(workspace):
             model_task += '\n\n本轮已切换项目目录。请先重新检查当前工作区的文件。历史项目操作的结果仅适用于其标注的工作区。'
+        if source and source.result.get('acceptance'):
+            from project_verification import format_verification_context
+            model_task += '\n\n用户在本机运行的上轮检查结果（历史证据，需要重跑）：\n' + format_verification_context(source.result['acceptance'])
+        if engine == 'harness':
+            try:
+                validate_task(model_task)
+            except ValueError as error:
+                app.status.set(str(error))
+                return
+        if app.session_id is None:
+            app.session_id = app.sessions.create()
+        identity = app.session_id
+        self.save_settings()
+        self.invalidate_checks(workspace)
         context = max(16384, CONTEXTS[app.context.get()])
         permission_mode = self.permission_mode.get()
         allow_write, use_memory = self.allow_write.get(), self.use_memory.get()
@@ -816,7 +1014,11 @@ class ProjectConversation:
         initial_result = {'status': 'running', 'answer': '项目任务执行中。', 'run_dir': '',
                           'changes': [], 'continuation_available': False, 'permission_mode': permission_mode,
                           'engine': engine}
+        if source and source.result.get('acceptance'):
+            initial_result['acceptance'] = {**source.result['acceptance'], 'stale': True}
         card.result = initial_result
+        if resume_notice:
+            card.append(resume_notice)
         card.history_index = len(app.history)
         app.history.append({'role': 'assistant', 'content': initial_result['answer']})
         try:
@@ -828,6 +1030,7 @@ class ProjectConversation:
         self.refresh_summary()
         app.refresh_recent()
         assistant_index = card.assistant_index
+        snapshot_state = {}
 
         def approve(details):
             if permission_mode != 'standard':
@@ -840,8 +1043,12 @@ class ProjectConversation:
             return request['allowed'] and not app.generation_cancel.is_set()
 
         def on_event(event):
+            if event.get('type') == 'start' and snapshot_state.get('directory'):
+                event = {**event, 'snapshot_dir': snapshot_state['directory']}
             if assistant_index is not None and event.get('type') == 'start' and event.get('run_dir'):
                 started = {**initial_result, 'run_dir': event['run_dir'], 'continuation_available': True}
+                if event.get('snapshot_dir'):
+                    started['snapshot_dir'] = event['snapshot_dir']
                 started = apply_task_state(started, event.get('task_state'))
                 self.save_reply(identity, assistant_index,
                                 started, workspace, '')
@@ -851,6 +1058,12 @@ class ProjectConversation:
             runner = None
             try:
                 from project_agent import ProjectAgent
+                if permission_mode != 'readonly':
+                    from project_snapshot import start_snapshot
+                    snapshot_state['directory'] = start_snapshot(ARTIFACTS / 'project_snapshots', workspace,
+                                                                 cancel_event=app.generation_cancel)
+                if app.generation_cancel.is_set():
+                    raise RuntimeError('任务已停止。')
                 if engine == 'harness':
                     from harness_agent import HarnessAgent
                     runner = HarnessAgent(workspace, model, executable=execution['executable'],
@@ -866,20 +1079,36 @@ class ProjectConversation:
                         write_memory=personal_options['write'], permission_mode=permission_mode)
                 if resume_from:
                     if recovery_confirmed:
-                        return runner.run(model_task, history=history, resume_from=resume_from,
+                        result = runner.run(model_task, history=history, resume_from=resume_from,
                                           recovery_confirmed=True)
-                    return runner.run(model_task, history=history, resume_from=resume_from)
-                return runner.run(model_task, history=history)
+                    else:
+                        result = runner.run(model_task, history=history, resume_from=resume_from)
+                else:
+                    result = runner.run(model_task, history=history)
             except Exception:
                 logging.exception('Project task failed')
                 directory = getattr(runner, 'run_dir', None)
-                return {'status': 'failed', 'answer': '项目任务发生错误，请检查目录、运行记录和磁盘空间。已有改动会保留。',
+                result = {'status': 'stopped' if app.generation_cancel.is_set() else 'failed',
+                        'answer': '项目任务已停止。' if app.generation_cancel.is_set() else '项目准备或执行失败，请检查目录、运行记录和磁盘空间。已有改动会保留。',
                         'run_dir': str(directory) if directory else '', 'changes': getattr(runner, 'changes', []),
                         'episode_id': None, 'continuation_available': directory is not None, 'engine': engine}
+            if snapshot_state.get('directory'):
+                result['snapshot_dir'] = snapshot_state['directory']
+                try:
+                    from project_snapshot import finish_snapshot
+                    result['snapshot'] = finish_snapshot(ARTIFACTS / 'project_snapshots', result['snapshot_dir'], workspace)
+                except (OSError, ValueError, RuntimeError):
+                    result['snapshot'] = {'status': 'unavailable', 'count': 0, 'files': [],
+                                          'notice': '未能保存执行后的快照，不能自动撤回这轮项目。'}
+                    result['answer'] += '\n\n' + result['snapshot']['notice']
+            return result
 
         def done(result):
             self.active = None
             result = {**card.result, **result}
+            if result.get('acceptance', {}).get('stale') and result.get('status') == 'completed':
+                result.update(status='review', continuation_available=bool(result.get('run_dir')))
+                result['answer'] += '\n\n上轮指定的手动检查需要重新运行，请在任务卡中检查项目结果。'
             memory_notice = app.memories.update_notice(result.get('memory_updates', []))
             if memory_notice:
                 result = {**result, 'answer': result['answer'] + memory_notice}
@@ -909,14 +1138,27 @@ class ProjectConversation:
         self.sync_busy()
 
     def undo(self, card):
-        if (self.app.busy or not card.result or card.result.get('engine') == 'harness' or not card.result.get('run_dir') or not card.result.get('changes')
+        snapshot = (card.result or {}).get('snapshot') or {}
+        use_snapshot = bool((card.result or {}).get('snapshot_dir') and snapshot.get('status') in ('ready', 'partial'))
+        if (self.app.busy or not card.result or (card.result.get('engine') == 'harness' and not use_snapshot) or not card.result.get('run_dir')
+                or not (snapshot.get('count') if use_snapshot else card.result.get('changes'))
                 or '[已撤回文件修改]' in card.activity):
             return
         from project_agent import rollback_run
         try:
-            directory = Path(card.result['run_dir']).resolve()
-            directory.relative_to((ARTIFACTS / 'project_runs').resolve())
-            outcome = rollback_run(directory, card.workspace)
+            if use_snapshot:
+                from project_snapshot import restore_snapshot
+                selected = None
+                if card.undo_files.winfo_manager():
+                    selected = [card.undo_files.get(index) for index in card.undo_files.curselection()]
+                    if not selected:
+                        card.status.set('请先在列表中选择要撤回的文件。')
+                        return
+                outcome = restore_snapshot(ARTIFACTS / 'project_snapshots', card.result['snapshot_dir'], card.workspace, paths=selected)
+            else:
+                directory = Path(card.result['run_dir']).resolve()
+                directory.relative_to((ARTIFACTS / 'project_runs').resolve())
+                outcome = rollback_run(directory, card.workspace)
         except (OSError, ValueError, RuntimeError):
             card.status.set('无法撤回，请检查文件和任务记录。')
             return
@@ -929,7 +1171,8 @@ class ProjectConversation:
         note = '用户已执行文件撤回。已恢复文件：' + ('、'.join(restored) or '无') + '。'
         if conflicts:
             note += '跳过文件：' + '、'.join(conflicts) + '。'
-        note += '此次撤回覆盖文件工具的修改。'
+        note += '此次撤回覆盖快照中的项目文件。' if use_snapshot else '此次撤回覆盖文件工具的修改。'
+        self.invalidate_checks(card.workspace)
         app = self.app
         index = getattr(card, 'history_index', card.assistant_index)
         previous = app.history[index]['content']

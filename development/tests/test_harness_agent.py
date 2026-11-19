@@ -1,6 +1,7 @@
 """Run the Harness adapter against an ACP peer with durable fixture sessions."""
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import sys
@@ -10,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from acp_transport import ACPProcess
-from harness_agent import HarnessAgent, load_harness_run
+from harness_agent import HarnessAgent, MAX_TASK_BYTES, load_harness_run, resolve_resume, validate_task
 from local_project_model import LocalProjectModel
 from remote_api import APIClient
 
@@ -111,6 +112,8 @@ if action in ("write", "deny", "fail", "cancel", "bad_approval", "unknown"):
         assert outcome.get("optionId") == "reject-once"
         update(identity, sessionUpdate="tool_call_update", toolCallId=call["toolCallId"], status="completed")
 
+if action == "long_task":
+    state["received_prompt"] = prompt["params"]["prompt"][0]["text"]
 state["turns"].append(name)
 if action == "cancel":
     update(identity, sessionUpdate="agent_message_chunk", content={"type": "text", "text": "cancel-ready"})
@@ -217,7 +220,8 @@ class HarnessAgentTests(unittest.TestCase):
         self.assertEqual((self.workspace / 'first.txt').read_text(encoding='utf-8'), 'written')
         self.assertEqual(self.session(first)['changes'], ['first.txt'])
 
-        second = self.runner('write', 'second.txt').run('Keep working.', resume_from=first['run_dir'])
+        second = self.runner('write', 'second.txt').run('Keep working.', resume_from=first['run_dir'],
+                                                       recovery_confirmed=True)
         third = self.runner('write', 'third.txt').run('Keep working.', resume_from=second['run_dir'])
         self.assertEqual([second['status'], third['status']], ['review', 'review'])
         self.assertEqual(self.session(third)['changes'], ['first.txt', 'second.txt', 'third.txt'])
@@ -225,6 +229,114 @@ class HarnessAgentTests(unittest.TestCase):
         self.assertEqual(self.metadata(first)['home_id'], self.metadata(third)['home_id'])
         self.assertEqual(third['task_state']['parent_run'], Path(second['run_dir']).name)
         self.assertTrue(all(connection._process.poll() is not None for connection in self.connections))
+
+    def test_long_task_reaches_peer_and_survives_in_redacted_run_record(self):
+        goal = '中' * 5400 + ' TAIL_ACCEPTANCE_MUST_BE_PRESENT'
+        result = self.runner('long_task', 'long').run(goal)
+        self.assertIn(goal, self.session(result)['received_prompt'])
+        self.assertEqual((Path(result['run_dir']) / 'request.txt').read_text(encoding='utf-8'), goal)
+
+    def test_invalid_inputs_leave_no_task_or_component(self):
+        validate_task('a' * MAX_TASK_BYTES)
+        for invalid in (' ', 'a' * (MAX_TASK_BYTES + 1), '\ud800'):
+            with self.subTest(size=len(invalid)), self.assertRaises(ValueError):
+                self.runner('reply', 'never').run(invalid)
+        for invalid in (1, True):
+            with self.subTest(value=invalid), self.assertRaises(ValueError):
+                self.runner('reply', 'never').run('Start', recovery_confirmed=invalid)
+        self.assertFalse(self.runs.exists())
+        self.assertFalse(self.connections)
+
+    def test_unavailable_model_retains_current_request_without_losing_the_existing_head(self):
+        first = self.runner('reply', 'one').run('Start.')
+        runtime = FixtureRuntime(21987)
+        model = LocalProjectModel(runtime=runtime, model_id='held')
+        task = 'Keep the complete request. ' + 'x' * 16384 + ' END'
+        with runtime._request_lock:
+            failure = self.runner('reply', 'never', model=model).run(task, resume_from=first['run_dir'])
+        self.assertEqual(failure['status'], 'failed')
+        self.assertEqual((Path(failure['run_dir']) / 'request.txt').read_text(encoding='utf-8'), task)
+        self.assertEqual(resolve_resume(self.runs, first['run_dir'], self.workspace), Path(first['run_dir']))
+
+    def test_unrelated_resumed_prompt_preserves_interrupted_operation(self):
+        first = self.runner('cancel', 'first.txt', cancel_event=Event()).run('Write and verify first.txt.')
+        self.assertTrue(first['task_state']['uncertain'])
+        second = self.runner('reply', 'hello').run('Just say hello.', resume_from=first['run_dir'])
+        self.assertTrue(second['task_state']['uncertain'])
+        self.assertEqual(second['status'], 'unfinished')
+        third = self.runner('reply', 'confirmed').run('Continue.', resume_from=second['run_dir'], recovery_confirmed=True)
+        self.assertFalse(third['task_state']['uncertain'])
+        self.assertIn('user_confirmation', [row['tool'] for row in third['task_state']['observations']])
+
+    def test_old_card_attaches_to_latest_journal_in_same_session(self):
+        a = self.runner('write', 'a.txt').run('Write A.')
+        b = self.runner('write', 'b.txt').run('Write B.', resume_from=a['run_dir'])
+        c = self.runner('reply', 'c').run('Continue.', resume_from=a['run_dir'])
+        self.assertEqual(self.session(c)['turns'], ['a.txt', 'b.txt', 'c'])
+        self.assertEqual(c['task_state']['parent_run'], Path(b['run_dir']).name)
+        self.assertIn('b.txt', json.dumps(c['task_state']['observations']))
+        self.assertEqual(resolve_resume(self.runs, a['run_dir'], self.workspace), Path(c['run_dir']))
+        stale = self.runner('reply', 'never')
+        with self.assertRaises(ValueError):
+            stale.run('Confirm old record.', resume_from=a['run_dir'], recovery_confirmed=True)
+        self.assertIsNone(stale.run_dir)
+
+    def test_concurrent_resume_leaves_one_session_writer(self):
+        a = self.runner('write', 'a.txt').run('Write A.')
+        entered, release = Event(), Event()
+        def approve(_):
+            entered.set()
+            return release.wait(4)
+        b = self.runner('write', 'b.txt', approve=approve)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(b.run, 'Write B.', resume_from=a['run_dir'])
+            try:
+                self.assertTrue(entered.wait(3))
+                c = self.runner('reply', 'never')
+                with self.assertRaisesRegex(ValueError, '锁定'):
+                    c.run('Continue.', resume_from=a['run_dir'])
+                self.assertIsNone(c.run_dir)
+            finally:
+                release.set()
+            result = pending.result(timeout=5)
+        self.assertEqual(result['status'], 'review')
+        self.assertEqual(len(self.connections), 2)
+
+    def test_legacy_linear_history_migrates_without_modifying_the_parent_runs(self):
+        a = self.runner('write', 'a.txt').run('Write A.')
+        b = self.runner('write', 'b.txt').run('Write B.', resume_from=a['run_dir'])
+        for run in (a, b):
+            manifest = Path(run['run_dir']) / 'harness.json'
+            old = json.loads(manifest.read_text(encoding='utf-8'))
+            del old['lineage_version']
+            manifest.write_text(json.dumps(old), encoding='utf-8')
+        pointer = self.root / 'harness' / 'lineages' / Path(a['run_dir']).name / 'latest.json'
+        pointer.unlink()
+        self.assertEqual(resolve_resume(self.runs, a['run_dir'], self.workspace), Path(b['run_dir']))
+        c = self.runner('reply', 'c').run('Continue.', resume_from=a['run_dir'])
+        self.assertEqual(c['task_state']['parent_run'], Path(b['run_dir']).name)
+        self.assertNotIn('lineage_version', self.metadata(a))
+        self.assertEqual(json.loads(pointer.read_text()), Path(c['run_dir']).name)
+
+    def test_ambiguous_legacy_branches_require_inspection(self):
+        runs = []
+        for name in ('a', 'b', 'c'):
+            runs.append(self.runner('reply', name).run('Continue.', resume_from=runs[-1]['run_dir'] if runs else None))
+        a, b, c = (Path(item['run_dir']) for item in runs)
+        for directory in (a, b, c):
+            metadata = directory / 'harness.json'
+            old = json.loads(metadata.read_text(encoding='utf-8'))
+            del old['lineage_version']
+            metadata.write_text(json.dumps(old), encoding='utf-8')
+        # In the legacy format B and C could both claim A as their parent.
+        state = c / 'task.json'
+        checkpoint = json.loads(state.read_text(encoding='utf-8'))
+        checkpoint['parent_run'] = a.name
+        state.write_text(json.dumps(checkpoint), encoding='utf-8')
+        (self.root / 'harness' / 'lineages' / a.name / 'latest.json').unlink()
+        with self.assertRaisesRegex(ValueError, '分支'):
+            resolve_resume(self.runs, a, self.workspace)
+        self.assertEqual(len(self.connections), 3)
 
     def test_denied_failed_and_unseen_operations_never_complete(self):
         for action in ('deny', 'fail', 'unknown', 'bad_approval'):
