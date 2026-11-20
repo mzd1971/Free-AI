@@ -231,7 +231,8 @@ class ClientApp(ExistingActions):
         self.input_scrollbar = ttk.Scrollbar(self.input_frame, command=self.input.yview, orient='vertical')
         self.input.configure(yscrollcommand=self.input_scrollbar.set)
         self.placeholder = label(self.input, '描述你想完成的事…', size=12, color=C['muted'], cursor='xterm', anchor='w')
-        self.placeholder.place(x=4, y=8)
+        self.placeholder.configure(padx=0, pady=0)
+        self.update_placeholder()
         self.placeholder.bind('<Button-1>', lambda e: self.input.focus_set())
         self.input.bind('<<Modified>>', self._draft_text_changed)
         self.input.bind('<Configure>', self._schedule_composer_size)
@@ -352,6 +353,7 @@ class ClientApp(ExistingActions):
             self.input_scrollbar.pack(side='right', fill='y')
         elif not scroll and self.input_scrollbar.winfo_manager():
             self.input_scrollbar.pack_forget()
+        self.update_placeholder()
         if self._memory_drawer:
             self._place_memory_drawer()
         elif self._project_drawer:
@@ -369,10 +371,17 @@ class ClientApp(ExistingActions):
         self._schedule_composer_size()
 
     def update_placeholder(self):
-        if self.input.index('end-1c') != '1.0':
+        if self.input.index('end-1c') != '1.0' or self.root.focus_get() is self.input:
             self.placeholder.place_forget()
         else:
-            self.placeholder.place(x=4, y=8)
+            line = self.input.dlineinfo('1.0')
+            x, y = line[:2] if line else (
+                self.input.winfo_pixels(self.input.cget('padx')),
+                self.input.winfo_pixels(self.input.cget('pady')))
+            # Text's placement border already includes its padding. Use widget
+            # coordinates so the hint shares the actual text origin. Hide it
+            # while editing, including before an IME commits its first character.
+            self.placeholder.place(x=x, y=y, bordermode='ignore')
 
     def layout_chat(self):
         if not hasattr(self, 'chat_stack'):

@@ -1,13 +1,12 @@
 ﻿# Export the approved transparent artwork without changing the source design.
 [CmdletBinding()]
-param([string]$SourceArtwork = 'assets\free-ai-openmark.png')
+param([string]$SourceArtwork = 'assets\free-ai-knowledge.png')
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
-Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition @"
+Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
-using System.Drawing;
 
 public static class FreeAIIconResource {
     [DllImport("user32.dll", SetLastError=true)]
@@ -20,12 +19,11 @@ public static class FreeAIIconResource {
     public static bool Check(byte[] frame, int size) {
         IntPtr handle = CreateIconFromResourceEx(frame, (uint)frame.Length, true, 0x00030000, size, size, 0);
         if (handle == IntPtr.Zero) return false;
-        try {
-            using (Icon icon = Icon.FromHandle(handle))
-                return icon.Width == size && icon.Height == size;
-        } finally {
-            DestroyIcon(handle);
-        }
+        // Dimensions and alpha are checked on the PNG frame below. Avoid a
+        // System.Drawing C# reference here so both Windows PowerShell and
+        // PowerShell 7 can validate the native icon resource.
+        DestroyIcon(handle);
+        return true;
     }
 }
 "@
@@ -177,7 +175,7 @@ $sourcePath = if ([IO.Path]::IsPathRooted($SourceArtwork)) {
 }
 $iconPath = Join-Path $iconRoot 'assets\free-ai.ico'
 $pngPath = Join-Path $iconRoot 'assets\free-ai-ui.png'
-$backupDirectory = Join-Path $iconRoot 'development\backups\before-blue-brand'
+$backupDirectory = Join-Path $iconRoot 'development\backups\before-knowledge-brand'
 $outputPaths = @($iconPath, $pngPath)
 foreach ($path in @($sourcePath, $iconPath, $pngPath, $backupDirectory)) {
     Assert-IconPath $path

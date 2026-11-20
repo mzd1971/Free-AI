@@ -268,6 +268,64 @@ class NativeComposerScenario(unittest.TestCase):
         self.assertTrue(self.app.generation_cancel.is_set())
         self.assertEqual(self.text(), '先写下一条\n')
 
+    def test_placeholder_aligns_with_caret_and_click_transfers_focus(self):
+        from tkinter import font as tkfont
+
+        app, root = self.app, self.app.root
+        root.geometry('1100x760+0+0')
+        root.deiconify()
+        root.focus_force()
+        root.update()
+        for choice, geometry in (('标准', '1100x760'), ('大', '940x740'), ('特大', '1100x820')):
+            with self.subTest(size=choice):
+                app.input.delete('1.0', 'end')
+                app.text_size_choice.set(choice)
+                app.change_text_size()
+                root.geometry(geometry + '+0+0')
+                root.update()
+                app.more_button.focus_set()
+                root.update()
+                self.assertIs(root.focus_get(), app.more_button)
+                self.assertTrue(app.placeholder.winfo_viewable())
+                x, y, _, height, baseline = app.input.dlineinfo('insert')
+                font = tkfont.Font(root=root, font=app.placeholder.cget('font'))
+                prompt_baseline = (app.placeholder.winfo_y()
+                    + app.placeholder.winfo_pixels(app.placeholder.cget('pady')) + font.metrics('ascent'))
+                self.assertAlmostEqual(prompt_baseline, y + baseline, delta=1)
+                self.assertGreaterEqual(height, font.metrics('linespace'))
+                app.placeholder.event_generate('<Button-1>', x=20, y=8)
+                app.placeholder.event_generate('<ButtonRelease-1>', x=20, y=8)
+                root.update()
+                self.assertIs(root.focus_get(), app.input)
+                self.assertFalse(app.placeholder.winfo_viewable(), 'The hint must hide as soon as editing starts')
+
+                # Native Text bindings must retain the insertion point after
+                # Chinese text and a newline, without putting the hint in data.
+                app.input.insert('insert', '你好 Free AI')
+                app.input.event_generate('<Return>')
+                root.update()
+                self.assertEqual(app.input.index('insert'), '2.0')
+                self.assertEqual(self.text(), '你好 Free AI\n')
+                self.assertFalse(app.placeholder.winfo_viewable())
+                app.input.insert('insert', '第二行')
+                app.input.event_generate('<Left>')
+                app.input.insert('insert', '✓')
+                root.update()
+                self.assertEqual(self.text(), '你好 Free AI\n第二✓行')
+                self.assertIsNotNone(app.input.bbox('insert'))
+                app.more_button.focus_set()
+                root.update()
+                self.assertFalse(app.placeholder.winfo_viewable(), 'A nonempty draft must never show the hint')
+                app.input.focus_set()
+                app.input.delete('1.0', 'end')
+                root.update()
+                self.assertFalse(app.placeholder.winfo_viewable(), 'Clearing while editing must not cover the caret')
+                app.more_button.focus_set()
+                root.update()
+                self.assertTrue(app.placeholder.winfo_viewable())
+                self.assertEqual(self.text(), '')
+                self.assertEqual(app.placeholder.winfo_x(), app.input.dlineinfo('1.0')[0])
+
 
 class ClientComposerTests(unittest.TestCase):
     def test_native_composer(self):
