@@ -44,7 +44,7 @@ class NativeTypographyScenario(unittest.TestCase):
             root.update()
             app.layout_chat()
             root.update()
-            for button in (app.send_button, app.model_button, app.context_button, app.skill_button,
+            for button in (app.send_button, app.model_button, app.more_button,
                            app.project.folder_button, app.project.permissions_button):
                 self.assertTrue(button.winfo_viewable(), (geometry, button.cget('text')))
                 self.assertGreaterEqual(button.winfo_rootx(), app.main.winfo_rootx())
@@ -52,6 +52,14 @@ class NativeTypographyScenario(unittest.TestCase):
                 self.assertLessEqual(button.winfo_rooty() + button.winfo_height(), root.winfo_rooty() + root.winfo_height())
             self.assertGreater(app.transcript.winfo_height(), 110)
             self.assertLess(app.chat_stack.winfo_width(), 1250)
+            # Length and skills are now reachable through the overflow menu,
+            # instead of taking space away from the model and send controls.
+            with patch('tkinter.Menu.tk_popup'):
+                app.answer_menu()
+                menus = [widget for widget in root.winfo_children() if isinstance(widget, tk.Menu)]
+                self.assertTrue(any(menu.entrycget(index, 'label') == '对话长度…'
+                                    for menu in menus for index in range((menu.index('end') or 0) + 1)
+                                    if menu.type(index) == 'command'))
         self.assertEqual(app.input.get('1.0', 'end').strip(), '不要丢失这段未发送的需求')
         self.assertEqual(app.transcript.get('1.0', 'end'), before)
         self.assertEqual(app.api_panel.model.get(), 'unsaved-model-draft')

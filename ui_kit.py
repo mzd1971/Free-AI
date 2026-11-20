@@ -16,6 +16,12 @@ LIGHT_COLORS = {
     'card_border': '#cfdef1', 'selected_bg': '#dceaff', 'selected_fg': '#1e40af',
     'brand': '#1d4ed8', 'secondary': '#0369a1',
 }
+CLIENT_LIGHT_COLORS = {**LIGHT_COLORS,
+    'bg': '#ffffff', 'side': '#f7f8fa', 'text': '#20242c', 'muted': '#69717e',
+    'line': '#e0e4ea', 'card_border': '#e0e4ea', 'hover': '#edf0f5',
+    'selected_bg': '#eaf0fb', 'selected_fg': '#224e9c', 'brand': '#20242c',
+    'secondary': '#586273', 'tint': '#eef4ff',
+}
 DARK_COLORS = {
     'bg': '#161719', 'side': '#202226', 'surface': '#282b30', 'input': '#353940',
     'text': '#f5f6f8', 'muted': '#c2c8d1', 'line': '#686f7b',
@@ -88,12 +94,12 @@ def background(parent):
 
 
 def setup_theme(root, title, size=(1320, 880), theme='light', *,
-                text_size=DEFAULT_TEXT_SIZE, min_size=(940, 640)):
+                text_size=DEFAULT_TEXT_SIZE, min_size=(940, 640), palette=None):
     palettes = {'light': LIGHT_COLORS, 'dark': DARK_COLORS, 'cyberpunk': CYBER_COLORS}
     if theme not in palettes:
         raise ValueError('Unknown application theme')
     COLORS.clear()
-    COLORS.update(palettes[theme])
+    COLORS.update(palette or palettes[theme])
     root._free_ai_theme = theme
     root.title(title)
     width = min(size[0], root.winfo_screenwidth() - 70)
@@ -307,6 +313,8 @@ class FlatButton(tk.Canvas):
         if self._max_width is not None:
             width = min(width, self._max_width)
         height = max(self._base_height, self._font.metrics('linespace') + 8)
+        if self._base_width == self._base_height and self.radius >= self._base_height / 2:
+            width = height = max(width, height)
         return width, height
 
     def _resize_text(self):
@@ -382,7 +390,10 @@ class FlatButton(tk.Canvas):
                     outline = fill
             _chamfered(self, 1, 1, w - 1, h - 1, 7, fill=fill, outline=outline)
         else:
-            rounded(self, 1, 1, w-1, h-1, self.radius, fill=fill, outline=fill)
+            if self._base_width == self._base_height and self.radius >= self._base_height / 2:
+                self.create_oval(1, 1, w-1, h-1, fill=fill, outline=fill)
+            else:
+                rounded(self, 1, 1, w-1, h-1, self.radius, fill=fill, outline=fill)
         text = self.value
         available = w - (24 if self.align == 'w' else 8)
         text_width = self._font.measure(text)

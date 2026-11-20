@@ -5,10 +5,11 @@ import os
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 
 from app_state import CONTEXTS, PROJECT_PERMISSION_MODES
 from paths import ARTIFACTS
+from project_checks import MAX_REPAIR_ATTEMPTS, load_project_check, save_project_check
 from ui_kit import COLORS as C, FONT, FlatButton, label, ui_font
 
 TITLES = {'remember_memory': '保存长期记忆', 'list_files': '查看项目', 'search_text': '搜索项目',
@@ -465,6 +466,12 @@ class ActivityCard:
         check = acceptance_summary(result)
         if check:
             lines.append(check)
+        if result.get('fixed_check'):
+            fixed = result['fixed_check']
+            summary = acceptance_summary({'acceptance': {**fixed, 'stale': False}})
+            if fixed.get('stale'):
+                summary += '（历史结果）'
+            lines.append('项目固定检查 · ' + summary)
         mode = result.get('permission_mode')
         if mode in ('readonly', 'automatic'):
             lines.append('权限 · ' + PERMISSION_LABELS[mode])
@@ -566,17 +573,16 @@ class ProjectConversation:
         self.menu_permission_mode = tk.StringVar(value='standard')
         self.allow_write = tk.BooleanVar(value=True)
         self.use_memory = tk.BooleanVar(value=False)
-        parent = app.composer.body
-        self.bar = tk.Frame(parent, bg=C['input'])
-        self.bar.pack(fill='x', before=app.input, pady=(0, 5))
-        self.chat_button = FlatButton(self.bar, '聊天', lambda: self.set_mode(False), variant='selected', height=30, width=55, font_size=11)
-        self.chat_button.pack(side='left')
-        self.project_button = FlatButton(self.bar, '做项目', lambda: self.set_mode(True), variant='ghost', height=30, width=69, font_size=11)
-        self.project_button.pack(side='left', padx=(3, 0))
-        self.folder_button = FlatButton(self.bar, '选择项目文件夹 ▾', self.choose_workspace,
-                                        variant='ghost', height=30, width=144, max_width=200, font_size=11)
-        self.permissions_button = FlatButton(self.bar, '逐条确认命令 ▾', self.show_permissions,
-                                             variant='ghost', height=30, width=124, font_size=11)
+        self.bar = tk.Frame(app.context_bar, bg=C['bg'])
+        self.bar.pack(fill='x')
+        self.folder_button = FlatButton(self.bar, '选择项目 ▾', self.choose_workspace,
+                                        variant='ghost', height=32, max_width=200, font_size=11)
+        self.chat_button = FlatButton(self.bar, '日常对话', lambda: self.set_mode(False),
+                                      variant='selected', height=32, font_size=11)
+        self.project_button = FlatButton(self.bar, '项目助手', lambda: self.set_mode(True),
+                                         variant='ghost', height=32, font_size=11)
+        self.permissions_button = FlatButton(app.composer_tools, '逐条确认命令 ▾', self.show_permissions,
+                                             variant='ghost', height=30, font_size=10)
         self.permissions_menu = tk.Menu(app.root, tearoff=0, bg=C['surface'], fg=C['text'],
                                         activebackground=C['tint'], activeforeground=C['text'])
         for mode, title in PERMISSION_LABELS.items():
@@ -589,34 +595,28 @@ class ProjectConversation:
         self.permissions_menu.add_checkbutton(label='参考经验', variable=self.use_memory, command=self.save_settings)
         self.permissions_menu.add_separator()
         self.permissions_menu.add_command(label='在编辑器中打开项目', command=self.open_project_in_editor)
+        self.permissions_menu.add_command(label='固定项目检查…', command=self.configure_fixed_check)
         self.permissions_menu.add_command(label='在终端中打开项目', command=self.open_project_terminal)
         self.location = label(self.bar, '', size=9, color=C['muted'])
         app.transcript.bind('<Configure>', lambda event: self.resize_cards(), add='+')
         self.bar.bind('<Configure>', lambda event: self.layout_bar())
 
     def layout_bar(self):
-        buttons = (self.chat_button, self.project_button, self.folder_button, self.permissions_button)
-        compact = self.bar.winfo_width() < sum(button.winfo_reqwidth() for button in buttons) + 20
-        layout = (bool(self.enabled.get()), compact, tuple(button.winfo_reqwidth() for button in buttons))
-        if getattr(self, '_bar_layout', None) == layout:
+        buttons = (self.folder_button, self.chat_button, self.project_button)
+        compact = self.bar.winfo_width() < sum(button.winfo_reqwidth() for button in buttons) + 12
+        if getattr(self, '_bar_compact', None) == compact:
             return
-        self._bar_layout = layout
+        self._bar_compact = compact
         for button in buttons:
-            button.pack_forget()
             button.grid_forget()
-        for index in range(4):
-            self.bar.columnconfigure(index, weight=0)
-        self.chat_button.grid(row=0, column=0, sticky='w')
-        self.project_button.grid(row=0, column=1, sticky='w', padx=(3, 0))
-        if self.enabled.get():
-            if compact:
-                self.bar.columnconfigure(1, weight=1)
-                self.folder_button.grid(row=1, column=0, columnspan=2, sticky='w', pady=(4, 0))
-                self.permissions_button.grid(row=1, column=2, sticky='e', pady=(4, 0))
-            else:
-                self.bar.columnconfigure(2, weight=1)
-                self.folder_button.grid(row=0, column=2, sticky='w', padx=(4, 0))
-                self.permissions_button.grid(row=0, column=3, sticky='e')
+        if compact:
+            self.folder_button.grid(row=0, column=0, columnspan=2, sticky='w')
+            self.chat_button.grid(row=1, column=0, sticky='w', pady=(4, 0))
+            self.project_button.grid(row=1, column=1, sticky='w', padx=(4, 0), pady=(4, 0))
+        else:
+            self.folder_button.grid(row=0, column=0, sticky='w')
+            self.chat_button.grid(row=0, column=1, sticky='w', padx=(8, 0))
+            self.project_button.grid(row=0, column=2, sticky='w', padx=(4, 0))
 
     def resize_cards(self):
         for card in self.cards:
@@ -640,16 +640,15 @@ class ProjectConversation:
 
     def refresh(self):
         enabled = self.enabled.get()
-        self.app.input.configure(height=3)
         self.chat_button.configure(variant='ghost' if enabled else 'selected')
         self.project_button.configure(variant='selected' if enabled else 'ghost')
+        workspace = self.workspace.get()
+        name = Path(workspace).name or workspace
+        self.folder_button.configure(text=(name or '选择项目') + ' ▾')
+        self.location.configure(text='项目：' + (workspace or '尚未选择'))
         if enabled:
             mode = self.permission_mode.get()
-            name = Path(self.workspace.get()).name or self.workspace.get()
-            name = name[:11] + '…' if len(name) > 12 else name
-            self.folder_button.configure(text=(name or '选择项目文件夹') + ' ▾')
             self.permissions_button.configure(text=PERMISSION_LABELS[mode] + ' ▾')
-            self.location.configure(text='项目：' + (self.workspace.get() or '尚未选择'))
             hints = ['本地处理' if self.app.backend == 'local' else '任务和读取的文件将发往已选 API',
                      PERMISSION_HINTS[mode]]
             if mode == 'automatic':
@@ -662,9 +661,10 @@ class ProjectConversation:
             self.app.skill_button.configure(state='disabled')
         else:
             self.app.skill_button.configure(state='normal')
-            self.app.chat_hint.set('Enter 发送 · Shift + Enter 换行')
+            self.app.chat_hint.set('Ctrl + Enter 发送 · Enter 换行')
         self.layout_bar()
         self.sync_busy()
+        self.app.layout_composer_tools()
         self.refresh_summary()
 
     def set_mode(self, enabled):
@@ -706,6 +706,30 @@ class ProjectConversation:
         self.save_settings()
         self.refresh()
 
+    def configure_fixed_check(self):
+        if self.app.busy:
+            return
+        folder = self.workspace.get().strip()
+        if not folder:
+            self.app.status.set('请先选择项目文件夹。')
+            return
+        try:
+            try:
+                current = load_project_check(self.app.sessions, folder)
+            except ValueError:
+                # Permit replacement of a saved command that no longer parses.
+                current = ''
+            command = simpledialog.askstring('固定项目检查',
+                f'项目：{folder}\n填写测试命令或 JSON 参数数组，保存后在可写任务结束时运行。'
+                '检查失败时使用本轮模型自动续修，最多 2 次。命令沿用本轮权限。\n留空保存可停用。',
+                initialvalue=current, parent=self.app.root)
+            if command is None:
+                return
+            save_project_check(self.app.sessions, folder, command)
+            self.app.status.set('已为当前项目启用固定检查。' if command.strip() else '已停用当前项目的固定检查。')
+        except (ValueError, OSError, RuntimeError) as error:
+            self.app.status.set(str(error))
+
     def save_settings(self, **overrides):
         if self.app.session_id:
             self.app.sessions.set_project_settings(self.app.session_id, {
@@ -717,14 +741,23 @@ class ProjectConversation:
         if self.app.busy:
             return
         folder = filedialog.askdirectory(parent=self.app.root, title='选择这段对话要处理的项目')
-        if folder:
-            folder = str(Path(folder).absolute())
-            if Path(folder) == Path(self.workspace.get()):
-                return
-            self.save_settings(workspace=folder, permission_mode='standard', allow_write=True)
-            self.workspace.set(folder)
-            self.apply_permission('standard', True)
-            self.refresh()
+        if not folder:
+            return
+        folder = str(Path(folder).absolute())
+        if Path(folder) == Path(self.workspace.get()):
+            if not self.enabled.get():
+                self.set_mode(True)
+            return
+        mode = 'readonly' if self.permission_mode.get() == 'readonly' else 'standard'
+        allow_write = self.allow_write.get() and mode != 'readonly'
+        self.save_settings(enabled=True, workspace=folder, permission_mode=mode, allow_write=allow_write)
+        self.workspace.set(folder)
+        self.apply_permission(mode, allow_write)
+        self.enabled.set(True)
+        self.app.tool_mode.set(False)
+        self.refresh()
+        self.app.select_page(0)
+        self.app.input.focus_set()
 
     def open_project_in_editor(self):
         return self.app.open_project_in_editor(self.workspace.get())
@@ -751,6 +784,8 @@ class ProjectConversation:
             result = row['result']
             if result.get('acceptance'):
                 result['acceptance'] = {**result['acceptance'], 'stale': True}
+            if result.get('fixed_check'):
+                result['fixed_check'] = {**result['fixed_check'], 'stale': True}
             if result.get('snapshot_dir') and not result.get('snapshot'):
                 try:
                     from project_snapshot import describe_snapshot
@@ -842,8 +877,10 @@ class ProjectConversation:
     def invalidate_checks(self, workspace):
         for card in self.cards:
             if (os.path.normcase(card.workspace) == os.path.normcase(workspace)
-                    and (card.result or {}).get('acceptance')):
-                card.result['acceptance'] = {**card.result['acceptance'], 'stale': True}
+                    and card.result and (card.result.get('acceptance') or card.result.get('fixed_check'))):
+                for key in ('acceptance', 'fixed_check'):
+                    if card.result.get(key):
+                        card.result[key] = {**card.result[key], 'stale': True}
                 card.finish(card.result)
                 self.save_card(card)
 
@@ -873,6 +910,10 @@ class ProjectConversation:
 
         def done(outcome):
             card.result = {**card.result, 'acceptance': outcome}
+            old_fixed = card.result.get('fixed_check') or {}
+            if old_fixed.get('argv') and outcome.get('argv') == old_fixed['argv']:
+                card.result['fixed_check'] = {**outcome, 'source': 'fixed',
+                                              'repair_attempt': old_fixed.get('repair_attempt', 0)}
             if outcome.get('status') != 'passed':
                 resumable = card.result.get('continuation_available', False)
                 if card.result.get('engine') != 'harness':
@@ -888,11 +929,15 @@ class ProjectConversation:
             previous = card.result.get('answer', '').split('\n\n[手动项目检查]\n', 1)[0]
             self.update_card_answer(card, previous + '\n\n[手动项目检查]\n' + details)
             card.finish(card.result)
-            card.status.set(acceptance_summary(card.result))
+            summary = acceptance_summary(card.result)
+            if (outcome.get('status') == 'passed' and card.result.get('fixed_check')
+                    and card.result['fixed_check']['status'] != 'passed'):
+                summary += ' · 项目固定检查尚未通过'
+            card.status.set(summary)
             if not self.save_card(card):
                 app.status.set('检查已结束，但记录未能保存，请复制详情中的结果。')
             else:
-                app.status.set(acceptance_summary(card.result))
+                app.status.set(summary)
             self.sync_busy()
         app.submit('正在检查项目', work, done, cancellable=True)
         self.sync_busy()
@@ -912,19 +957,20 @@ class ProjectConversation:
             self.set_mode(True)
         self.send(resume_from=card.result['run_dir'], recovery_confirmed=recovery_confirmed)
 
-    def send(self, *, resume_from=None, recovery_confirmed=False):
+    def send(self, *, resume_from=None, recovery_confirmed=False, repair_attempt=0):
         app = self.app
         if app.busy:
             return
-        draft = app.input.get('1.0', 'end').strip()
-        task = draft or (CONTINUE_TASK if resume_from else '')
+        draft = '' if repair_attempt else app.input.get('1.0', 'end').strip()
+        task = (f'自动续修 {repair_attempt}/{MAX_REPAIR_ATTEMPTS}：固定检查未通过。请根据实际失败输出修复原任务，程序会重新检查。'
+                if repair_attempt else draft or (CONTINUE_TASK if resume_from else ''))
         folder = self.workspace.get().strip()
         if not task:
             return
         if not folder or not Path(folder).is_dir():
             app.status.set('先选择这段对话的项目文件夹，输入内容会保留。')
             return
-        if app.image_path or app.skill_file:
+        if not repair_attempt and (app.image_path or app.skill_file):
             app.status.set('做项目暂时只处理文字文件。请先在 + 菜单移除图片或 CSV 附件，草稿会保留。')
             return
         from harness_settings import load_preferences as load_execution_preferences
@@ -946,6 +992,8 @@ class ProjectConversation:
                 if resume_from:
                     latest = str(resolve_resume(ARTIFACTS / 'project_runs', resume_from, folder))
                     if os.path.normcase(latest) != os.path.normcase(str(resume_from)):
+                        if repair_attempt:
+                            raise ValueError('组件会话已有更新，自动续修已停止。请从最新任务卡继续。')
                         if recovery_confirmed:
                             raise ValueError('这张卡之后已有新进度，请核实最新任务卡后再继续。')
                         resume_notice = '已接续本会话最新进度。'
@@ -984,6 +1032,14 @@ class ProjectConversation:
         if source and source.result.get('acceptance'):
             from project_verification import format_verification_context
             model_task += '\n\n用户在本机运行的上轮检查结果（历史证据，需要重跑）：\n' + format_verification_context(source.result['acceptance'])
+        if source and source.result.get('fixed_check'):
+            from project_verification import format_verification_context
+            model_task += '\n\n' + format_verification_context(source.result['fixed_check'])
+        try:
+            fixed_command = load_project_check(app.sessions, workspace)
+        except (ValueError, OSError, RuntimeError) as error:
+            app.status.set(f'无法读取固定项目检查，请在项目菜单重新配置。{error}')
+            return
         if engine == 'harness':
             try:
                 validate_task(model_task)
@@ -999,14 +1055,21 @@ class ProjectConversation:
         permission_mode = self.permission_mode.get()
         allow_write, use_memory = self.allow_write.get(), self.use_memory.get()
         personal_options = app.memories.snapshot(app.backend)
-        app.sessions.append(identity, 'user', task)
+        if not repair_attempt and hasattr(app, 'draft_session_id'):
+            app.sessions.append(identity, 'user', task, draft_from=app.draft_session_id)
+        else:
+            app.sessions.append(identity, 'user', task)
         app.history.append({'role': 'user', 'content': task})
-        app.append_heading('你', 'user')
+        app.append_heading('自动续修' if repair_attempt else '你', 'user')
         app.write(app.transcript, task + '\n\n', True)
         app.append_heading('Free AI', 'assistant')
         app.pending_chat, app.streamed = None, ''
         app.last_episode, app.last_tool_result = None, None
-        app.input.delete('1.0', 'end')
+        if not repair_attempt:
+            if hasattr(app, 'clear_submitted_draft'):
+                app.clear_submitted_draft()
+            else:
+                app.input.delete('1.0', 'end')
         app.update_placeholder()
         app.layout_chat()
         app.root.update_idletasks()
@@ -1016,6 +1079,8 @@ class ProjectConversation:
                           'engine': engine}
         if source and source.result.get('acceptance'):
             initial_result['acceptance'] = {**source.result['acceptance'], 'stale': True}
+        if source and source.result.get('fixed_check'):
+            initial_result['fixed_check'] = {**source.result['fixed_check'], 'stale': True}
         card.result = initial_result
         if resume_notice:
             card.append(resume_notice)
@@ -1031,6 +1096,7 @@ class ProjectConversation:
         app.refresh_recent()
         assistant_index = card.assistant_index
         snapshot_state = {}
+        denied = threading.Event()
 
         def approve(details):
             if permission_mode != 'standard':
@@ -1040,6 +1106,8 @@ class ProjectConversation:
             while not request['ready'].wait(.1):
                 if app.generation_cancel.is_set():
                     return False
+            if not request['allowed']:
+                denied.set()
             return request['allowed'] and not app.generation_cancel.is_set()
 
         def on_event(event):
@@ -1069,7 +1137,8 @@ class ProjectConversation:
                     runner = HarnessAgent(workspace, model, executable=execution['executable'],
                         runs_root=ARTIFACTS / 'project_runs', approve_command=approve, on_event=on_event,
                         cancel_event=app.generation_cancel, allow_write=allow_write,
-                        context=context, permission_mode=permission_mode)
+                        context=context, permission_mode=permission_mode,
+                        personal_memory=app.personal_memory, read_memory=personal_options['read'])
                 else:
                     runner = ProjectAgent(workspace, model, runs_root=ARTIFACTS / 'project_runs',
                         approve_command=approve, on_event=on_event,
@@ -1085,6 +1154,20 @@ class ProjectConversation:
                         result = runner.run(model_task, history=history, resume_from=resume_from)
                 else:
                     result = runner.run(model_task, history=history)
+                if (fixed_command and permission_mode != 'readonly'
+                        and result.get('status') in ('completed', 'review', 'unfinished', 'limit')):
+                    from project_verification import run_verification, format_verification_context
+                    on_event({'type': 'instructions', 'message': '正在运行已保存的项目固定检查。'})
+                    check = run_verification(workspace, fixed_command, cancel_event=app.generation_cancel,
+                                             permission_mode=permission_mode, approve_command=approve)
+                    result['fixed_check'] = {**check, 'source': 'fixed', 'repair_attempt': repair_attempt}
+                    result['answer'] += '\n\n[项目固定检查]\n' + format_verification_context(result['fixed_check'])
+                    if check['status'] != 'passed':
+                        result.update(status='stopped' if check['status'] == 'stopped' else 'unfinished',
+                                      continuation_available=bool(result.get('run_dir')))
+                        result['answer'] = '项目固定检查尚未通过。\n\n模型本轮回复：\n' + result['answer']
+                        if check['status'] == 'failed' and repair_attempt == MAX_REPAIR_ATTEMPTS:
+                            result['answer'] += '\n已达到自动续修次数上限。'
             except Exception:
                 logging.exception('Project task failed')
                 directory = getattr(runner, 'run_dir', None)
@@ -1109,7 +1192,12 @@ class ProjectConversation:
             if result.get('acceptance', {}).get('stale') and result.get('status') == 'completed':
                 result.update(status='review', continuation_available=bool(result.get('run_dir')))
                 result['answer'] += '\n\n上轮指定的手动检查需要重新运行，请在任务卡中检查项目结果。'
-            memory_notice = app.memories.update_notice(result.get('memory_updates', []))
+            if (fixed_command and result.get('fixed_check', {}).get('stale')
+                    and result.get('status') in ('review', 'completed')):
+                result.update(status='unfinished', continuation_available=bool(result.get('run_dir')))
+                result['answer'] += '\n\n本轮尚未执行已保存的项目固定检查。'
+            memory_notice = (app.memories.update_notice(result.get('memory_updates', []))
+                             + app.memories.read_notice(result.get('memory_ids', [])))
             if memory_notice:
                 result = {**result, 'answer': result['answer'] + memory_notice}
             card.finish(result)
@@ -1134,6 +1222,14 @@ class ProjectConversation:
             app.refresh_model_state()
             self.sync_busy()
             self.refresh_summary()
+            if (saved and repair_attempt < MAX_REPAIR_ATTEMPTS and not denied.is_set()
+                    and not app.generation_cancel.is_set() and card.can_resume()
+                    and app.session_id == identity and card in self.cards
+                    and os.path.normcase(self.workspace.get()) == os.path.normcase(workspace)
+                    and not (result.get('task_state') or {}).get('uncertain')
+                    and not result.get('fixed_check', {}).get('stale')
+                    and result.get('fixed_check', {}).get('status') == 'failed'):
+                self.send(resume_from=result['run_dir'], repair_attempt=repair_attempt + 1)
         app.submit('项目助手正在处理', work, done, cancellable=True)
         self.sync_busy()
 

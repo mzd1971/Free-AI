@@ -199,8 +199,9 @@ def _http_error(status):
 
 
 class _RequestState:
-    def __init__(self, cancel_event):
+    def __init__(self, cancel_event, read_timeout=None):
         self.cancel_event = cancel_event
+        self.read_timeout = read_timeout
         self.aborted = threading.Event()
         self.done = threading.Event()
         self._lock = threading.Lock()
@@ -251,6 +252,10 @@ def _opener(state):
             state.check()
             super().connect()
             state.register(self.sock)
+            # A non-streaming model may produce no headers until generation ends.
+            # Keep connection establishment short, then use the overall request
+            # budget; _run still enforces the wall-clock deadline and cancellation.
+            self.sock.settimeout(state.read_timeout)
 
         def send(self, data):
             state.check()
@@ -267,6 +272,7 @@ def _opener(state):
             state.register(self.sock)
             self.sock.do_handshake()
             state.check()
+            self.sock.settimeout(state.read_timeout)
 
         def send(self, data):
             state.check()
@@ -344,11 +350,12 @@ class APIClient:
         return '<APIClient configured; credentials hidden>'
 
     def _run(self, operation, cancel_event=None, timeout=None):
-        state = _RequestState(cancel_event)
+        budget = timeout or self.request_timeout
+        state = _RequestState(cancel_event, read_timeout=budget)
         state.check()
         if not self._request_lock.acquire(blocking=False):
             raise APIError('已有 API 请求正在进行，请等待完成或先停止。')
-        deadline = time.monotonic() + (timeout or self.request_timeout)
+        deadline = time.monotonic() + budget
 
         def work():
             try:

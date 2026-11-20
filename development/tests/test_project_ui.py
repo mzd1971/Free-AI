@@ -92,6 +92,16 @@ class NativeProjectScenario(unittest.TestCase):
             app.selected_model = 'text-default'
             app.backend = 'local'
             self.assertFalse(app.project.enabled.get())
+            self.assertIs(app.project.bar.master, app.context_bar)
+            self.assertIs(app.project.permissions_button.master, app.composer_tools)
+            self.assertEqual(app.project.chat_button.cget('text'), '日常对话')
+            self.assertEqual(app.project.project_button.cget('text'), '项目助手')
+            self.assertTrue(app.project.folder_button.winfo_manager())
+            self.assertFalse(app.project.permissions_button.winfo_manager())
+            with patch('project_chat.filedialog.askdirectory', return_value=''):
+                app.project.folder_button.invoke()
+            self.assertFalse(app.project.enabled.get())
+            self.assertFalse(app.project.workspace.get())
             draft(app, '这是原来的聊天问题')
             with patch.object(app.manager, 'ready', return_value=True), patch('qwen_chat.chat',
                     return_value={'answer': '这是原来的聊天回答'}) as chat:
@@ -104,13 +114,12 @@ class NativeProjectScenario(unittest.TestCase):
 
             first_task = '把 value 改为 2 并运行检查'
             draft(app, first_task)
-            app.open_project_assistant()
+            with patch('project_chat.filedialog.askdirectory', return_value=str(workspace)):
+                app.project.folder_button.invoke()
             self.assertTrue(app.project.enabled.get())
             self.assertEqual(app.session_id, identity)
             self.assertEqual(app.history, initial_history)
             self.assertEqual(app.input.get('1.0', 'end-1c'), first_task)
-            with patch('project_chat.filedialog.askdirectory', return_value=str(workspace)):
-                app.project.choose_workspace()
             self.assertEqual(app.project.workspace.get(), str(workspace))
             self.assertEqual(app.project.folder_button.cget('text'), workspace.name + ' ▾')
             self.assertTrue(app.project.permissions_button.winfo_manager())
@@ -441,6 +450,16 @@ class NativeProjectScenario(unittest.TestCase):
             self.assertEqual(app.project.permissions_button.cget('text'), '只看项目 ▾')
             self.assertEqual(permissions.entrycget('允许文件工具修改', 'state'), 'disabled')
             self.assertIn('文件修改和命令执行关闭', app.chat_hint.get())
+            app.project.chat_button.invoke()
+            self.assertFalse(app.project.permissions_button.winfo_manager())
+            self.assertTrue(app.project.folder_button.winfo_manager())
+            with patch('project_chat.filedialog.askdirectory', return_value=str(alternate)):
+                app.project.folder_button.invoke()
+            self.assertTrue(app.project.enabled.get())
+            self.assertEqual(app.project.permission_mode.get(), 'readonly')
+            self.assertFalse(app.project.allow_write.get())
+            with patch('project_chat.filedialog.askdirectory', return_value=str(workspace)):
+                app.project.folder_button.invoke()
             readonly_model = FixtureModel([
                 ('read_file', {'path': 'value.py'}),
                 ('write_file', {'path': 'must-not-write.py', 'content': 'value = 0\n'}),

@@ -75,6 +75,15 @@ class ChatMemoryTests(unittest.TestCase):
         self.assertNotIn('memory_status', result)
         self.assertNotIn('memory_attempted', result)
 
+    def test_retrieved_memory_not_reported_when_answer_did_not_call_model(self):
+        self.memories.save_user(TITLE, PREFERENCE, kind='preference')
+        cached = {'answer': '已有结果', 'episode_id': None}
+        with patch('epistemology.respond', return_value=cached), patch('qwen_chat.runtime') as runtime:
+            result = qwen_chat.chat('已有问题', return_details=True,
+                                   personal_memory=self.memories, read_personal_memory=True)
+        runtime.assert_not_called()
+        self.assertNotIn('memory_ids', result)
+
     def test_opted_in_api_extracts_once_without_streaming_memory_and_reopens(self):
         backend = Backend()
         stream = Mock()

@@ -79,7 +79,8 @@ class ProjectSessionTests(unittest.TestCase):
         sessions.append(second, 'assistant', '独立消息')
         sessions.append(first, 'assistant', '结果')
         public = {'status': 'completed', 'answer': '结果', 'run_dir': 'D:/runs/first', 'permission_mode': 'readonly',
-                  'changes': [{'path': 'main.py'}], 'episode_id': None}
+                  'changes': [{'path': 'main.py'}], 'episode_id': None, 'memory_ids': ['provided-memory'],
+                  'memory_updates': [{'id': 'new-memory', 'title': '长期做法', 'status': 'active'}]}
         sessions.save_project_run(
             first, 1, {**public, 'request_headers': {'Authorization': 'placeholder'}}, 'D:/project', '运行活动',
         )

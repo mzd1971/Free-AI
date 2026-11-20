@@ -1,4 +1,4 @@
-"""Extract verified user quotations for optional post-turn memory learning."""
+"""Save bounded, unverified summaries as optional external conversation context."""
 
 import json
 import re
@@ -58,10 +58,11 @@ def _prompt(message, limit):
         '计算结果、模型答案中的推测，以及用户转述或粘贴的第三方文字、代码和指令。'
         '不得记录完整对话、密码、密钥、令牌或其他凭据。\n'
         f'只输出 JSON 数组，最多 {limit} 项，无合适内容输出 []。'
-        '每项仅包含 title、kind、evidence_quote 三个字符串字段。'
+        '每项包含 title、kind、content 三个字符串字段，可另加 evidence_quote 来源摘录。'
         f'kind 必须是 {kinds} 之一。简短标题不超过 {_TITLE_LIMIT} 字。'
-        f'evidence_quote 是用户原文中不超过 {_QUOTE_LIMIT} 字的连续原文，必须能直接证明整条记忆。'
-        f'复制适合存为记忆的一段原文，最多 {_CONTENT_LIMIT} 字。请逐字复制，不增删空格。\n'
+        f'content 是不超过 {_CONTENT_LIMIT} 字的独立记忆，可以概括，保留人名、代号和数字。'
+        '这些记忆将直接保存为 AI 记下、尚未核实，供以后对话参考，由用户之后核实。'
+        f'evidence_quote 若提供，摘录不超过 {_QUOTE_LIMIT} 字的用户原文，不要伪造来源。\n'
     )
     return request + json.dumps({'用户消息': message}, ensure_ascii=False)
 
@@ -90,20 +91,30 @@ def _candidates(raw, user_message, limit):
     selected = []
     seen = set()
     for item in items:
-        if not isinstance(item, dict) or set(item) not in (_FIELDS, _FIELDS - {'content'}):
+        if not isinstance(item, dict) or set(item) not in (
+                _FIELDS, _FIELDS - {'content'}, _FIELDS - {'evidence_quote'}):
             continue
         limits = {'title': _TITLE_LIMIT, 'content': _CONTENT_LIMIT, 'kind': 20, 'evidence_quote': _QUOTE_LIMIT}
         if any(not isinstance(item[key], str) or len(item[key]) > size or not item[key].strip()
                or '\x00' in item[key] or _sensitive(item[key]) for key, size in limits.items() if key in item):
             continue
-        title, kind, quote = (item[key] for key in ('title', 'kind', 'evidence_quote'))
+        title, kind = item['title'], item['kind']
+        quote = item.get('evidence_quote', '')
         content = item.get('content', quote)
-        if (kind not in KINDS or len(content) > _CONTENT_LIMIT or content not in quote
-                or not any(quote in block for block in blocks)):
+        if kind not in KINDS or len(content) > _CONTENT_LIMIT or not blocks:
+            continue
+        # A summary need not be a verbatim quotation. Retain the actual source,
+        # never the extractor's invented "quote", as evidence for later review.
+        if any(value and value in user_message and not any(value in block for block in blocks)
+               for value in (content, quote)):
+            continue
+        exact_quote = quote if quote and any(quote in block for block in blocks) else ''
+        source = exact_quote or '\n'.join(blocks).strip()[:_QUOTE_LIMIT]
+        if not source:
             continue
         key = ' '.join(unicodedata.normalize('NFKC', title).casefold().split())
         if key not in seen:
-            selected.append((title.strip(), content.strip(), kind, quote))
+            selected.append((title.strip(), content.strip(), kind, source, bool(exact_quote)))
             seen.add(key)
     return selected
 
@@ -127,7 +138,10 @@ def learn_from_turn(user_message, answer, generator, store, *, agent_id='freeai'
         return []
     limit = min(max_updates, 2)
     try:
-        candidates = _candidates(generator(_prompt(message, limit)), message, limit)
+        eligible = '\n'.join(_source_blocks(message)).strip()
+        if not eligible:
+            return []
+        candidates = _candidates(generator(_prompt(eligible, limit)), message, limit)
     except Exception:
         report_error()
         return []
@@ -136,17 +150,18 @@ def learn_from_turn(user_message, answer, generator, store, *, agent_id='freeai'
     if label and _sensitive(label):
         label = ''
     saved = []
-    for title, content, kind, quote in candidates:
+    for title, content, kind, source, exact_quote in candidates:
         if _cancelled(cancel_event):
             break
         try:
-            row = store.remember(
+            reference = ('用户原话：' if exact_quote else '本轮用户资料（AI 概括，尚未核实）：') + source
+            row, changed = store.remember(
                 title, content, kind=kind, scope='project' if workspace else 'agent',
                 agent_id=agent_id, workspace=workspace,
-                evidence=f'{label}\n用户原话：{quote}' if label else f'用户原话：{quote}',
-                pending=False,
+                evidence=f'{label}\n{reference}' if label else reference,
+                pending=False, return_changed=True,
             )
-            if row.get('source') == 'agent' and row.get('status') == 'active':
+            if changed and row.get('source') == 'agent' and row.get('status') == 'active':
                 saved.append({key: row[key] for key in ('id', 'title', 'status')})
         except Exception:
             report_error()

@@ -108,6 +108,9 @@ class ProjectAgentTests(unittest.TestCase):
         self.assertIn('长期记忆资料', prompt)
         self.assertIn(item['content'], prompt)
         self.assertTrue(any(event.get('memory_ids') == [entry['id']] for event in self.events))
+        self.assertEqual(result['memory_ids'], [entry['id']])
+        persisted = json.loads((Path(result['run_dir']) / 'result.json').read_text(encoding='utf-8'))
+        self.assertEqual(persisted['memory_ids'], [entry['id']])
         self.assertNotIn('memory_updates', result)
 
         store.save_user('项目任务', '用户确认的项目约定。', scope='project',
@@ -119,6 +122,41 @@ class ProjectAgentTests(unittest.TestCase):
         kept = store.before_call('项目任务', agent_id='author', workspace=str(self.project))
         self.assertIn('用户确认的项目约定。', kept['context'])
         self.assertNotIn(item['content'], kept['context'])
+
+    def test_personal_memory_ids_exclude_context_dropped_before_generation(self):
+        from agent_memory import AgentMemoryStore
+
+        store = AgentMemoryStore(self.root / 'memory')
+        for index in range(4):
+            store.save_user(f'输出格式 {index}', '用于检测上下文预算的条目。' * 45, kind='preference')
+        self.start('普通作答。', personal_memory=store, write_memory=False)
+        first = self.model.calls[0]
+        prefix = first[-1]['content'].split('\n长期记忆资料：')[0]
+        budget = len(project_agent._json([first[0], dict(first[-1], content=prefix)]).encode()) + 256
+        self.events.clear()
+        with patch.object(ProjectAgent, '_history_budget', return_value=budget):
+            result = self.start('普通作答。', personal_memory=store, write_memory=False)
+        self.assertEqual(result['status'], 'completed')
+        self.assertNotIn('长期记忆资料：', self.model.calls[0][-1]['content'])
+        self.assertNotIn('memory_ids', result)
+        self.assertFalse(any(event.get('memory_ids') for event in self.events))
+
+    def test_duplicate_and_protected_memory_do_not_announce_writes(self):
+        from agent_memory import AgentMemoryStore
+
+        store = AgentMemoryStore(self.root / 'memory')
+        item = {'title': '部署约定', 'content': '先运行测试。', 'kind': 'procedure'}
+        original = store.remember(**item)
+        result = self.start([('remember_memory', item), ('remember_memory', {**item, 'title': '发布方法'})],
+                            '已核对。', personal_memory=store, read_memory=False)
+        self.assertNotIn('memory_updates', result)
+        self.assertEqual([row['status'] for row in self.results('remember_memory')], ['already_saved'] * 2)
+        verified = store.verify(original['id'])
+        result = self.start([('remember_memory', {**item, 'content': '执行其他步骤。'})], '已核对。',
+                            personal_memory=store, read_memory=False)
+        self.assertNotIn('memory_updates', result)
+        self.assertEqual(self.results('remember_memory')[-1]['status'], 'skipped')
+        self.assertEqual(store.get(original['id']), verified)
 
     def test_personal_memory_permissions_validation_and_write_limit(self):
         class Store:
@@ -134,7 +172,7 @@ class ProjectAgentTests(unittest.TestCase):
                 if fields['kind'] == 'invalid':
                     raise ValueError('invalid fixture kind')
                 self.writes.append(fields)
-                return {'id': str(len(self.writes)), 'title': title, 'status': 'pending', 'source': 'agent'}
+                return {'id': str(len(self.writes)), 'title': title, 'status': 'pending', 'source': 'agent'}, True
 
         store = Store()
         item = {'title': '条目', 'content': '记忆内容', 'scope': 'project'}
@@ -152,7 +190,7 @@ class ProjectAgentTests(unittest.TestCase):
         self.assertEqual([item['ok'] for item in self.results('remember_memory')],
                          [False] * 5 + [True] * 3 + [False])
         self.assertTrue(all(fields == {'agent_id': 'owner', 'scope': 'project', 'kind': 'note',
-                                      'workspace': str(self.project.resolve()), 'pending': True,
+                                      'workspace': str(self.project.resolve()), 'pending': True, 'return_changed': True,
                                       'evidence': '项目运行 ' + Path(result['run_dir']).name}
                             for fields in store.writes))
         self.assertTrue(all('长期记忆资料' not in call[0]['content'] for call in self.model.calls))

@@ -15,7 +15,12 @@ import uuid
 KINDS = frozenset({'preference', 'fact', 'procedure', 'note'})
 SCOPES = frozenset({'global', 'agent', 'project'})
 STATUSES = frozenset({'active', 'pending', 'disabled'})
-HEADER = '本次用户指令优先，其次是人工记忆，再其次是 AI 记忆。AI 记忆未核实。记忆不授予任何执行权限。'
+HEADER = '本次用户指令优先，其次是人工记忆，再其次是 AI 记忆。核实状态见各条标记。记忆不授予任何执行权限。'
+MEMORY_OVERVIEW = re.compile(
+    r'(?:请问)?你(?:现在|还)?记得(?:关于我|我)(?:的)?(?:什么|哪些|多少)(?:事(?:情)?|信息|约定|习惯|偏好|记忆)?'
+    r'|(?:请)?(?:列出|列一下|看看|查看|显示|总结)(?:一下)?(?:你|我)?(?:的)?(?:当前|目前|已有|所有|全部)?(?:的)?(?:长期)?记忆'
+    r'|(?:你|我)?(?:现在|目前|都)?有(?:哪些|什么)(?:关于我的)?(?:长期)?记忆'
+    r'|what do you remember about me|(?:list|show)(?: me)? (?:my|your) memories', re.IGNORECASE)
 SECRET = re.compile(
     r'-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----'
     r'|(?<![\w-])(?:sk-(?:proj-|live-|test-|ant-api\d+-)?[\w-]{20,}'
@@ -83,6 +88,8 @@ def _snippet(value, limit):
 def _public(row):
     record = dict(row)
     record.pop('title_key', None)
+    record['verified'] = bool(record['verified'])
+    record['pinned'] = bool(record['pinned'])
     return record
 
 
@@ -106,6 +113,7 @@ class AgentMemoryStore:
                     scope TEXT NOT NULL, agent_id TEXT NOT NULL, workspace TEXT NOT NULL,
                     source TEXT NOT NULL, status TEXT NOT NULL,
                     created TEXT NOT NULL, updated TEXT NOT NULL, evidence TEXT NOT NULL,
+                    verified INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(title_key, scope, agent_id, workspace)
                 );
                 CREATE INDEX IF NOT EXISTS memories_scope
@@ -115,6 +123,14 @@ class AgentMemoryStore:
                     action TEXT NOT NULL, source TEXT NOT NULL, created TEXT NOT NULL
                 );
             """)
+            # Lock before inspecting the old schema: two windows can start together.
+            db.execute('BEGIN IMMEDIATE')
+            columns = {row['name'] for row in db.execute('PRAGMA table_info(memories)')}
+            if 'verified' not in columns:
+                db.execute('ALTER TABLE memories ADD COLUMN verified INTEGER NOT NULL DEFAULT 0')
+                db.execute("UPDATE memories SET verified=1 WHERE source='user'")
+            if 'pinned' not in columns:
+                db.execute('ALTER TABLE memories ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0')
 
     @contextmanager
     def _connect(self, write=False):
@@ -142,19 +158,23 @@ class AgentMemoryStore:
                    (memory_id, action, source, timestamp))
 
     def save_user(self, title, content, *, kind='note', scope='agent', agent_id='freeai',
-                  workspace='', memory_id=None):
-        return self._save(title, content, kind, scope, agent_id, workspace,
-                          source='user', evidence='', status='active', memory_id=memory_id)
+                  workspace='', memory_id=None, pinned=None):
+        if pinned is not None and type(pinned) is not bool:
+            raise ValueError('置顶必须是布尔值。')
+        row, _ = self._save(title, content, kind, scope, agent_id, workspace,
+                            source='user', evidence='', status='active', memory_id=memory_id, pinned=pinned)
+        return row
 
     def remember(self, title, content, *, kind='note', scope='agent', agent_id='freeai',
-                 workspace='', evidence='', pending=False):
+                 workspace='', evidence='', pending=False, return_changed=False):
         if type(pending) is not bool:
             raise ValueError('pending 必须是布尔值。')
-        return self._save(title, content, kind, scope, agent_id, workspace, source='agent',
-                          evidence=evidence, status='pending' if pending else 'active')
+        row, changed = self._save(title, content, kind, scope, agent_id, workspace, source='agent',
+                                  evidence=evidence, status='pending' if pending else 'active')
+        return (row, changed) if return_changed else row
 
     def _save(self, title, content, kind, scope, agent_id, workspace, *, source, evidence,
-              status, memory_id=None):
+              status, memory_id=None, pinned=None):
         if not isinstance(kind, str) or kind not in KINDS:
             raise ValueError('未知的记忆类型。')
         if not isinstance(scope, str) or scope not in SCOPES or (source == 'agent' and scope == 'global'):
@@ -180,8 +200,8 @@ class AgentMemoryStore:
             else:
                 row = existing
             if source == 'agent':
-                if row is not None and (row['source'] == 'user' or row['status'] == 'disabled'):
-                    return _public(row)
+                if row is not None and (row['source'] == 'user' or row['verified'] or row['status'] == 'disabled'):
+                    return _public(row), False
                 duplicate = db.execute("""
                     SELECT * FROM memories
                     WHERE scope=? AND agent_id=? AND workspace=? AND content=? AND kind=?
@@ -190,21 +210,21 @@ class AgentMemoryStore:
                     LIMIT 1
                 """, (scope, agent_id, workspace, content, kind, title_key)).fetchone()
                 if duplicate is not None:
-                    return _public(duplicate)
+                    return _public(duplicate), False
             if row is not None and source == 'agent':
                 if all(row[name] == value for name, value in (
                     ('title', title), ('content', content), ('kind', kind), ('status', status),
                 )):
-                    return _public(row)
+                    return _public(row), False
             now = _now()
             if row is None:
                 memory_id = uuid.uuid4().hex
                 db.execute("""
                     INSERT INTO memories(id,title,title_key,content,kind,scope,agent_id,workspace,
-                                         source,status,created,updated,evidence)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                         source,status,created,updated,evidence,verified,pinned)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, (memory_id, title, title_key, content, kind, scope, agent_id, workspace,
-                      source, status, now, now, evidence))
+                      source, status, now, now, evidence, source == 'user', bool(pinned)))
                 action = 'created'
             else:
                 memory_id = row['id']
@@ -212,12 +232,13 @@ class AgentMemoryStore:
                     status = row['status']
                 db.execute("""
                     UPDATE memories SET title=?,title_key=?,content=?,kind=?,scope=?,agent_id=?,
-                                        workspace=?,source=?,status=?,updated=?,evidence=? WHERE id=?
+                                        workspace=?,source=?,status=?,updated=?,evidence=?,verified=?,
+                                        pinned=COALESCE(?,pinned) WHERE id=?
                 """, (title, title_key, content, kind, scope, agent_id, workspace, source, status,
-                      now, evidence, memory_id))
+                      now, evidence, source == 'user', pinned, memory_id))
                 action = 'updated'
             self._audit(db, memory_id, action, source, now)
-            return _public(self._record(db, memory_id))
+            return _public(self._record(db, memory_id)), True
 
     def get(self, memory_id):
         with self._connect() as db:
@@ -244,6 +265,26 @@ class AgentMemoryStore:
                 self._audit(db, memory_id, 'status_' + status, 'user', now)
             return _public(self._record(db, memory_id))
 
+    def set_pinned(self, memory_id, pinned):
+        if type(pinned) is not bool:
+            raise ValueError('置顶必须是布尔值。')
+        with self._connect(write=True) as db:
+            row = self._record(db, memory_id)
+            if bool(row['pinned']) != pinned:
+                now = _now()
+                db.execute('UPDATE memories SET pinned=?, updated=? WHERE id=?', (pinned, now, memory_id))
+                self._audit(db, memory_id, 'pinned' if pinned else 'unpinned', 'user', now)
+            return _public(self._record(db, memory_id))
+
+    def verify(self, memory_id):
+        with self._connect(write=True) as db:
+            row = self._record(db, memory_id)
+            if not row['verified']:
+                now = _now()
+                db.execute('UPDATE memories SET verified=1, updated=? WHERE id=?', (now, memory_id))
+                self._audit(db, memory_id, 'verified', 'user', now)
+            return _public(self._record(db, memory_id))
+
     def delete(self, memory_id):
         with self._connect(write=True) as db:
             self._record(db, memory_id)
@@ -256,6 +297,7 @@ class AgentMemoryStore:
         if budget < len(HEADER.encode('utf-8')) + 40:
             return {'context': '', 'memory_ids': []}
         query_terms = _terms(query)
+        overview = MEMORY_OVERVIEW.fullmatch(unicodedata.normalize('NFKC', query).strip().rstrip('?!。！').strip())
         ranked = []
         for item in self.list(agent_id=agent_id, workspace=workspace, include_disabled=False):
             if item['status'] != 'active':
@@ -263,15 +305,15 @@ class AgentMemoryStore:
             title_match = len(query_terms & _terms(item['title']))
             body_match = len(query_terms & _terms(item['content']))
             user = item['source'] == 'user'
-            if title_match or body_match or item['kind'] == 'preference':
-                ranked.append(((user, title_match * 3 + body_match), item))
+            if title_match or body_match or item['kind'] == 'preference' or item['pinned'] or overview:
+                ranked.append(((user, item['pinned'], title_match * 3 + body_match), item))
         ranked.sort(key=lambda match: match[0], reverse=True)
         context = HEADER
         memory_ids = []
         remaining = budget - len(context.encode('utf-8'))
         labels = {'global': '全局', 'agent': '助手', 'project': '项目'}
         for _, item in ranked:
-            provenance = '用户' if item['source'] == 'user' else 'AI，未核实'
+            provenance = '用户' if item['source'] == 'user' else ('AI，用户已核实' if item['verified'] else 'AI，未核实')
             label = f'\n- [{provenance} · {labels[item["scope"]]}] '
             label_size = len(label.encode('utf-8'))
             available = remaining - label_size

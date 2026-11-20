@@ -1,6 +1,6 @@
 ﻿# Export the approved transparent artwork without changing the source design.
 [CmdletBinding()]
-param()
+param([string]$SourceArtwork = 'assets\free-ai-openmark.png')
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
@@ -31,9 +31,6 @@ public static class FreeAIIconResource {
 "@
 
 $iconRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-if ($iconRoot.TrimEnd('\') -ine 'D:\FreeAI') {
-    throw 'Run this exporter from the development directory inside D:\FreeAI.'
-}
 
 function Assert-IconPath {
     param([string]$Path)
@@ -173,12 +170,20 @@ function Write-IconFile {
     }
 }
 
-$sourcePath = Join-Path $iconRoot 'assets\free-ai-edgerunners.png'
+$sourcePath = if ([IO.Path]::IsPathRooted($SourceArtwork)) {
+    [IO.Path]::GetFullPath($SourceArtwork)
+} else {
+    [IO.Path]::GetFullPath((Join-Path $iconRoot $SourceArtwork))
+}
 $iconPath = Join-Path $iconRoot 'assets\free-ai.ico'
 $pngPath = Join-Path $iconRoot 'assets\free-ai-ui.png'
-$backupPath = Join-Path $iconRoot 'development\backups\before-cyberpunk\free-ai.ico'
-foreach ($path in @($sourcePath, $iconPath, $pngPath, $backupPath)) {
+$backupDirectory = Join-Path $iconRoot 'development\backups\before-blue-brand'
+$outputPaths = @($iconPath, $pngPath)
+foreach ($path in @($sourcePath, $iconPath, $pngPath, $backupDirectory)) {
     Assert-IconPath $path
+}
+if ($sourcePath -in $outputPaths) {
+    throw 'The source must be separate from the exported icon and UI PNG.'
 }
 
 $sizes = @(16, 24, 32, 48, 64, 128, 256)
@@ -200,9 +205,13 @@ finally {
 $iconBytes = New-IconBundle -Sizes $sizes -Frames $frames
 Test-IconBundle -Bytes $iconBytes -Sizes $sizes
 
-if (-not [IO.File]::Exists($backupPath)) {
-    $null = [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($backupPath))
-    [IO.File]::Copy($iconPath, $backupPath)
+foreach ($path in $outputPaths) {
+    $backupPath = Join-Path $backupDirectory ([IO.Path]::GetFileName($path))
+    Assert-IconPath $backupPath
+    if ([IO.File]::Exists($path) -and -not [IO.File]::Exists($backupPath)) {
+        $null = [IO.Directory]::CreateDirectory($backupDirectory)
+        [IO.File]::Copy($path, $backupPath)
+    }
 }
 Write-IconFile -Path $iconPath -Bytes $iconBytes
 Write-IconFile -Path $pngPath -Bytes $frames[64]
@@ -210,4 +219,3 @@ Test-IconBundle -Bytes ([IO.File]::ReadAllBytes($iconPath)) -Sizes $sizes
 
 [pscustomobject]@{ Path = $iconPath; Sizes = $sizes -join ', '; Bytes = $iconBytes.Length }
 [pscustomobject]@{ Path = $pngPath; Sizes = '64'; Bytes = $frames[64].Length }
-[pscustomobject]@{ Path = $backupPath; Sizes = 'original'; Bytes = (Get-Item -LiteralPath $backupPath).Length }

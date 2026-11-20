@@ -115,6 +115,48 @@ def _json(value):
     return json.dumps(value, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
 
 
+def _string_bytes(value):
+    """Byte cost inside the quotes of a UTF-8 JSON string, including escapes."""
+    return len(_json(value).encode('utf-8')) - 2
+
+
+def _clip_command_stream(value, budget):
+    if _string_bytes(value) <= budget:
+        return value
+    marker = '\n…\n'
+    if _string_bytes(marker) > budget:
+        return ''
+
+    def excerpt(count):
+        head = count // 3
+        tail = count - head
+        return value[:head] + marker + (value[-tail:] if tail else '')
+
+    low, high = 0, len(value) - 1
+    while low < high:
+        middle = (low + high + 1) // 2
+        if _string_bytes(excerpt(middle)) <= budget:
+            low = middle
+        else:
+            high = middle - 1
+    return excerpt(low)
+
+
+def _fit_command_streams(observation, budget):
+    stdout, stderr = observation['stdout'], observation['stderr']
+    observation.update(stdout='', stderr='')
+    available = max(0, budget - len(_json(observation).encode('utf-8')))
+    # Give failed commands more room for diagnostics, and lend unused space to the other stream.
+    stdout_share = available // (2 if observation['ok'] else 3)
+    stdout_budget = max(stdout_share, available - _string_bytes(stderr))
+    observation['stdout'] = _clip_command_stream(stdout, stdout_budget)
+    observation['stderr'] = _clip_command_stream(stderr, available - _string_bytes(observation['stdout']))
+    if observation['stdout'] != stdout:
+        observation['stdout_truncated'] = True
+    if observation['stderr'] != stderr:
+        observation['stderr_truncated'] = True
+
+
 def _sha(data):
     return hashlib.sha256(data).hexdigest() if data is not None else None
 
@@ -262,6 +304,28 @@ def _decode(data):
     if re.search(r'-----BEGIN [A-Z ]*PRIVATE KEY-----', result):
         raise ToolError('项目文件工具无法访问私钥。')
     return result
+
+
+def _replacement_span(content, old, new):
+    """Match logical newlines, then splice only the corresponding original characters."""
+    logical = content.replace('\r\n', '\n')
+    needle = old.replace('\r\n', '\n')
+    position = logical.find(needle)
+    if position < 0:
+        raise ToolError('没有找到 old 原文。请重新读取，核对空白及末尾换行。')
+    if logical.find(needle, position + 1) >= 0:
+        raise ToolError('old 必须在文件中恰好出现一次。请补充上下文以区分多处匹配。')
+    endings = re.findall(r'\r?\n', content)
+    line = logical.count('\n', 0, position)
+    matched = endings[line:line + needle.count('\n')]
+    start = position + endings[:line].count('\r\n')
+    end = start + len(needle) + matched.count('\r\n')
+    if endings and '\n' in new:
+        # Keep mixed endings in order. Additional lines use the surrounding style.
+        fallback = matched[-1] if matched else endings[min(line, len(endings) - 1)]
+        styles = iter(matched)
+        new = re.sub(r'\r?\n', lambda _: next(styles, fallback), new)
+    return start, end, new
 
 
 def _atomic_bytes(path, data, *, validate=None, mode=None):
@@ -612,6 +676,7 @@ class ProjectAgent:
         self.write_memory = personal_memory is not None and write_memory
         self.memory_pending = memory_pending
         self.memory_updates = []
+        self.memory_ids = []
         self._memory_writes = 0
         self.run_dir = None
         self.changes = []
@@ -834,7 +899,7 @@ class ProjectAgent:
             raise ToolError('文件超过大小上限。')
         _decode(data)
         if original == data:
-            return {'path': path, 'changed': False}
+            return {'path': path, 'changed': False, 'message': '内容相同，本次未修改文件。'}
         target = self._path(path)
         before_mode = stat.S_IMODE(target.stat().st_mode) & 0o777 if original is not None else None
         relative = target.relative_to(self.workspace).as_posix()
@@ -908,19 +973,13 @@ class ProjectAgent:
         original = _read_required(self._path(path))
         self._check_read_version(path, original)
         content = _decode(original)
-        normalized_old = old.replace('\r\n', '\n')
-        if '\r\n' in content:
-            old = normalized_old.replace('\n', '\r\n') if old not in content else old
-            new = new.replace('\r\n', '\n').replace('\n', '\r\n')
-        position = content.find(old)
-        if position < 0 or content.find(old, position + 1) >= 0:
-            raise ToolError('old 必须在文件中恰好出现一次。请重新读取并补充上下文。')
+        start, stop, new = _replacement_span(content, old, new)
         known = self._read_versions[os.path.normcase(str(self._path(path)))]
-        begin = len(content[:position].encode('utf-8'))
-        end = begin + len(old.encode('utf-8'))
-        if not any(start <= begin and stop >= end for start, stop in known['ranges']):
+        byte_start = len(content[:start].encode('utf-8'))
+        byte_end = byte_start + len(content[start:stop].encode('utf-8'))
+        if not any(left <= byte_start and right >= byte_end for left, right in known['ranges']):
             raise ToolError('要替换的原文尚未读取，请先读取对应片段。')
-        replacement = content[:position] + new + content[position + len(old):]
+        replacement = content[:start] + new + content[stop:]
         return self._save_file(path, original, replacement.encode('utf-8'),
                                complete=known['ranges'] == [(0, len(original))])
 
@@ -1013,18 +1072,20 @@ class ProjectAgent:
         if scope not in ('agent', 'project'):
             raise ToolError('长期记忆仅支持助手或当前项目范围。')
         try:
-            saved = self.personal_memory.remember(
+            saved, changed = self.personal_memory.remember(
                 title, content, kind=kind, scope=scope, agent_id=self.agent_id,
                 workspace=str(self.workspace), evidence='项目运行 ' + self.run_dir.name,
-                pending=self.memory_pending)
+                pending=self.memory_pending, return_changed=True)
             entry = {key: saved[key] for key in ('id', 'title', 'status')}
         except (TypeError, ValueError):
             raise ToolError('记忆标题、内容或类型无效。') from None
         except Exception:
             raise ToolError('暂时无法保存长期记忆。') from None
         self._memory_writes += 1
-        if saved.get('source') != 'agent' or entry['status'] == 'disabled':
-            return {'status': 'skipped', 'message': '已存在用户记忆或停用记录，未覆盖。'}
+        if not changed:
+            if saved.get('verified') or saved.get('source') == 'user' or entry['status'] == 'disabled':
+                return {'status': 'skipped', 'message': '这条记忆已由用户维护、核实或停用，本次未覆盖。'}
+            return {'status': 'already_saved', 'message': '相同记忆已保存。'}
         if not any(item['id'] == entry['id'] for item in self.memory_updates):
             self.memory_updates.append(entry)
         return {'memory': entry}
@@ -1056,7 +1117,9 @@ class ProjectAgent:
         if len(_json(observation).encode('utf-8')) <= budget:
             return _json(observation)
         observation = dict(observation)
-        for key in ('stdout', 'stderr', 'content', 'project_instructions', 'context'):
+        if 'stdout' in observation and 'stderr' in observation:
+            _fit_command_streams(observation, budget)
+        for key in ('content', 'project_instructions', 'context'):
             if key not in observation:
                 continue
             value = observation[key]
@@ -1074,9 +1137,6 @@ class ProjectAgent:
                 # The original segment's offsets remain valid even when a provider key was redacted.
                 if visible == result[key] and low < len(visible):
                     observation['next_offset'] = result['offset'] + len(visible[:low].encode('utf-8'))
-            elif key in ('stdout', 'stderr'):
-                observation[key] = value[:budget // 10]
-                observation[key + '_truncated'] = len(observation[key]) < len(value) or observation.get(key + '_truncated', False)
             else:
                 observation[key] = value[:max(0, budget // 10)]
                 observation['instructions_truncated'] = True
@@ -1093,15 +1153,17 @@ class ProjectAgent:
         output_limit = min(getattr(self.model, 'max_output_tokens', 1024), self.context // 2)
         return self.context - output_limit - len(_json(self.tools).encode('utf-8')) - 512
 
-    def _starting_messages(self, system, task, history, memory_context, personal_context=''):
+    def _starting_messages(self, system, task, history, memory_context, personal_context, personal_ids):
         prefix = {'role': 'system', 'content': self._redact(system)}
         current = {'role': 'user', 'content': self._redact(task)}
         budget = self._history_budget()
-        for caption, context in (('长期记忆资料：', personal_context), ('历史经验资料：', memory_context)):
+        included_ids = []
+        for caption, context, ids in (('长期记忆资料：', personal_context, personal_ids), ('历史经验资料：', memory_context, [])):
             if context:
                 with_memory = dict(current, content=current['content'] + '\n' + caption + context)
                 if len(_json([prefix, with_memory]).encode('utf-8')) <= budget:
                     current = with_memory
+                    included_ids.extend(ids)
         pairs = []
         previous_user = None
         for entry in history or ():
@@ -1125,7 +1187,7 @@ class ProjectAgent:
             recent.append(pair)
             remaining -= cost
         previous = [row for pair in reversed(recent) for row in pair]
-        return [prefix, *previous, current]
+        return [prefix, *previous, current], included_ids
 
     def _fit_context(self, latest, handoff=''):
         """Retain the latest tool batch while dropping whole prior conversation turns as needed."""
@@ -1195,7 +1257,7 @@ class ProjectAgent:
             signature.append((name, normalized))
         return signature
 
-    def _conversation(self):
+    def _conversation(self, included_ids):
         previous_batch = None
         last_change_count = 0
         repeats = 0
@@ -1220,6 +1282,9 @@ class ProjectAgent:
             self._accept_reads(visible)
             message = self.model.complete_tools(visible, self.tools,
                                                 cancel_event=self.cancel, context=self.context)
+            if included_ids and not self.memory_ids:
+                self.memory_ids = included_ids
+                self._event('memory', '已将长期记忆加入本轮模型上下文。', memory_ids=self.memory_ids)
             if not isinstance(message, dict) or message.get('role') != 'assistant':
                 raise APIError('模型未返回有效的项目工具消息。')
             calls = message.get('tool_calls', [])
@@ -1344,6 +1409,7 @@ class ProjectAgent:
         memory = {}
         memory_context = ''
         personal_context = ''
+        personal_ids = []
         try:
             self._save_changes([])
             self.journal.save()
@@ -1367,9 +1433,9 @@ class ProjectAgent:
                         self._redact(task), agent_id=self.agent_id, workspace=str(self.workspace), budget=1800)
                     ids = personal.get('memory_ids')
                     context = personal.get('context')
-                    if ids and isinstance(context, str):
+                    if isinstance(ids, list) and ids and isinstance(context, str) and context:
                         personal_context = self._redact(context)
-                        self._event('memory', '已检索长期记忆。', memory_ids=ids)
+                        personal_ids = ids
                 except Exception:
                     self._event('memory', '未能读取长期记忆。')
             if self.knowledge is not None and self.use_memory and not self.cancel.is_set():
@@ -1383,13 +1449,14 @@ class ProjectAgent:
                         memory_context = self._redact(str(context)[:1200])
                 except Exception:
                     self._event('memory', '未能读取历史经验。')
-            self.messages = self._starting_messages(system, active_task, history, memory_context, personal_context)
+            self.messages, included_ids = self._starting_messages(
+                system, active_task, history, memory_context, personal_context, personal_ids)
             self._history_base = len(self.messages)
             self._checkpoint()
             if len(_json(self.messages).encode('utf-8')) > self._history_budget():
                 status, answer = 'limit', '任务描述超出项目对话容量。'
             else:
-                status, answer = self._conversation()
+                status, answer = self._conversation(included_ids)
         except APICancelled:
             status, answer = 'stopped', '项目任务已停止。'
         except APIError as exc:
@@ -1409,6 +1476,8 @@ class ProjectAgent:
             result['answer'] += '\n任务进度未能完整保存，请先检查已产生的文件和命令结果。'
         if self.memory_updates:
             result['memory_updates'] = self.memory_updates
+        if self.memory_ids:
+            result['memory_ids'] = self.memory_ids
         if self.knowledge is not None:
             try:
                 result['episode_id'] = self.knowledge.record(

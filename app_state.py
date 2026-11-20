@@ -9,25 +9,41 @@ from contextlib import contextmanager
 PROJECT_PERMISSION_MODES = frozenset({'standard', 'readonly', 'automatic'})
 PROJECT_SETTING_TYPES = {'enabled': bool, 'workspace': str, 'allow_write': bool, 'use_memory': bool,
                          'permission_mode': str}
-PROJECT_RESULT_FIELDS = ('status', 'answer', 'run_dir', 'changes', 'episode_id', 'memory_updates', 'engine',
+PROJECT_RESULT_FIELDS = ('status', 'answer', 'run_dir', 'changes', 'episode_id', 'memory_updates', 'memory_ids', 'engine',
                          'task_state', 'continuation_available', 'permission_mode',
-                         'snapshot_dir', 'snapshot', 'acceptance')
+                         'snapshot_dir', 'snapshot', 'acceptance', 'fixed_check')
 PROJECT_RECORD_LIMIT = 512 * 1024
 PROJECT_STATE_FIELDS = ('task', 'status', 'phase', 'parent_run', 'uncertain')
 
 CONTEXTS = {'日常聊天 · 4K': 4096, '阅读长文 · 16K': 16384, '深入讨论 · 32K': 32768}
+ACTIVE_DRAFT_SESSION = 'client_active_session'
+_KEEP_DRAFT = object()
+_EMPTY_DRAFT = ('', None, None, None)
+
+
+def _draft_key(identity):
+    if identity is None:
+        return ''
+    if not isinstance(identity, str) or not identity:
+        raise ValueError('草稿会话无效。')
+    return identity
 
 class Sessions:
     def __init__(self, directory):
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
         self.path = directory / 'conversations.sqlite3'
+        self._known_drafts = {}
         with self.connect() as db:
             db.executescript('''CREATE TABLE IF NOT EXISTS sessions(
                 id TEXT PRIMARY KEY, title TEXT, updated TEXT);
                 CREATE TABLE IF NOT EXISTS messages(
                 id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT);
                 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+                CREATE TABLE IF NOT EXISTS conversation_drafts(
+                    draft_key TEXT PRIMARY KEY NOT NULL,
+                    session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+                    text TEXT NOT NULL, image_path TEXT, skill_file TEXT, skill_id TEXT);
                 CREATE TABLE IF NOT EXISTS session_project(
                     session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
                     settings_json TEXT NOT NULL);
@@ -60,9 +76,39 @@ class Sessions:
         with self.connect() as db:
             rows = db.execute('SELECT role,content FROM messages WHERE session_id=? ORDER BY id', (identity,)).fetchall()
         return [{'role': role, 'content': content} for role, content in rows]
-    def append(self, identity, role, content):
+    def has_session(self, identity):
+        with self.connect() as db:
+            return db.execute('SELECT 1 FROM sessions WHERE id=?', (identity,)).fetchone() is not None
+
+    def draft(self, identity):
+        key = _draft_key(identity)
+        with self.connect() as db:
+            row = db.execute('SELECT text,image_path,skill_file,skill_id FROM conversation_drafts WHERE draft_key=?',
+                             (key,)).fetchone()
+        self._known_drafts[key] = row or _EMPTY_DRAFT
+        return self._known_drafts[key]
+
+    def save_draft(self, identity, text, image_path=None, skill_file=None, skill_id=None):
+        key = _draft_key(identity)
+        if not isinstance(text, str) or any(value is not None and not isinstance(value, str)
+                                           for value in (image_path, skill_file, skill_id)):
+            raise ValueError('草稿格式无效。')
+        with self.connect() as db:
+            if text or image_path or skill_file:
+                snapshot = (text, image_path, skill_file, skill_id)
+                db.execute('INSERT OR REPLACE INTO conversation_drafts VALUES(?,?,?,?,?,?)',
+                           (key, identity, *snapshot))
+            else:
+                snapshot = _EMPTY_DRAFT
+                db.execute('DELETE FROM conversation_drafts WHERE draft_key=?', (key,))
+        self._known_drafts[key] = snapshot
+
+    def append(self, identity, role, content, *, draft_from=_KEEP_DRAFT):
         if role not in ('user', 'assistant') or not isinstance(content, str):
             raise ValueError('Invalid conversation message')
+        if draft_from is not _KEEP_DRAFT and (role != 'user' or draft_from not in (None, identity)):
+            raise ValueError('只能随发送的用户消息清除对应草稿。')
+        draft_key = _draft_key(draft_from) if draft_from is not _KEEP_DRAFT else None
         with self.connect() as db:
             if not db.execute('SELECT id FROM sessions WHERE id=?', (identity,)).fetchone():
                 raise ValueError('Conversation does not exist')
@@ -71,7 +117,16 @@ class Sessions:
             db.execute('UPDATE sessions SET updated=? WHERE id=?', (self.now(), identity))
             if role == 'user':
                 db.execute("UPDATE sessions SET title=? WHERE id=? AND title='新的对话'", (content.replace('\n', ' ')[:22], identity))
-            return message.lastrowid
+            if draft_key is not None:
+                # Another window may have autosaved after this client last saw the draft.
+                snapshot = self._known_drafts.get(draft_key, _EMPTY_DRAFT)
+                if snapshot != _EMPTY_DRAFT:
+                    db.execute('DELETE FROM conversation_drafts WHERE draft_key=? AND text=? '
+                               'AND image_path IS ? AND skill_file IS ? AND skill_id IS ?', (draft_key, *snapshot))
+                db.execute('INSERT OR REPLACE INTO settings VALUES(?,?)',
+                           (ACTIVE_DRAFT_SESSION, json.dumps(identity)))
+        self._known_drafts.pop(draft_key, None)
+        return message.lastrowid
 
     def project_settings(self, session_id):
         with self.connect() as db:

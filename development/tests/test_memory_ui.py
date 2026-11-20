@@ -1,5 +1,6 @@
 """Exercise the native chat memory panel with isolated storage and model I/O."""
 
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -68,11 +69,14 @@ class NativeMemoryScenario(unittest.TestCase):
             self.fail('chat worker did not finish')
 
         class FakeRuntime:
-            def __init__(self):
+            def __init__(self, candidates=None):
                 self.prompts = []
+                self.candidates = candidates
 
             def generate(self, prompt, history, **kwargs):
                 self.prompts.append(prompt)
+                if self.candidates is not None and 'evidence_quote' in prompt:
+                    return json.dumps(self.candidates, ensure_ascii=False)
                 return '测试聊天回答'
 
         with patch.object(tk, 'Toplevel', side_effect=AssertionError('memory opened another window')):
@@ -85,6 +89,33 @@ class NativeMemoryScenario(unittest.TestCase):
             self.assertEqual(len(app.pages), 3)
             self.assertEqual(panel.snapshot('api'), {'read': False, 'write': False})
             self.assertEqual(panel.snapshot('local'), {'read': True, 'write': True})
+            self.assertEqual(app.memory_button.cget('text'), '长期记忆')
+            self.assertIn('读取开启 · 自动保存开启', panel.mode_state.get())
+            app.backend = 'api'
+            panel.refresh_mode()
+            self.assertIn('未授权', panel.mode_state.get())
+            self.assertIn('尚未获准', panel.chat_notice({}, '请记住我的偏好', backend='api'))
+            self.assertIn('已停止自动整理', panel.chat_notice({'memory_status': 'cancelled'}, '请记住'))
+            self.assertIn('自动整理失败', panel.chat_notice({'memory_status': 'failed'}, '请记住'))
+            self.assertEqual(panel.read_notice(['id1', 'id1', 'id2', None]).count('2 条'), 1)
+            app.project.enabled.set(True)
+            with patch('harness_settings.load_preferences', return_value={'engine': 'harness'}) as execution:
+                panel.refresh_mode()
+                self.assertIn('未授权长期记忆', panel.mode_state.get())
+                execution.assert_not_called()
+                panel.remote_enabled.set(True)
+                panel.refresh_mode()
+                self.assertEqual(panel.mode_state.get(), 'Harness（联网模式）· 读取开启 · 暂不支持自动保存')
+                panel.read_enabled.set(False)
+                panel.refresh_mode()
+                self.assertEqual(panel.mode_state.get(), 'Harness（联网模式）· 读取关闭 · 暂不支持自动保存')
+                app.backend = 'local'
+                panel.read_enabled.set(True)
+                panel.refresh_mode()
+                self.assertEqual(panel.mode_state.get(), 'Harness（本地模式）· 读取开启 · 暂不支持自动保存')
+            app.project.enabled.set(False)
+            panel.remote_enabled.set(False)
+            app.backend = 'local'
             app.open_memory()
             self.assertTrue(panel.opened)
             self.assertIs(panel.frame.master, app.pages[0])
@@ -119,6 +150,48 @@ class NativeMemoryScenario(unittest.TestCase):
                 store.get(proposed['id'])
             self.assertNotIn(proposed['id'], store.before_call('输出单位')['memory_ids'])
 
+            quote = '我的构建工具固定使用 uv。'
+            saving_runtime = FakeRuntime([{'title': '构建工具', 'kind': 'fact', 'evidence_quote': quote}])
+            app.selected_model = 'text-default'
+            put(app.input, '请记住：' + quote)
+            with patch.object(app.manager, 'ready', return_value=True), patch('qwen_chat.runtime', return_value=saving_runtime):
+                app.send_chat()
+                settle(app)
+            self.assertEqual(len(saving_runtime.prompts), 2)
+            automatic = next(row for row in panel.rows if row['title'] == '构建工具')
+            self.assertEqual((automatic['source'], automatic['status']), ('agent', 'active'))
+            self.assertFalse(automatic['verified'])
+            self.assertIn('[长期记忆] AI 已记下：构建工具', app.last_answer)
+            self.assertIn('[长期记忆] AI 已记下：构建工具', app.sessions.messages(app.session_id)[-1]['content'])
+            select(panel, automatic['id'])
+            self.assertIn('尚未核实', panel.provenance.cget('text'))
+            self.assertEqual(panel.verify_button.cget('text'), '核实这条')
+            evidence = store.get(automatic['id'])['evidence']
+            panel.source_button.invoke()
+            self.assertEqual(panel.source_button.cget('text'), '收起来源')
+            self.assertEqual(panel.source_text.cget('state'), 'disabled')
+            self.assertEqual(panel.source_text.get('1.0', 'end-1c'), evidence)
+            self.assertIn('用户原话：' + quote, evidence)
+            with patch.object(app.root, 'clipboard_clear') as clear, patch.object(app.root, 'clipboard_append') as copy:
+                panel.source_copy_button.invoke()
+            clear.assert_called_once()
+            copy.assert_called_once_with(evidence)
+            panel.source_button.invoke()
+            self.assertEqual(panel.source_frame.winfo_manager(), '')
+            self.assertEqual(panel.source_button.cget('text'), '查看来源')
+            panel.pin_option.invoke()
+            self.assertTrue(store.get(automatic['id'])['pinned'])
+            self.assertIn('在适用范围内时优先提供', panel.pin_scope_note.cget('text'))
+            self.assertIn('上下文空间不足时可能省略', panel.pin_scope_note.cget('text'))
+            self.assertTrue(any('置顶 · AI 未核实 · 构建工具' in item for item in panel.listbox.get(0, 'end')))
+            panel.verify_button.invoke()
+            verified = store.get(automatic['id'])
+            self.assertEqual((verified['source'], verified['verified'], verified['status']), ('agent', True, 'active'))
+            self.assertIn('AI 记下 · 已核实', panel.provenance.cget('text'))
+            self.assertEqual(panel.verify_button.cget('text'), '已核实')
+            self.assertEqual(panel.verify_button.cget('state'), 'disabled')
+            self.assertIn('不再被自动覆盖', panel.notice.get())
+
             panel.options[1].invoke()  # Isolate memory retrieval from automatic extraction.
             app.selected_model, app.backend = 'text-default', 'local'
             runtime = FakeRuntime()
@@ -129,7 +202,9 @@ class NativeMemoryScenario(unittest.TestCase):
             self.assertEqual(len(runtime.prompts), 1)
             self.assertIn('长期记忆资料开始', runtime.prompts[0])
             self.assertIn(preference, runtime.prompts[0])
-            self.assertEqual(app.last_answer, '测试聊天回答')
+            self.assertTrue(app.last_answer.startswith('测试聊天回答'))
+            self.assertIn('本轮向模型提供了 2 条记忆作为参考', app.last_answer)
+            self.assertIn(quote, runtime.prompts[0])
 
             identity, history = app.session_id, list(app.history)
             put(app.input, '这段草稿仍未发送')
@@ -160,11 +235,29 @@ class NativeMemoryScenario(unittest.TestCase):
             panel.options[2].invoke()
             self.assertEqual(panel.snapshot('api'), {'read': False, 'write': False})
             app.close()
-            restored = new_app().memories
+            reopened = new_app()
+            restored = reopened.memories
+            reopened.open_memory()
+            select(restored, automatic['id'])
+            self.assertTrue(restored.pin_enabled.get())
+            self.assertIn('已核实', restored.provenance.cget('text'))
+            restored.source_button.invoke()
+            self.assertEqual(restored.source_text.get('1.0', 'end-1c'), evidence)
+            self.assertTrue(any('置顶 · AI 已核实 · 构建工具' in item for item in restored.listbox.get(0, 'end')))
             self.assertFalse(restored.read_enabled.get())
             self.assertFalse(restored.auto_enabled.get())
             self.assertTrue(restored.remote_enabled.get())
             restored.options[0].invoke()
+            self.assertEqual(restored.snapshot('api'), {'read': True, 'write': False})
+            reopened.new_conversation()
+            reopened.backend, reopened.selected_model = 'local', 'text-default'
+            after_restart = FakeRuntime()
+            put(reopened.input, '请简单解释二分查找。')
+            with patch.object(reopened.manager, 'ready', return_value=True), patch('qwen_chat.runtime', return_value=after_restart):
+                reopened.send_chat()
+                settle(reopened)
+            self.assertIn(quote, after_restart.prompts[0])
+            self.assertIn('本轮向模型提供了', reopened.last_answer)
             restored.options[1].invoke()
             self.assertEqual(restored.snapshot('api'), {'read': True, 'write': True})
             self.assertFalse(callback_errors, callback_errors)

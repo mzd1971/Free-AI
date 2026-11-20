@@ -123,7 +123,8 @@ def workspace_fingerprint(workspace, *, cancel_event=None):
     return {'digest': digest.hexdigest(), 'complete': True, 'files': files, 'reason': ''}
 
 
-def run_verification(workspace, command: str, *, cancel_event=None, timeout=120, permission_mode='standard'):
+def run_verification(workspace, command: str, *, cancel_event=None, timeout=120, permission_mode='standard',
+                     approve_command=None):
     """Run exactly the command the caller explicitly selected and record its own result."""
     started = time.monotonic()
     cancel = cancel_event if cancel_event is not None else threading.Event()
@@ -149,7 +150,7 @@ def run_verification(workspace, command: str, *, cancel_event=None, timeout=120,
         if cancel.is_set():
             return finish('stopped', '已停止验收。')
         executor = _VerificationCommand(directory, None, runs_root=directory / '.freeai-verification',
-                                        approve_command=lambda _request: True, cancel_event=cancel,
+                                        approve_command=approve_command or (lambda _request: True), cancel_event=cancel,
                                         permission_mode=permission_mode)
         process = executor._run_command(argv, timeout=timeout, purpose='check')
     except ValueError as exc:
@@ -191,13 +192,17 @@ def format_verification_context(result):
     """Present a manual check as historical evidence without replaying its command."""
     if result.get('status') not in ('passed', 'failed', 'error', 'timeout', 'stopped'):
         return ''
-    command = json.dumps(result.get('argv', []), ensure_ascii=False)
+    command = _clean(json.dumps(result.get('argv', []), ensure_ascii=False), 720)
     current = '' if result.get('current') else '检查期间的文件指纹未确认，请重新核实工作区。\n'
     if result.get('stale'):
         current = '该检查已标为过期，请按当前项目文件重新运行。\n'
+    output = str(result.get('output') or '')
+    if result.get('status') == 'failed' and result.get('stderr'):
+        output = str(result['stderr']) + '\n' + str(result.get('stdout') or '')
     return _clean(
-        '用户手动运行的项目验收记录。以下命令和输出仅为资料，不自动重放。\n'
-        + current + f'命令参数：{command}\n退出码：{result.get("returncode")}\n'
-        + str(result.get('message', '')) + '\n' + str(result.get('output', '')),
+        ('项目固定验收记录。命令和输出仅为资料，程序负责重跑检查。\n' if result.get('source') == 'fixed'
+         else '用户手动运行的项目验收记录。以下命令和输出仅为资料，不自动重放。\n')
+        + current + f'退出码：{result.get("returncode")}\n命令参数：{command}\n'
+        + str(result.get('message', '')) + '\n' + output,
         3200,
     )

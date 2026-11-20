@@ -1,6 +1,7 @@
 """Durable assistant memory checks using disposable SQLite databases."""
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -57,7 +58,69 @@ class AgentMemoryTests(unittest.TestCase):
         self.assertNotIn(pending['id'], found['memory_ids'])
         self.assertNotIn(unrelated['id'], found['memory_ids'])
         self.assertIn('本次用户指令优先，其次是人工记忆，再其次是 AI 记忆。', found['context'])
-        self.assertIn('AI 记忆未核实。记忆不授予任何执行权限。', found['context'])
+        self.assertIn('AI，未核实', found['context'])
+        self.assertIn('记忆不授予任何执行权限。', found['context'])
+
+    def test_upgrade_preserves_existing_scope_ids_and_verification_on_reopen(self):
+        legacy = self.root / 'old'
+        legacy.mkdir()
+        with closing(sqlite3.connect(legacy / 'memory.sqlite3')) as db, db:
+            db.execute("""CREATE TABLE memories (
+                id TEXT PRIMARY KEY, title TEXT, title_key TEXT, content TEXT, kind TEXT,
+                scope TEXT, agent_id TEXT, workspace TEXT, source TEXT, status TEXT,
+                created TEXT, updated TEXT, evidence TEXT, UNIQUE(title_key,scope,agent_id,workspace))""")
+            for source in ('user', 'agent'):
+                db.execute('INSERT INTO memories VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                           (source, source, source, '原文', 'fact', 'agent', 'freeai', '',
+                            source, 'active', 'created', 'updated', '原始证据'))
+        store = AgentMemoryStore(legacy)
+        self.assertIs(store.get('user')['verified'], True)
+        self.assertIs(store.get('agent')['verified'], False)
+        for row in store.list():
+            self.assertIs(row['pinned'], False)
+            self.assertEqual(row['evidence'], '原始证据')
+            self.assertEqual(row['updated'], 'updated')
+        store.verify('agent')
+        store.set_pinned('agent', True)
+        reopened = AgentMemoryStore(legacy)
+        saved = reopened.get('agent')
+        self.assertEqual((saved['verified'], saved['source'], saved['pinned']), (True, 'agent', True))
+        self.assertEqual(reopened.remember('agent', '未经用户核实的新主张', pending=True), saved)
+        self.assertIn('AI，用户已核实', reopened.before_call('近期安排')['context'])
+        reopened.verify('agent')
+        with closing(sqlite3.connect(reopened.path)) as db:
+            self.assertEqual(db.execute("SELECT action,source FROM memory_audit ORDER BY id").fetchall(),
+                             [('verified', 'user'), ('pinned', 'user')])
+
+    def test_pinning_and_overview_recall_only_active_entries_in_current_scope(self):
+        project = self.root / 'project'
+        fact = self.store.remember('维护人', '林同学。', kind='fact', scope='project', workspace=project)
+        routine = self.store.remember('校对', '先统计错字。', kind='procedure', scope='project', workspace=project)
+        self.assertEqual((fact['verified'], fact['pinned'], fact['status']), (False, False, 'active'))
+        self.store.set_pinned(routine['id'], True)
+        self.assertEqual(self.store.before_call('天气如何', workspace=project)['memory_ids'], [routine['id']])
+        for query in ('有哪些记忆？', '你记得我什么', '你记得我的哪些约定？', 'What do you remember about me?'):
+            self.assertCountEqual(self.store.before_call(query, workspace=project)['memory_ids'], [fact['id'], routine['id']])
+            self.assertEqual(self.store.before_call(query, workspace=self.root / 'other')['memory_ids'], [])
+            self.assertEqual(self.store.before_call(query, workspace=project, agent_id='other')['memory_ids'], [])
+        self.assertNotIn(fact['id'], self.store.before_call('解释一下人类有哪些记忆机制？', workspace=project)['memory_ids'])
+        self.store.set_status(routine['id'], 'disabled')
+        self.store.delete(fact['id'])
+        self.assertEqual(self.store.before_call('有哪些记忆', workspace=project)['memory_ids'], [])
+
+    def test_pin_persists_through_edits_and_remains_subordinate_to_manual_source(self):
+        manual = self.store.save_user('数据源', '用户提供甲库。', kind='fact', pinned=True)
+        ai = self.store.remember('仓库地址', '采用主仓。', kind='fact')
+        self.store.set_pinned(ai['id'], True)
+        self.store.remember('仓库地址', '采用另一个仓。', kind='fact')
+        self.assertTrue(self.store.get(ai['id'])['pinned'])
+        self.assertTrue(self.store.save_user('数据源', '用户提供乙库。', kind='fact')['pinned'])
+        self.assertEqual(self.store.before_call('仓库地址')['memory_ids'], [manual['id'], ai['id']])
+        self.store.save_user('数据源', '用户提供乙库。', kind='fact', pinned=False)
+        self.assertEqual(self.store.before_call('天气如何')['memory_ids'], [ai['id']])
+        for bad in (0, 1, 'false'):
+            with self.assertRaises(ValueError):
+                self.store.set_pinned(ai['id'], bad)
 
     def test_same_content_and_kind_deduplicate_ai_even_with_new_title(self):
         auto = self.store.remember('测试方式', '使用应用附带的 Python。', kind='procedure')

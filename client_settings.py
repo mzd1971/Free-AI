@@ -67,6 +67,7 @@ class SettingsPanel(tk.Frame):
         self.empty_message = label(self.body, '没有匹配的设置。', size=11, color=C['muted'])
 
         self.build_permissions()
+        self.build_memory()
         self.build_coding_tools()
         self.build_models()
         self.build_appearance()
@@ -188,6 +189,18 @@ class SettingsPanel(tk.Frame):
         self.permission_notice.set(access + ('任务运行期间无法切换权限。' if busy else
             ' 文件工具开关可在聊天的权限菜单调整。' if mode != 'readonly' else ''))
 
+    def build_memory(self):
+        memories = self.app.memories
+        memory = self.card('general', '长期记忆',
+                           '把长期偏好、事实和做法保存为外置上下文。AI 可以直接保存，稍后由你核实。',
+                           '记忆 自动记忆 外置上下文 联网授权 置顶 每次都参考')
+        self.description(memory, textvariable=memories.mode_state).pack(fill='x', pady=(8, 2))
+        self.memory_options = memories.build_options(memory)
+        self.description(memory, '授权联网读写后，相关记忆可能会发给所选服务商，自动整理可能增加费用。').pack(
+            fill='x', pady=(4, 0))
+        FlatButton(memory, '管理长期记忆', memories.show, variant='ghost', height=32, font_size=11).pack(
+            anchor='w', pady=(6, 0))
+
     def build_coding_tools(self):
         prefs = load_preferences(self.app.sessions)
         self.editor = tk.StringVar(self, next(title for title, value in EDITORS.items() if value == prefs['editor']))
@@ -260,8 +273,10 @@ class SettingsPanel(tk.Frame):
         api_host = tk.Frame(self.body, bg=C['bg'])
         self.register_section('models', api_host,
                               '联网 API 连接 DeepSeek 自定义兼容接口 服务商 服务地址 模型名 API 密钥 '
-                              '记住密钥 回答上限 思考 记忆 保存设置 测试连接 使用 API 切回本机 清除已存密钥')
+                              '记住密钥 回答上限 思考 本地经验 保存设置 测试连接 使用 API 切回本机 清除已存密钥')
         app.api_panel = APISettingsPanel(app, api_host)
+        self.description(api_host, '这里的“本地经验”是任务经验库。联网读写长期记忆的授权在「常规与权限 → 长期记忆」。').pack(
+            fill='x', pady=(0, 8))
         models = self.card('models', '模型占用', '需要推理时才加载模型。释放内存会保留模型选择，停用模型会清除选择。',
                            '本地模型 释放模型 停用模型 下载 能力中心')
         self.actions(models, [('释放模型', app.release_model), ('停用模型', app.disable_model),

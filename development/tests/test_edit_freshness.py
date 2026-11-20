@@ -104,6 +104,62 @@ class EditFreshnessTests(unittest.TestCase):
         self.assertFalse(attempt['ok'])
         self.assertEqual(self.file.read_bytes(), b'broken')
 
+    def test_cross_line_replacements_keep_source_endings(self):
+        cases = [
+            (b'first\r\nsecond\r\nlast', '\nsecond', '\nfixed', b'first\r\nfixed\r\nlast'),
+            (b'first\nsecond\nlast', 'first\r\nsecond', 'one\r\ntwo', b'one\ntwo\nlast'),
+            (b'before\r\none\ntwo\r\nthree\nafter', 'one\r\ntwo\nthree', '1\r\n2\r\n3',
+             b'before\r\n1\n2\r\n3\nafter'),
+        ]
+        for original, old, new, expected in cases:
+            with self.subTest(original=original):
+                self.file.write_bytes(original)
+                outcome = self.run_agent([read()], [replace(old, new)])
+                self.assertEqual(self.file.read_bytes(), expected)
+                self.assertEqual(len(outcome['changes']), 1)
+
+    def test_mixed_line_endings_cannot_disambiguate_duplicate_matches(self):
+        original = b'left\r\nright\nleft\nright\n'
+        self.file.write_bytes(original)
+        self.run_agent([read()], [replace('left\nright', 'updated')], expected_status='unfinished')
+        self.assertIn('恰好出现一次', self.results('replace_text')[-1]['message'])
+        self.assertEqual(self.file.read_bytes(), original)
+
+    def test_partial_read_must_cover_whole_crlf_in_original_utf8_bytes(self):
+        self.file.write_bytes('甲🙂\r\n乙尾'.encode())
+        # The first read starts on LF, one byte past CR. The second includes both.
+        outcome = self.run_agent([read(offset=8, limit=4)], [replace('\n乙', '\n新')],
+                                 [read(offset=7, limit=5)], [replace('\n乙', '\n新')])
+        blocked, changed = self.results('replace_text')
+        self.assertFalse(blocked['ok'])
+        self.assertTrue(changed['changed'])
+        self.assertEqual(self.file.read_bytes(), '甲🙂\r\n新尾'.encode())
+        self.assertEqual(len(outcome['changes']), 1)
+
+    def test_noop_does_not_resolve_a_failed_edit(self):
+        self.file.write_bytes(b'broken')
+        outcome = self.run_agent([read()], [replace('absent', 'fixed')], [replace('broken', 'broken')],
+                                 expected_status='unfinished')
+        failed, noop = self.results('replace_text')
+        self.assertFalse(failed['ok'])
+        self.assertTrue(noop['ok'])
+        self.assertFalse(noop['changed'])
+        self.assertIn('未修改', noop['message'])
+        self.assertEqual(outcome['task_state']['failed_writes'], [FILE])
+        self.assertEqual(outcome['changes'], [])
+        self.assertEqual(self.file.read_bytes(), b'broken')
+
+    def test_noop_alone_remains_successful_and_preserves_mixed_endings(self):
+        source = b'one\r\ntwo\nthree'
+        self.file.write_bytes(source)
+        outcome = self.run_agent([read()], [replace('one\ntwo\nthree', 'one\ntwo\nthree')])
+        noop, = self.results('replace_text')
+        self.assertTrue(noop['ok'])
+        self.assertFalse(noop['changed'])
+        self.assertIn('未修改', noop['message'])
+        self.assertEqual(outcome['changes'], [])
+        self.assertEqual(self.file.read_bytes(), source)
+
     def test_replace_requires_visible_target_and_preserves_partial_limit(self):
         original = b'broken prefix hidden suffix\n'
         self.file.write_bytes(original)

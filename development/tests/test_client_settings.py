@@ -63,10 +63,27 @@ class NativeSettingsScenario(unittest.TestCase):
         self.assertTrue(app.sidebar.winfo_manager())
         app.select_page(2)
         self.assertEqual(list(panel.category_buttons), ['general', 'coding', 'models', 'appearance', 'storage', 'about'])
-        self.assertEqual(visible_sections(), {'general': 1})
+        self.assertEqual(visible_sections(), {'general': 2})
         self.assertEqual(panel.heading.cget('text'), '常规与权限')
         self.assertEqual(app.project.permission_mode.get(), 'standard')
         self.assertTrue(panel.permission_buttons['standard'].cget('text').startswith('✓'))
+
+        for query in ('长期记忆', '外置上下文', '记忆'):
+            panel.query.set(query)
+            root.update_idletasks()
+            self.assertEqual(visible_sections(), {'general': 1})
+            self.assertTrue(panel.memory_options[0].winfo_viewable())
+        self.assertEqual(panel.memory_options[0].cget('variable'), app.memories.options[0].cget('variable'))
+        panel.memory_options[0].invoke()
+        self.assertFalse(app.memories.read_enabled.get())
+        app.memories.options[0].invoke()
+        self.assertTrue(app.memories.read_enabled.get())
+        find_button(panel, '管理长期记忆').invoke()
+        self.assertEqual(app.current_page, 0)
+        self.assertTrue(app.memories.opened)
+        self.assertTrue(app.memories.frame.winfo_manager())
+        app.open_memory()
+        app.select_page(2)
 
         panel.query.set('api 密钥')
         self.assertEqual(visible_sections(), {'models': 1})
@@ -86,7 +103,9 @@ class NativeSettingsScenario(unittest.TestCase):
         self.assertEqual([button.grid_info()['row'] for button in api.connection_buttons], [0, 0, 0, 0])
         for button in api.connection_buttons:
             self.assertLessEqual(button.winfo_x() + button.winfo_width(), button.master.winfo_width())
-        panel.navigation.configure(width=310)
+        # The client no longer reserves a permanent icon rail; deliberately
+        # narrow the content enough to exercise the two-row button layout.
+        panel.navigation.configure(width=400)
         root.update()
         self.assertEqual([button.grid_info()['row'] for button in api.connection_buttons], [0, 0, 1, 1])
         panel.navigation.configure(width=156)

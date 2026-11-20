@@ -387,7 +387,7 @@ class TaskJournal:
                 self._state['failed_writes'] = [item for item in self._state['failed_writes']
                     if os.path.normcase(item) != os.path.normcase(path)]
         self._state['inflight'] = None
-        if tool in ('write_file', 'replace_text'):
+        if tool in ('write_file', 'replace_text') and (not successful or result.get('changed') is True):
             path = _clean(result.get('path') or arguments.get('path'), 1024).replace('\\', '/')
             pending = self._state['failed_writes']
             pending[:] = [item for item in pending if os.path.normcase(item) != os.path.normcase(path)]

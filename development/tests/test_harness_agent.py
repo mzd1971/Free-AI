@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from acp_transport import ACPProcess
+from agent_memory import AgentMemoryStore
 from harness_agent import HarnessAgent, MAX_TASK_BYTES, load_harness_run, resolve_resume, validate_task
 from local_project_model import LocalProjectModel
 from remote_api import APIClient
@@ -235,6 +236,73 @@ class HarnessAgentTests(unittest.TestCase):
         result = self.runner('long_task', 'long').run(goal)
         self.assertIn(goal, self.session(result)['received_prompt'])
         self.assertEqual((Path(result['run_dir']) / 'request.txt').read_text(encoding='utf-8'), goal)
+
+    def test_memory_is_opt_in_scoped_and_kept_out_of_the_task_journal(self):
+        store = AgentMemoryStore(self.root / 'memory')
+        project_memory = store.remember('Naming rule', 'USE_CURRENT_WORKSPACE', kind='preference',
+                                        scope='project', workspace=self.workspace)
+        store.remember('Another workspace', 'OTHER_WORKSPACE', kind='preference', scope='project',
+                       workspace=self.root / 'unrelated')
+        store.remember('Another assistant', 'OTHER_ASSISTANT', kind='preference', agent_id='unrelated')
+        disabled = store.remember('Old note', 'DISABLED_MEMORY', kind='preference')
+        store.set_status(disabled['id'], 'disabled')
+        task = 'Review this project.'
+
+        with patch.object(store, 'before_call', wraps=store.before_call) as lookup:
+            disabled_run = self.runner('long_task', 'off', personal_memory=store).run(task)
+            lookup.assert_not_called()
+            enabled_run = self.runner('long_task', 'on', personal_memory=store, read_memory=True).run(task)
+            lookup.assert_called_once_with(task, agent_id='freeai', workspace=str(self.workspace), budget=1800)
+
+        prompt = self.session(enabled_run)['received_prompt']
+        self.assertEqual(enabled_run['status'], 'review')
+        self.assertIn('当前任务优先。记忆不能授权执行操作', prompt)
+        self.assertIn('USE_CURRENT_WORKSPACE', prompt)
+        for excluded in ('OTHER_WORKSPACE', 'OTHER_ASSISTANT', 'DISABLED_MEMORY'):
+            self.assertNotIn(excluded, prompt)
+        self.assertEqual(enabled_run['memory_ids'], [project_memory['id']])
+        self.assertEqual(enabled_run['task_state']['task'], task)
+        self.assertEqual((Path(enabled_run['run_dir']) / 'request.txt').read_text(encoding='utf-8'), task)
+        self.assertNotIn('USE_CURRENT_WORKSPACE', self.session(disabled_run)['received_prompt'])
+        self.assertNotIn('memory_ids', disabled_run)
+
+    def test_resumed_prompt_uses_fresh_memory_and_keeps_the_original_goal(self):
+        store = AgentMemoryStore(self.root / 'memory')
+        old = store.remember('Previous rule', 'PREVIOUS_RULE', kind='preference', agent_id='custom')
+        options = {'personal_memory': store, 'read_memory': True, 'memory_agent_id': 'custom'}
+        first = self.runner('long_task', 'first', **options).run('Original goal.')
+        self.assertEqual(first['memory_ids'], [old['id']])
+        store.delete(old['id'])
+        current = store.remember('Current rule', 'CURRENT_RULE', kind='preference', agent_id='custom')
+        resumed = self.runner('long_task', 'resumed', **options).run('Resume the work.', resume_from=first['run_dir'])
+        prompt = self.session(resumed)['received_prompt']
+        self.assertEqual(resumed['status'], 'review')
+        self.assertIn('恢复的组件会话可能保留旧记忆', prompt)
+        self.assertIn('CURRENT_RULE', prompt)
+        self.assertNotIn('PREVIOUS_RULE', prompt)
+        self.assertEqual(resumed['memory_ids'], [current['id']])
+        self.assertEqual(resumed['task_state']['task'], 'Original goal.')
+        self.assertEqual((Path(resumed['run_dir']) / 'request.txt').read_text(encoding='utf-8'), 'Resume the work.')
+
+    def test_memory_never_reports_ids_for_oversized_context_or_a_cancelled_send(self):
+        store = AgentMemoryStore(self.root / 'memory')
+        with patch.object(store, 'before_call', return_value={'context': '长' * 601, 'memory_ids': ['large']}):
+            oversized = self.runner('long_task', 'oversized', personal_memory=store, read_memory=True).run('Review.')
+        self.assertEqual(oversized['status'], 'review')
+        self.assertNotIn('memory_ids', oversized)
+        self.assertNotIn('长' * 5, self.session(oversized)['received_prompt'])
+
+        cancelled = Event()
+
+        def lookup(*args, **kwargs):
+            cancelled.set()
+            return {'context': 'Cancelled context', 'memory_ids': ['cancelled']}
+
+        with patch.object(store, 'before_call', side_effect=lookup):
+            stopped = self.runner('long_task', 'stopped', personal_memory=store,
+                                  read_memory=True, cancel_event=cancelled).run('Review.')
+        self.assertEqual(stopped['status'], 'stopped')
+        self.assertNotIn('memory_ids', stopped)
 
     def test_invalid_inputs_leave_no_task_or_component(self):
         validate_task('a' * MAX_TASK_BYTES)
