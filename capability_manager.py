@@ -88,6 +88,8 @@ class PackageManager:
         if default_catalog and 'engine-cpu' in self.catalog:
             from hf_models import load_specs
             self.catalog.update(load_specs(self))
+            from training_publish import load_specs as load_trained_specs
+            self.catalog.update(load_trained_specs(self))
         self._validate_catalog()
         self._verified = {}
         self._active = set()
@@ -107,7 +109,12 @@ class PackageManager:
             for dep in spec.get('dependencies', []):
                 if dep not in self.catalog:
                     raise PackageError('缺少能力包依赖定义。')
-            if not spec.get('assets'):
+            if spec.get('local_training') is True:
+                if (not identity.startswith('trained-') or spec.get('kind') != 'model'
+                        or spec.get('assets') != []
+                        or spec.get('base_model_id') not in spec.get('dependencies', [])):
+                    raise PackageError('本地训练成果的模型资料无效。')
+            elif not spec.get('assets'):
                 raise PackageError('能力包没有下载文件。')
             for asset in spec['assets']:
                 _relative(asset['filename'])
@@ -172,7 +179,11 @@ class PackageManager:
             return None
 
     def ready(self, identity, *, full=False):
-        self._spec(identity)
+        spec = self._spec(identity)
+        if spec.get('local_training') is True:
+            from training_publish import ready
+            return ready(self, identity, full=full) and all(
+                self.ready(dep, full=full) for dep in spec.get('dependencies', []))
         receipt = self._receipt(identity)
         if receipt is None:
             return False
@@ -203,12 +214,30 @@ class PackageManager:
     def asset_path(self, identity):
         if not self.ready(identity):
             raise PackageError(f'请先在“能力中心”下载或修复“{self._spec(identity)["title"]}”。')
+        if self._spec(identity).get('local_training') is True:
+            from training_publish import asset_path
+            return asset_path(self, identity)
         return self._safe(f'installed/{identity}/{self._receipt(identity)["entrypoint"]}')
+
+    def refresh_trained_models(self):
+        """Discover newly published results without interrupting a loaded model."""
+        from training_publish import load_specs
+        with self._thread_lock:
+            keep = {key: spec for key, spec in self.catalog.items()
+                    if not spec.get('local_training') or key in self._active}
+            self.catalog = {**keep, **load_specs(self)}
 
     def list_packages(self):
         result = []
         for identity, spec in self.catalog.items():
             installed = self.ready(identity)
+            if spec.get('local_training') is True:
+                from training_publish import installed_size
+                result.append({**spec, 'size': installed_size(self, identity),
+                               'installed': installed, 'status': 'installed' if installed else 'repair',
+                               'downloaded': 0, 'installed_size': installed_size(self, identity),
+                               'download_size': 0})
+                continue
             partial = sum(self._safe(f'downloads/{identity}/{asset["filename"]}.part').stat().st_size
                           for asset in spec['assets']
                           if self._safe(f'downloads/{identity}/{asset["filename"]}.part').is_file())
@@ -275,6 +304,8 @@ class PackageManager:
                 stream.close()
 
     def install(self, identity, progress=None, cancel_event=None):
+        if self._spec(identity).get('local_training') is True:
+            raise PackageError('这是本机训练成果。请在训练工作台重新验收并加入客户端，不能联网下载。')
         with self._operation():
             for item in self._dependency_order(identity):
                 _cancel(cancel_event)
@@ -447,9 +478,16 @@ class PackageManager:
             if identity in self._active:
                 raise PackageError('这个能力包正在使用，请先停止相关任务。')
             dependents = [spec['title'] for other, spec in self.catalog.items()
-                          if other != identity and identity in self._dependency_order(other) and self._receipt(other)]
+                          if other != identity and identity in self._dependency_order(other)
+                          and (spec.get('local_training') is True or self._receipt(other))]
             if dependents:
                 raise PackageError('请先移除依赖它的能力：' + '、'.join(dependents))
+            if self._spec(identity).get('local_training') is True:
+                from training_publish import remove
+                remove(self, identity)
+                self.catalog.pop(identity, None)
+                self._verified.clear()
+                return
             for relative in (f'installed/{identity}', f'downloads/{identity}'):
                 target = self._safe(relative)
                 if target.exists():

@@ -65,7 +65,14 @@ def training_runs(directory=RUNS_ROOT):
                 summary = {}
         except (OSError, ValueError):
             pass
-        rows.append({'path': path, 'name': path.name, 'summary': summary,
+        acceptance = {'status': 'needs_review'}
+        if summary.get('completed') is True:
+            try:
+                from training_evaluation import evaluate_run
+                acceptance = evaluate_run(path)
+            except (OSError, ValueError, TypeError, KeyError):
+                pass
+        rows.append({'path': path, 'name': path.name, 'summary': summary, 'acceptance': acceptance,
                      'completed': summary.get('completed') is True, 'modified': path.stat().st_mtime_ns})
     return sorted(rows, key=lambda row: row['modified'], reverse=True)
 
@@ -79,7 +86,14 @@ def load_result(directory):
     comparisons = json.loads(path.read_text(encoding='utf-8')) if path.is_file() else []
     if not isinstance(comparisons, list) or any(not isinstance(row, dict) for row in comparisons):
         raise ValueError('训练前后对比记录格式不正确。原始文件仍然保留。')
-    return {'path': directory, 'summary': summary, 'comparisons': comparisons}
+    from training_evaluation import evaluate_run
+    return {'path': directory, 'summary': summary, 'comparisons': comparisons,
+            'acceptance': evaluate_run(directory)}
+
+
+def acceptance_label(report):
+    return {'passed': '验收通过', 'failed': '验收未通过',
+            'needs_review': '需要核实'}.get(report.get('status'), '需要核实')
 
 
 def result_text(result):
@@ -87,7 +101,23 @@ def result_text(result):
     def number(key, digits=4):
         value = summary.get(key)
         return f'{value:.{digits}f}' if isinstance(value, (int, float)) else '未记录'
-    return (f"检查用的新题：训练前 {number('baseline_validation_loss')} → 训练后 {number('best_validation_loss')}\n"
+    acceptance = result.get('acceptance', {'status': 'needs_review'})
+    reasons = '；'.join(str(item) for item in acceptance.get('reasons', []))
+    verdict = acceptance_label(acceptance)
+    if acceptance.get('status') == 'passed':
+        verdict += ' · 仅代表本批检查题达标，可以加入客户端后试用。'
+    scores = []
+    for group, title in (('domain', '新题'), ('general', '基础能力')):
+        metric = acceptance.get('metrics', {}).get(group, {})
+        count = metric.get('evaluable', 0)
+        if count:
+            scores.append(f"{title}通过数：{metric.get('before_passed', 0)}/{count} → "
+                          f"{metric.get('after_passed', 0)}/{count}（共 {metric.get('total', 0)} 题）")
+        else:
+            scores.append(f'{title}：暂无可自动评分的完整对照')
+    return (verdict + ('\n' + reasons if reasons else '') + '\n\n'
+            + '\n'.join(scores) + '\n'
+            f"验证题回答偏差：训练前 {number('baseline_validation_loss')} → 训练后 {number('best_validation_loss')}\n"
             '这是回答偏差的数值，越低越好；它不等于正确率。\n'
             f"保留第 {summary.get('best_epoch', '未记录')} 轮成果 · 调整 {summary.get('updates', '未记录')} 次 · "
             f"训练用时 {number('training_seconds', 1)} 秒\n"
@@ -495,6 +525,9 @@ class TrainerApp:
         self.button(toolbar, '刷新记录', self.refresh_runs)
         self.button(toolbar, '打开所选文件夹', self.open_selected_run)
         self.button(toolbar, '查看详细数值', lambda: self.show_details('训练详细记录', self.finetune_details))
+        self.button(toolbar, '验收怎么判断', self.acceptance_help)
+        self.publish_button = self.button(toolbar, '加入客户端模型', self.publish_result, variant='accent', width=175)
+        self.publish_button.configure(state='disabled')
         self.run_tree = self.tree(page, pady=(0, 12), columns=('status', 'name'),
                                   show='headings', height=4, selectmode='browse')
         self.run_tree.heading('status', text='结果')
@@ -681,9 +714,10 @@ class TrainerApp:
                 self.phase.set('已安全停止')
                 self.result_notice.set('这次训练未完成全部检查，不会标记为可用成果；原始记录仍然保留。')
             else:
-                self.phase.set('训练与检查已完成')
                 path = Path(result['run_dir'])
                 loaded = load_result(path)
+                self.phase.set('训练已结束 · ' + acceptance_label(loaded['acceptance']))
+                self.status.set(self.phase.get())
                 self.result_notice.set(result_text(loaded))
                 self.refresh_runs()
         self.submit('正在训练，显卡暂由训练工作台使用', work, done, kind='training', cancellable=True)
@@ -735,13 +769,20 @@ class TrainerApp:
 
     def refresh_runs(self):
         selected = self.run_tree.selection()
+        selected_path = self.run_rows.get(selected[0], {}).get('path') if selected else None
         rows = training_runs()
         self.run_rows = {str(index): row for index, row in enumerate(rows)}
         self.run_tree.delete(*self.run_tree.get_children())
         for identity, row in self.run_rows.items():
-            self.run_tree.insert('', 'end', iid=identity, values=('已完成' if row['completed'] else '未完成', row['name']))
-        if selected and selected[0] in self.run_rows:
-            self.run_tree.selection_set(selected[0])
+            status = acceptance_label(row.get('acceptance', {})) if row['completed'] else '未完成'
+            self.run_tree.insert('', 'end', iid=identity, values=(status, row['name']))
+        identity = next((key for key, row in self.run_rows.items() if row['path'] == selected_path), None)
+        if identity is not None:
+            self.run_tree.selection_set(identity)
+            self.select_run()
+        else:
+            self.result = None
+            self._refresh_publish_button()
 
     def latest_result(self):
         self.select_page(1)
@@ -756,10 +797,13 @@ class TrainerApp:
     def select_run(self, event=None):
         selected = self.run_tree.selection()
         if not selected or selected[0] not in self.run_rows:
+            self.result = None
+            self._refresh_publish_button()
             return
         row = self.run_rows[selected[0]]
         if not row['completed']:
             self.result = None
+            self._refresh_publish_button()
             self.record_summary.set('这次训练未完成全部检查，不能据此判断是否进步。可打开文件夹查看保留的记录。')
             self.question_picker.configure(values=())
             self.question.set('')
@@ -769,7 +813,7 @@ class TrainerApp:
             return
         try:
             self.result = load_result(row['path'])
-            self.finetune_details = self.result['summary']
+            self.finetune_details = {**self.result['summary'], 'acceptance': self.result['acceptance']}
             self.record_summary.set(result_text(self.result))
             values = [f"{index + 1}. {item.get('prompt', '')[:90]}" for index, item in enumerate(self.result['comparisons'])]
             self.question_picker.configure(values=values)
@@ -781,7 +825,49 @@ class TrainerApp:
                 self.write(self.before_answer, '')
                 self.write(self.after_answer, '')
         except Exception as exc:
+            self.result = None
             self.status.set('无法读取这次结果：' + str(exc))
+        self._refresh_publish_button()
+
+    def _refresh_publish_button(self):
+        if hasattr(self, 'publish_button'):
+            eligible = (not self.busy and self.result is not None
+                        and self.result.get('acceptance', {}).get('status') == 'passed')
+            self.publish_button.configure(state='normal' if eligible else 'disabled')
+
+    def publish_result(self):
+        if self.busy:
+            return
+        if self.result is None or self.result.get('acceptance', {}).get('status') != 'passed':
+            self.status.set('请先选择通过验收的训练记录。没有评分依据的成果需要先补充检查。')
+            return
+        directory = self.result['path']
+        from training_publish import publish_run
+        def progress(event):
+            self.events.put(('update', self.status.set, event.get('message', '正在准备训练成果')))
+        def done(identity):
+            self.status.set('已加入客户端模型：' + self.manager.catalog[identity]['title'] +
+                            '。在客户端输入框的模型菜单中选择使用。')
+            self.write(self.log, '\n' + self.status.get() + '\n', True)
+            self._refresh_publish_button()
+        self.submit('正在复查并转换训练成果',
+                    lambda: publish_run(self.manager, directory, progress=progress, cancel_event=self.cancel_event),
+                    done, kind='publish', cancellable=True)
+
+    def acceptance_help(self):
+        self.show_details('训练成果如何验收',
+            '训练结束和效果达标是两件事。系统分别检查新题表现、基础能力以及验证题偏差。\n\n'
+            '每组至少需要 5 道可评分的检查题，可评分覆盖率与训练后通过率均至少 80%，'
+            '而且两组得分与验证题偏差都不能退步。达标只代表这批检查题，不代表所有任务都变强。\n\n'
+            '在 sft_test.jsonl 和 sft_general_test.jsonl 的题目中加入 evaluation 字段：\n'
+            '精确答案："evaluation": {"type": "exact"}\n'
+            '完整 JSON 答案："evaluation": {"type": "json"}\n'
+            '人工查看："evaluation": {"type": "manual"}\n\n'
+            '精确答案只整理首尾空白、换行和 Unicode 表示，不把相似表述当作相等。'
+            'JSON 按完整结构和值比较，不要求对象字段顺序相同。没有规则的开放式回答不会自动打分。\n\n'
+            '通过验收后点击“加入客户端模型”。目前支持本工作台产生的 Qwen3-0.6B LoRA 成果，'
+            '客户端会加载匹配的基础模型与补丁，不会把补丁套到别的模型上。'
+            '旧记录缺少权重与检查结果的校验资料时，需要重新训练生成完整记录。')
 
     def select_question(self, event=None):
         if self.result is None:
@@ -797,7 +883,13 @@ class TrainerApp:
                 text += '\n\n[本次回答达到长度上限，可能尚未说完。]'
             self.write(widget, text)
         group = '基础能力检查' if row.get('group') == 'general' else '新题检查'
-        self.reference.set(f"{group} · 问题：{row.get('prompt', '')}\n参考回答：{row.get('response', '未记录')}")
+        case = next((case for case in self.result.get('acceptance', {}).get('cases', [])
+                     if case['id'] == row.get('id')), {})
+        statuses = {'passed': '通过', 'failed': '未通过', 'token_limit': '输出被截断',
+                    'missing': '缺少结果', 'invalid': '结果无效', 'unscored': '人工查看'}
+        score = ' · '.join(f"{title}：{statuses.get(case.get(key), '未评分')}"
+                           for key, title in (('before', '训练前'), ('after', '训练后')))
+        self.reference.set(f"{group} · {score}\n问题：{row.get('prompt', '')}\n参考回答：{row.get('response', '未记录')}")
 
     def open_outputs(self):
         RUNS_ROOT.mkdir(parents=True, exist_ok=True)
@@ -859,6 +951,7 @@ class TrainerApp:
                 else:
                     self.status.set('已完成，记录保存在本机。')
                     callback(value)
+                self._refresh_publish_button()
         except queue.Empty:
             pass
         except Exception as exc:

@@ -153,6 +153,9 @@ class NativeMemoryScenario(unittest.TestCase):
             quote = '我的构建工具固定使用 uv。'
             saving_runtime = FakeRuntime([{'title': '构建工具', 'kind': 'fact', 'evidence_quote': quote}])
             app.selected_model = 'text-default'
+            # This suite covers the legacy automatic extraction path. Unified
+            # tool-memory behavior has its own native UI integration suite.
+            app.project.assistant_enabled.set(False)
             put(app.input, '请记住：' + quote)
             with patch.object(app.manager, 'ready', return_value=True), patch('qwen_chat.runtime', return_value=saving_runtime):
                 app.send_chat()
@@ -250,6 +253,7 @@ class NativeMemoryScenario(unittest.TestCase):
             restored.options[0].invoke()
             self.assertEqual(restored.snapshot('api'), {'read': True, 'write': False})
             reopened.new_conversation()
+            reopened.project.assistant_enabled.set(False)
             reopened.backend, reopened.selected_model = 'local', 'text-default'
             after_restart = FakeRuntime()
             put(reopened.input, '请简单解释二分查找。')

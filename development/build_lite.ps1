@@ -16,6 +16,11 @@ $taskPrivatePattern = '(?i)(^|[-_.])(api[-_]?connection|api[-_]?settings|setting
 $taskRequired = @('free_ai_bootstrap.py','client_app.py','client_settings.py','coding_tools.py','ui_preferences.py','hf_models.py','hf_model_panel.py','hf_datasets.py','hf_dataset_catalog.py','hf_dataset_panel.py','trainer_app.py','ui_kit.py','compute_guard.py','model_catalog.py','app_skills.py','api_panel.py','api_settings.py','remote_api.py','project_agent.py','project_chat.py','agent_workspace.py','agent_task_state.py','agent_review.py','local_project_model.py','agent_memory.py','memory_learning.py','memory_panel.py','paths.py','assets\free-ai.ico')
 $taskRequired += @('acp_transport.py','harness_agent.py','harness_settings.py','harness_panel.py')
 $taskRequired += @('project_snapshot.py','project_verification.py','project_checks.py')
+$taskRequired += @('agent_web.py')
+$taskRequired += @('clock_context.py')
+$taskRequired += @('unified_tools.py')
+$taskRequired += @('reasoning_view.py', 'keyboard_shortcuts.py')
+$taskRequired += @('training_evaluation.py', 'training_publish.py', 'training_gguf.py')
 foreach ($taskName in $taskRequired) {
     if (-not (Test-Path -LiteralPath (Join-Path $SourceRoot $taskName) -PathType Leaf)) { throw "Missing application source: $taskName" }
 }

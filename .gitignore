@@ -32,6 +32,7 @@ runtime/python/Lib/site-packages/
 /development/*
 !/development/build_lite.ps1
 !/development/export_icon.ps1
+!/development/training-workflow.md
 !/development/installer/
 !/development/launcher/
 !/development/tests/

@@ -8,10 +8,12 @@ from contextlib import contextmanager
 
 PROJECT_PERMISSION_MODES = frozenset({'standard', 'readonly', 'automatic'})
 PROJECT_SETTING_TYPES = {'enabled': bool, 'workspace': str, 'allow_write': bool, 'use_memory': bool,
-                         'permission_mode': str}
-PROJECT_RESULT_FIELDS = ('status', 'answer', 'run_dir', 'changes', 'episode_id', 'memory_updates', 'memory_ids', 'engine',
+                         'permission_mode': str, 'allow_web': bool, 'assistant_enabled': bool}
+REASONING_LIMIT = 24_000
+PROJECT_RESULT_FIELDS = ('status', 'answer', 'reasoning', 'run_dir', 'changes', 'episode_id', 'memory_updates', 'memory_ids', 'engine',
                          'task_state', 'continuation_available', 'permission_mode',
-                         'snapshot_dir', 'snapshot', 'acceptance', 'fixed_check')
+                         'snapshot_dir', 'snapshot', 'acceptance', 'fixed_check', 'allow_web', 'web_sources',
+                         'capability_mode', 'csv_attachment')
 PROJECT_RECORD_LIMIT = 512 * 1024
 PROJECT_STATE_FIELDS = ('task', 'status', 'phase', 'parent_run', 'uncertain')
 
@@ -28,6 +30,31 @@ def _draft_key(identity):
         raise ValueError('草稿会话无效。')
     return identity
 
+
+def _bounded_reasoning(text):
+    if not isinstance(text, str):
+        raise ValueError('模型思考必须为文本。')
+    text = text[:REASONING_LIMIT]
+    return text if text.strip() else ''
+
+
+def _fit_project_reasoning(text, available_bytes):
+    def fits(length):
+        field = json.dumps({'reasoning': text[:length]}, ensure_ascii=False)
+        return len(field.encode('utf-8')) - 2 <= available_bytes  # Exclude the surrounding braces.
+
+    if fits(len(text)):
+        return text
+    low, high = 0, len(text) - 1
+    while low < high:
+        length = (low + high + 1) // 2
+        if fits(length):
+            low = length
+        else:
+            high = length - 1
+    return _bounded_reasoning(text[:low])
+
+
 class Sessions:
     def __init__(self, directory):
         directory = Path(directory)
@@ -39,6 +66,9 @@ class Sessions:
                 id TEXT PRIMARY KEY, title TEXT, updated TEXT);
                 CREATE TABLE IF NOT EXISTS messages(
                 id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT);
+                CREATE TABLE IF NOT EXISTS messages_reasoning(
+                    message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+                    text TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
                 CREATE TABLE IF NOT EXISTS conversation_drafts(
                     draft_key TEXT PRIMARY KEY NOT NULL,
@@ -76,6 +106,16 @@ class Sessions:
         with self.connect() as db:
             rows = db.execute('SELECT role,content FROM messages WHERE session_id=? ORDER BY id', (identity,)).fetchall()
         return [{'role': role, 'content': content} for role, content in rows]
+    def reasoning(self, identity):
+        with self.connect() as db:
+            rows = db.execute('''WITH indexed_messages AS (
+                SELECT id, role, row_number() OVER (ORDER BY id) - 1 AS message_index
+                FROM messages WHERE session_id=?
+            ) SELECT message_index, text FROM indexed_messages
+              JOIN messages_reasoning ON messages_reasoning.message_id=indexed_messages.id
+              WHERE role='assistant' ORDER BY message_index''', (identity,)).fetchall()
+        return dict(rows)
+
     def has_session(self, identity):
         with self.connect() as db:
             return db.execute('SELECT 1 FROM sessions WHERE id=?', (identity,)).fetchone() is not None
@@ -103,9 +143,13 @@ class Sessions:
                 db.execute('DELETE FROM conversation_drafts WHERE draft_key=?', (key,))
         self._known_drafts[key] = snapshot
 
-    def append(self, identity, role, content, *, draft_from=_KEEP_DRAFT):
+    def append(self, identity, role, content, *, draft_from=_KEEP_DRAFT, reasoning=None):
         if role not in ('user', 'assistant') or not isinstance(content, str):
             raise ValueError('Invalid conversation message')
+        if reasoning is not None:
+            if role != 'assistant':
+                raise ValueError('模型思考只能随助手消息保存。')
+            reasoning = _bounded_reasoning(reasoning)
         if draft_from is not _KEEP_DRAFT and (role != 'user' or draft_from not in (None, identity)):
             raise ValueError('只能随发送的用户消息清除对应草稿。')
         draft_key = _draft_key(draft_from) if draft_from is not _KEEP_DRAFT else None
@@ -114,6 +158,9 @@ class Sessions:
                 raise ValueError('Conversation does not exist')
             message = db.execute('INSERT INTO messages(session_id,role,content) VALUES(?,?,?)',
                                  (identity, role, content))
+            if reasoning:
+                db.execute('INSERT INTO messages_reasoning(message_id,text) VALUES(?,?)',
+                           (message.lastrowid, reasoning))
             db.execute('UPDATE sessions SET updated=? WHERE id=?', (self.now(), identity))
             if role == 'user':
                 db.execute("UPDATE sessions SET title=? WHERE id=? AND title='新的对话'", (content.replace('\n', ' ')[:22], identity))
@@ -171,11 +218,27 @@ class Sessions:
     @staticmethod
     def _encode_project_run(result, workspace, activity):
         public = {field: result[field] for field in PROJECT_RESULT_FIELDS if field in result}
+        reasoning = _bounded_reasoning(public.pop('reasoning')) if 'reasoning' in public else ''
+        if 'capability_mode' in public and public['capability_mode'] not in ('assistant', 'project'):
+            raise ValueError('助手能力范围无效。')
+        if 'csv_attachment' in public and type(public['csv_attachment']) is not bool:
+            raise ValueError('表格附件标记无效。')
+        if 'web_sources' in public:
+            sources = public['web_sources']
+            if not isinstance(sources, list):
+                raise ValueError('联网来源记录无效。')
+            public['web_sources'] = [
+                {key: row[key] for key in ('url', 'title', 'kind', 'fetched_at') if isinstance(row.get(key), str)}
+                for row in sources if isinstance(row, dict)
+                and isinstance(row.get('url'), str) and row.get('kind') in ('search', 'page')
+            ]
         state = public.get('task_state')
         if isinstance(state, dict):
             structured = {field: state[field] for field in PROJECT_STATE_FIELDS if field in state}
             if 'failed_writes' in state:
                 structured['failed_writes'] = [path for path in state['failed_writes'] if isinstance(path, str)]
+            if 'failed_utilities' in state:
+                structured['failed_utilities'] = [name for name in state['failed_utilities'] if isinstance(name, str)]
             for group, fields in (('plan', ('text', 'status')), ('edits', ('path', 'sha256')),
                                   ('observations', ('tool', 'subject', 'status', 'detail')),
                                   ('unresolved', ('id', 'tool', 'subject'))):
@@ -198,6 +261,11 @@ class Sessions:
             raise ValueError('项目运行记录无法保存。') from exc
         if size > PROJECT_RECORD_LIMIT:
             raise ValueError('项目运行记录超过 512 KiB。')
+        if reasoning:
+            reasoning = _fit_project_reasoning(reasoning, PROJECT_RECORD_LIMIT - size - (2 if public else 0))
+            if reasoning:
+                public['reasoning'] = reasoning
+                encoded = json.dumps(public, ensure_ascii=False, allow_nan=False)
         return encoded
 
     @staticmethod

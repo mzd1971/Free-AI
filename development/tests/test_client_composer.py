@@ -196,7 +196,7 @@ class NativeComposerScenario(unittest.TestCase):
         home_center = app.chat_stack.winfo_y() + app.chat_stack.winfo_height() / 2
         self.assertAlmostEqual(home_center / page.winfo_height(), .52, delta=.05)
         self.assertLess(app.context_bar.winfo_rooty(), app.composer.winfo_rooty())
-        self.assertFalse(app.project.permissions_button.winfo_viewable())
+        self.assertTrue(app.project.permissions_button.winfo_viewable())
         self.assertLess(app.more_button.winfo_rootx(), app.model_button.winfo_rootx())
         self.assertLess(app.model_button.winfo_rootx(), app.send_button.winfo_rootx())
 
@@ -244,6 +244,28 @@ class NativeComposerScenario(unittest.TestCase):
         root.update()
         self.assertTrue(app.sidebar.winfo_viewable())
         self.assertEqual(self.text(), '未发送的草稿')
+
+    def test_starter_preserves_existing_draft_and_never_sends(self):
+        app, root = self.app, self.app.root
+        root.deiconify()
+        root.update()
+        app.input.insert('1.0', '已经写下的要求')
+        with patch.object(app, 'send_chat') as send:
+            app.starter_buttons[0].invoke()
+            root.update()
+            self.assertTrue(self.text().startswith('已经写下的要求\n\n'))
+            self.assertIn('清晰的计划', self.text())
+            self.assertIs(root.focus_get(), app.input)
+            self.assertFalse(app.placeholder.winfo_viewable())
+            from ui_kit import COLORS
+            self.assertEqual(app.composer.border, COLORS['focus'])
+            send.assert_not_called()
+        self.assertTrue(app.flush_draft())
+        self.assertEqual(app.sessions.draft(None)[0], self.text())
+        app.input.delete('1.0', 'end')
+        app.input.insert('1.0', '  \n')
+        app.use_starter('新的要求')
+        self.assertTrue(self.text().startswith('  \n'), 'Whitespace in a draft also belongs to the user')
 
     def test_busy_input_is_editable_and_shortcut_does_not_send_or_stop(self):
         root = self.app.root

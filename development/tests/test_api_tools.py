@@ -23,6 +23,14 @@ def reply(finish, content=None, **fields):
                          'message': {'role': 'assistant', 'content': content, **fields}}]}
 
 
+def event(delta, finish=None):
+    data = {'choices': [{'index': 0, 'delta': delta, 'finish_reason': finish}]}
+    return f'data: {json.dumps(data)}\r\n\r\n'.encode('utf-8')
+
+
+DONE = b'data: [DONE]\r\n\r\n'
+
+
 class ToolAPITests(unittest.TestCase):
     def setUp(self):
         self.requests, self.responses = Queue(), Queue()
@@ -39,6 +47,20 @@ class ToolAPITests(unittest.TestCase):
                 response = responses.get(timeout=3)
                 if response is None:
                     release.wait(3)
+                    return
+                if isinstance(response, tuple):
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+                    self.end_headers()
+                    try:
+                        for chunk in response:
+                            if chunk is None:
+                                release.wait(3)
+                            else:
+                                self.wfile.write(chunk)
+                                self.wfile.flush()
+                    except OSError:
+                        pass
                     return
                 raw = json.dumps(response).encode('utf-8')
                 self.send_response(200)
@@ -125,6 +147,103 @@ class ToolAPITests(unittest.TestCase):
         cancellation.set()
         self.assertIsInstance(result.get(timeout=2), APICancelled)
         worker.join(timeout=1)
+
+    def test_streams_reasoning_before_fragmented_tool_call_completes(self):
+        self.responses.put((
+            event({'role': 'assistant', 'reasoning_content': 'fixture '}),
+            None,
+            event({'reasoning': 'reasoning', 'tool_calls': [{
+                'index': 0, 'id': CALL['id'], 'type': 'function',
+                'function': {'name': 'read_', 'arguments': '{"path":'},
+            }]}),
+            event({'tool_calls': [{
+                'index': 0, 'function': {'name': 'file', 'arguments': '"sample.txt"}'},
+            }]}),
+            event({}, 'tool_calls'), DONE,
+        ))
+        thoughts, results = Queue(), Queue()
+
+        def run():
+            try:
+                results.put(self.client.complete_tools([MESSAGE], [TOOL], on_reasoning=thoughts.put))
+            except APIError as error:
+                results.put(error)
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        try:
+            self.assertIs(self.requests.get(timeout=2)[2]['stream'], True)
+            self.assertEqual(thoughts.get(timeout=2), 'fixture ')
+            self.assertTrue(results.empty())
+        finally:
+            self.release.set()
+        self.assertEqual(thoughts.get(timeout=2), 'reasoning')
+        assistant = results.get(timeout=2)
+        worker.join(timeout=1)
+        self.assertEqual(assistant, {'role': 'assistant', 'content': None, 'tool_calls': [CALL],
+                                     'reasoning_content': 'fixture reasoning'})
+        history = [MESSAGE, assistant, {'role': 'tool', 'tool_call_id': CALL['id'], 'content': 'Read.'}]
+        self.responses.put(reply('stop', 'Done.'))
+        self.assertEqual(self.client.complete_tools(history, [TOOL], on_reasoning=thoughts.put)['content'],
+                         'Done.')
+        self.assertEqual(self.requests.get_nowait()[2]['messages'], history)
+        self.assertTrue(thoughts.empty())
+
+    def test_tool_json_fallback_separates_reasoning_and_does_not_resend(self):
+        self.responses.put(reply('stop', '<think>fixture</think>Final.', reasoning_content='fixture'))
+        thoughts = []
+        result = self.client.complete_tools([MESSAGE], [TOOL], on_reasoning=thoughts.append)
+        self.assertEqual(thoughts, ['fixture'])
+        self.assertEqual(result, {'role': 'assistant', 'content': 'Final.', 'tool_calls': [],
+                                  'reasoning_content': 'fixture'})
+        self.assertIs(self.requests.get_nowait()[2]['stream'], True)
+        self.assertTrue(self.requests.empty())
+
+    def test_text_stream_separates_split_think_tags_and_deduplicates_mirror(self):
+        self.responses.put((
+            event({'content': '<thi'}),
+            event({'content': 'nk>first part</thi'}),
+            event({'reasoning_content': 'first'}),
+            event({'reasoning_content': ' part continued', 'content': 'nk>The answer.'}),
+            event({}, 'stop'), DONE,
+        ))
+        tokens, thoughts = [], []
+        answer = self.client.generate('Question.', on_token=tokens.append, on_reasoning=thoughts.append)
+        self.assertEqual(''.join(tokens), answer)
+        self.assertEqual(answer, 'The answer.')
+        self.assertEqual(''.join(thoughts), 'first part continued')
+        self.assertEqual(self.client.last_reasoning, 'first part continued')
+
+    def test_streaming_tools_require_a_completed_valid_response(self):
+        complete_delta = {'tool_calls': [dict(CALL, index=0)]}
+        bad_chunks = (
+            (event(complete_delta), event({}, 'tool_calls')),
+            (event(complete_delta), event({}, 'stop'), DONE),
+            (event({'tool_calls': [dict(CALL, index=16)]}), event({}, 'tool_calls'), DONE),
+        )
+        for chunks in bad_chunks:
+            with self.subTest(chunks=chunks):
+                self.responses.put(chunks)
+                with self.assertRaises(APIError):
+                    self.client.complete_tools([MESSAGE], [TOOL], on_reasoning=lambda _text: None)
+                self.requests.get_nowait()
+
+    def test_cancel_from_reasoning_callback_prevents_tool_result(self):
+        self.responses.put((
+            event({'reasoning_content': 'first'}),
+            event({'reasoning_content': 'discard'}),
+            event({'tool_calls': [dict(CALL, index=0)]}, 'tool_calls'), DONE,
+        ))
+        cancelled, thoughts = threading.Event(), []
+
+        def receive(text):
+            thoughts.append(text)
+            cancelled.set()
+
+        with self.assertRaises(APICancelled):
+            self.client.complete_tools([MESSAGE], [TOOL], cancel_event=cancelled, on_reasoning=receive)
+        self.assertEqual(thoughts, ['first'])
+        self.assertFalse(self.client._request_lock.locked())
 
     def test_existing_text_generation(self):
         self.responses.put(reply('stop', 'Fixture answer.'))

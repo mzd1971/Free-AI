@@ -16,11 +16,15 @@ LIGHT_COLORS = {
     'card_border': '#cfdef1', 'selected_bg': '#dceaff', 'selected_fg': '#1e40af',
     'brand': '#1d4ed8', 'secondary': '#0369a1',
 }
-CLIENT_LIGHT_COLORS = {**LIGHT_COLORS,
-    'bg': '#ffffff', 'side': '#f7f8fa', 'text': '#20242c', 'muted': '#69717e',
-    'line': '#e0e4ea', 'card_border': '#e0e4ea', 'hover': '#edf0f5',
-    'selected_bg': '#eaf0fb', 'selected_fg': '#224e9c', 'brand': '#20242c',
-    'secondary': '#586273', 'tint': '#eef4ff',
+CLIENT_LIGHT_COLORS = {
+    'bg': '#ffffff', 'side': '#f6f7f9', 'surface': '#ffffff', 'input': '#ffffff',
+    'text': '#202630', 'muted': '#586477', 'line': '#e0e5ec',
+    'accent': '#2155c7', 'tint': '#edf3ff', 'success': '#16714c',
+    'hover': '#e9eef5', 'primary_bg': '#275bda', 'primary_fg': '#ffffff',
+    'primary_hover': '#204dbb', 'disabled_bg': '#e9edf3', 'disabled_fg': '#606b7c',
+    'focus': '#245bdb', 'selection_bg': '#dce8ff', 'selection_fg': '#133b96',
+    'card_border': '#e2e7ef', 'selected_bg': '#e8effe', 'selected_fg': '#1947af',
+    'brand': '#202630', 'secondary': '#526176',
 }
 DARK_COLORS = {
     'bg': '#161719', 'side': '#202226', 'surface': '#282b30', 'input': '#353940',
@@ -65,8 +69,14 @@ def ui_font(widget, size=12, bold=False, family=FONT):
     return fonts[key]
 
 
+def display_scale(widget):
+    """Return the app's layout scale for pixel dimensions."""
+    return getattr(widget._root(), '_free_ai_display_scale', 1.0)
+
+
 def text_scale(widget):
-    return TEXT_SCALE[getattr(widget._root(), '_free_ai_text_size', DEFAULT_TEXT_SIZE)]
+    choice = getattr(widget._root(), '_free_ai_text_size', DEFAULT_TEXT_SIZE)
+    return TEXT_SCALE[choice] * display_scale(widget)
 
 
 def set_text_size(root, choice):
@@ -172,6 +182,12 @@ def setup_theme(root, title, size=(1320, 880), theme='light', *,
     style.configure('Vertical.TScrollbar', background=COLORS['side'],
                     troughcolor=COLORS['bg'], arrowcolor=COLORS['muted'])
     style.map('Vertical.TScrollbar', background=[('active', COLORS['hover'])])
+    if hasattr(root, '_free_ai_display_scale'):
+        style.layout('Vertical.TScrollbar', [('Vertical.Scrollbar.trough', {
+            'sticky': 'ns', 'children': [('Vertical.Scrollbar.thumb', {'expand': '1', 'sticky': 'nswe'})],
+        })])
+        style.configure('Vertical.TScrollbar', width=round(6 * display_scale(root)), arrowsize=0,
+                        borderwidth=0, background=COLORS['line'], troughcolor=COLORS['bg'])
     style.configure('Horizontal.TProgressbar', background=COLORS['accent'], troughcolor=COLORS['side'],
                     borderwidth=0, lightcolor=COLORS['accent'], darkcolor=COLORS['accent'])
     set_text_size(root, text_size)
@@ -257,36 +273,105 @@ class RoundedFrame(tk.Frame):
         self.canvas = tk.Canvas(self, bg=background(parent), highlightthickness=0, bd=0)
         self.canvas.place(x=0, y=0, relwidth=1, relheight=1)
         self.body = tk.Frame(self, bg=self.color, bd=0)
-        pad = padding if isinstance(padding, tuple) else (padding, padding)
-        self.body.pack(fill='both', expand=True, padx=pad[0], pady=pad[1])
+        pad_x, pad_y = padding if isinstance(padding, tuple) else (padding, padding)
+        scale = display_scale(self)
+        if scale != 1.0:
+            pad_x, pad_y = round(pad_x * scale), round(pad_y * scale)
+        self.body.pack(fill='both', expand=True, padx=pad_x, pady=pad_y)
         self.canvas.bind('<Configure>', self.draw)
 
     def draw(self, event=None):
         self.canvas.delete('all')
         right, bottom = max(2, self.winfo_width() - 1), max(2, self.winfo_height() - 1)
+        scale = display_scale(self)
         if _is_cyberpunk(self):
-            _chamfered(self.canvas, 1, 1, right, bottom, 12,
+            cut = round(12 * scale)
+            _chamfered(self.canvas, 1, 1, right, bottom, cut,
                         fill=self.color, outline=self.border or COLORS['card_border'], width=1)
-            if right >= 48 and bottom >= 34:
-                self.canvas.create_line(1, 19, 1, 13, 13, 1, 30, 1, fill=COLORS['accent'], width=2)
-                self.canvas.create_line(right, bottom - 19, right, bottom - 12,
-                                        right - 12, bottom, right - 29, bottom,
+            if right >= 48 * scale and bottom >= 34 * scale:
+                short, long = round(19 * scale), round(29 * scale)
+                self.canvas.create_line(1, short, 1, 1 + cut, 1 + cut, 1, 1 + long, 1,
+                                        fill=COLORS['accent'], width=2)
+                self.canvas.create_line(right, bottom - short, right, bottom - cut,
+                                        right - cut, bottom, right - long, bottom,
                                         fill=COLORS['accent'], width=2)
         else:
-            rounded(self.canvas, 1, 1, right, bottom, self.radius,
+            rounded(self.canvas, 1, 1, right, bottom, self.radius * scale,
                     fill=self.color, outline=self.border or self.color, width=1)
 
 
+# Icon paths share a 24×24 drawing area with an inset for rounded strokes.
+_PANEL_OUTLINE = (6, 4, 18, 4, 20, 6, 20, 18, 18, 20, 6, 20, 4, 18, 4, 6, 6, 4)
+_BUTTON_ICON_PATHS = {
+    'sidebar': (_PANEL_OUTLINE, (9, 4, 9, 20), (6.5, 8, 6.7, 8), (6.5, 11, 6.7, 11)),
+    'plus': ((12, 5, 12, 19), (5, 12, 19, 12)),
+    'folder': ((4, 7, 6, 5, 10, 5, 12, 8, 18, 8, 20, 10, 20, 17, 18, 19, 6, 19, 4, 17, 4, 7),),
+    'grid': (
+        (4.5, 4.5, 10, 4.5, 10, 10, 4.5, 10, 4.5, 4.5),
+        (14, 4.5, 19.5, 4.5, 19.5, 10, 14, 10, 14, 4.5),
+        (4.5, 14, 10, 14, 10, 19.5, 4.5, 19.5, 4.5, 14),
+        (14, 14, 19.5, 14, 19.5, 19.5, 14, 19.5, 14, 14),
+    ),
+    'sparkle': (
+        (10, 4, 12, 9, 17, 11, 12, 13, 10, 18, 8, 13, 3, 11, 8, 9, 10, 4),
+        (18.5, 15.5, 18.5, 20), (16.25, 17.75, 20.75, 17.75),
+    ),
+    'memory': (
+        (8, 5, 16, 5, 19, 8, 19, 16, 16, 19, 8, 19, 5, 16, 5, 8, 8, 5),
+        (9.5, 9.5, 14.5, 9.5, 14.5, 14.5, 9.5, 14.5, 9.5, 9.5),
+        (9, 2.5, 9, 5), (15, 2.5, 15, 5), (9, 19, 9, 21.5), (15, 19, 15, 21.5),
+        (2.5, 9, 5, 9), (2.5, 15, 5, 15), (19, 9, 21.5, 9), (19, 15, 21.5, 15),
+    ),
+    'settings': (
+        (10, 3, 14, 3, 14.7, 6, 16.3, 7, 19.2, 6.1, 21.2, 9.5, 19, 11.1, 19, 12.9,
+         21.2, 14.5, 19.2, 17.9, 16.3, 17, 14.7, 18, 14, 21, 10, 21,
+         9.3, 18, 7.7, 17, 4.8, 17.9, 2.8, 14.5, 5, 12.9, 5, 11.1, 2.8, 9.5,
+         4.8, 6.1, 7.7, 7, 9.3, 6, 10, 3),
+    ),
+    'chevron_down': ((6, 9, 12, 15, 18, 9),),
+    'more': (),
+    'arrow_up': ((12, 20, 12, 4), (5, 11, 12, 4, 19, 11)),
+    'stop': ((8, 6, 16, 6, 18, 8, 18, 16, 16, 18, 8, 18, 6, 16, 6, 8, 8, 6),),
+    'copy': (
+        (10, 8, 18, 8, 20, 10, 20, 19, 18, 21, 10, 21, 8, 19, 8, 10, 10, 8),
+        (4, 16, 4, 5, 6, 3, 16, 3),
+    ),
+    'panel': (_PANEL_OUTLINE, (15, 4, 15, 20)),
+}
+
+
+def _paint_button_icon(canvas, icon, left, top, size, color):
+    unit = size / 24
+    stroke = max(1, size * .065)
+    for path in _BUTTON_ICON_PATHS[icon]:
+        coords = [(top if index % 2 else left) + value * unit for index, value in enumerate(path)]
+        canvas.create_line(coords, fill=color, width=stroke, capstyle='round',
+                           joinstyle='round', tags='button-icon')
+    if icon == 'settings':
+        canvas.create_oval(left + 9 * unit, top + 9 * unit, left + 15 * unit, top + 15 * unit,
+                           outline=color, width=stroke, tags='button-icon')
+    elif icon == 'more':
+        for x in (5, 12, 19):
+            canvas.create_oval(left + (x - 1.45) * unit, top + 10.55 * unit,
+                               left + (x + 1.45) * unit, top + 13.45 * unit,
+                               fill=color, outline='', tags='button-icon')
+
+
 class FlatButton(tk.Canvas):
-    """Canvas button with a minimum width and an optional cap for variable captions."""
+    """Canvas button with an optional vector icon beside or in place of the caption."""
+
+    _ICON_GAP = 7
 
     def __init__(self, parent, text='', command=None, variant='secondary', width=None, height=40,
-                 radius=12, font_size=12, anchor='center', state='normal', *, max_width=None, **kwargs):
+                 radius=12, font_size=12, anchor='center', state='normal', *, max_width=None,
+                 icon=None, icon_side='left', **kwargs):
         self.value, self.command, self.variant = text, command, variant
         self.button_state, self.radius, self.font_size, self.align = state, radius, font_size, anchor
+        self.icon, self.icon_side = icon, icon_side
         self.hovered = False
         self._base_width, self._base_height = width, height
         self._max_width = max_width
+        self._display_scale = display_scale(parent)
         self._font = ui_font(parent, font_size)
         width, height = self._requested_size()
         super().__init__(parent, width=width, height=height, bg=background(parent), bd=0,
@@ -305,17 +390,33 @@ class FlatButton(tk.Canvas):
         self.bind('<Destroy>', lambda e: self._root()._free_ai_buttons.discard(self))
 
     def _requested_size(self):
+        scale = self._display_scale
         text_width = self._font.measure(self.value)
-        padding = 28 if self.align == 'w' or self._base_width is None else 20
-        if self._base_width is not None and self.align == 'center' and len(self.value) == 1:
-            padding = 8
-        width = max(self._base_width if self._base_width is not None else 66, text_width + padding)
-        if self._max_width is not None:
-            width = min(width, self._max_width)
-        height = max(self._base_height, self._font.metrics('linespace') + 8)
+        default_width = self._base_height if self.icon and not self.value else 66
+        base_width = self._base_width if self._base_width is not None else default_width
+        min_width = round(base_width * scale)
+        if self.icon and not self.value:
+            width = self._icon_size() + round(12 * scale)
+        elif self.icon:
+            width = text_width + self._icon_size() + round(self._ICON_GAP * scale) + round(24 * scale)
+        else:
+            padding = 28 if self.align == 'w' or self._base_width is None else 20
+            if self._base_width is not None and self.align == 'center' and len(self.value) == 1:
+                padding = 8
+            width = text_width + round(padding * scale)
+        width = max(min_width, width)
+        max_width = round(self._max_width * scale) if self._max_width is not None else None
+        if max_width is not None:
+            width = min(width, max_width)
+        height = max(round(self._base_height * scale), self._font.metrics('linespace') + round(8 * scale))
         if self._base_width == self._base_height and self.radius >= self._base_height / 2:
             width = height = max(width, height)
+            if self.icon and max_width is not None:
+                width = min(width, max_width)
         return width, height
+
+    def _icon_size(self):
+        return max(18, min(26, self._font.metrics('linespace')))
 
     def _resize_text(self):
         width, height = self._requested_size()
@@ -337,7 +438,10 @@ class FlatButton(tk.Canvas):
     def configure(self, cnf=None, **kwargs):
         if cnf:
             kwargs.update(cnf)
-        for source, target in [('text','value'), ('command','command'), ('variant','variant'), ('state','button_state')]:
+        for source, target in (
+            ('text', 'value'), ('command', 'command'), ('variant', 'variant'), ('state', 'button_state'),
+            ('icon', 'icon'), ('icon_side', 'icon_side'),
+        ):
             if source in kwargs:
                 setattr(self, target, kwargs.pop(source))
         if 'width' in kwargs:
@@ -358,11 +462,48 @@ class FlatButton(tk.Canvas):
             return self.button_state
         if name == 'text':
             return self.value
+        if name == 'icon':
+            return self.icon
+        if name == 'icon_side':
+            return self.icon_side
         return super().cget(name)
 
     def invoke(self):
         if self.button_state != 'disabled' and self.command:
             return self.command()
+
+    def _draw_icon_content(self, width, height, color):
+        scale = self._display_scale
+        inset = round(8 * scale)
+        size = min(self._icon_size(), width - inset, height - inset)
+        if size <= 0:
+            return
+        padding = min(round(12 * scale), (width - size) / 2)
+        gap = round(self._ICON_GAP * scale)
+        available = width - 2 * padding - size - gap
+        text = self.value
+        text_width = self._font.measure(text)
+        if text and text_width > available:
+            if self._font.measure('…') <= available:
+                text = text[:int(len(text) * available / text_width)]
+                while text and self._font.measure(text + '…') > available:
+                    text = text[:-1]
+                text += '…'
+            else:
+                text = ''
+        if not text:
+            _paint_button_icon(self, self.icon, (width - size) / 2, (height - size) / 2, size, color)
+            return
+
+        text_width = self._font.measure(text)
+        content_width = size + gap + text_width
+        left = padding if self.align == 'w' else (width - content_width) / 2
+        if self.icon_side == 'right':
+            icon_left, text_left = left + text_width + gap, left
+        else:
+            icon_left, text_left = left, left + size + gap
+        _paint_button_icon(self, self.icon, icon_left, (height - size) / 2, size, color)
+        self.create_text(text_left, height / 2, text=text, anchor='w', fill=color, font=self._font)
 
     def draw(self, event=None):
         self.delete('all')
@@ -381,6 +522,8 @@ class FlatButton(tk.Canvas):
         w, h = self.winfo_width(), self.winfo_height()
         if w < 3 or h < 3:
             return
+        scale = self._display_scale
+        radius = self.radius * scale
         cyberpunk = _is_cyberpunk(self)
         if cyberpunk:
             outline = fill
@@ -388,28 +531,33 @@ class FlatButton(tk.Canvas):
                 outline = COLORS['card_border'] if self.variant == 'secondary' else COLORS['line']
                 if self.variant == 'primary':
                     outline = fill
-            _chamfered(self, 1, 1, w - 1, h - 1, 7, fill=fill, outline=outline)
+            _chamfered(self, 1, 1, w - 1, h - 1, round(7 * scale), fill=fill, outline=outline)
         else:
             if self._base_width == self._base_height and self.radius >= self._base_height / 2:
                 self.create_oval(1, 1, w-1, h-1, fill=fill, outline=fill)
             else:
-                rounded(self, 1, 1, w-1, h-1, self.radius, fill=fill, outline=fill)
-        text = self.value
-        available = w - (24 if self.align == 'w' else 8)
-        text_width = self._font.measure(text)
-        if text_width > available and len(text) > 1:
-            text = text[:max(0, int(len(text) * available / text_width))]
-            while text and self._font.measure(text + '…') > available:
-                text = text[:-1]
-            text += '…'
-        self.create_text(16 if self.align == 'w' else w/2, h/2, text=text,
-                         anchor=self.align, fill=foreground, font=self._font)
+                rounded(self, 1, 1, w-1, h-1, radius, fill=fill, outline=fill)
+        if self.icon:
+            self._draw_icon_content(w, h, foreground)
+        else:
+            text = self.value
+            available = w - round((24 if self.align == 'w' else 8) * scale)
+            text_width = self._font.measure(text)
+            if text_width > available and len(text) > 1:
+                text = text[:max(0, int(len(text) * available / text_width))]
+                while text and self._font.measure(text + '…') > available:
+                    text = text[:-1]
+                text += '…'
+            self.create_text(round(16 * scale) if self.align == 'w' else w/2, h/2, text=text,
+                             anchor=self.align, fill=foreground, font=self._font)
         if self.focus_get() == self and not disabled:
+            focus = COLORS['focus']
+            if self.variant == 'primary' and (cyberpunk or self.icon):
+                focus = COLORS['primary_fg']
             if cyberpunk:
-                focus = COLORS['primary_fg'] if self.variant == 'primary' else COLORS['focus']
-                _chamfered(self, 3, 3, w - 3, h - 3, 6, fill='', outline=focus, width=1)
+                _chamfered(self, 3, 3, w - 3, h - 3, round(6 * scale), fill='', outline=focus, width=1)
             else:
-                rounded(self, 2, 2, w-2, h-2, self.radius, fill='', outline=COLORS['focus'], width=1)
+                rounded(self, 2, 2, w-2, h-2, radius, fill='', outline=focus, width=1)
 
 
 def label(parent, text='', size=12, bold=False, color=None, **kwargs):

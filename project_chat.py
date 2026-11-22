@@ -1,20 +1,26 @@
-"""Project work embedded in the existing conversation and composer."""
+"""Assistant and project work embedded in the conversation and composer."""
 import json
 import logging
 import os
+import sqlite3
 import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog
+from uuid import UUID
 
 from app_state import CONTEXTS, PROJECT_PERMISSION_MODES
 from paths import ARTIFACTS
 from project_checks import MAX_REPAIR_ATTEMPTS, load_project_check, save_project_check
-from ui_kit import COLORS as C, FONT, FlatButton, label, ui_font
+from ui_kit import COLORS as C, FlatButton, label, ui_font
 
 TITLES = {'remember_memory': '保存长期记忆', 'list_files': '查看项目', 'search_text': '搜索项目',
           'read_file': '读取文件', 'write_file': '写入文件', 'replace_text': '修改文件',
-          'run_command': '运行命令', 'update_plan': '整理计划'}
+          'run_command': '运行命令', 'update_plan': '整理计划',
+          'web_search': '搜索公开网页', 'web_fetch': '读取公开网页',
+          'calculate': '计算', 'check_json': '检查 JSON', 'current_time': '读取系统时间',
+          'summarize_csv': '统计 CSV'}
+WEB_SOURCE_LABELS = {'search': '搜索结果', 'page': '已读取网页'}
 STATES = {'running': '正在执行项目任务', 'executing': '正在执行项目任务', 'checking': '正在验证任务结果',
           'completed': '本轮已结束', 'stopped': '已停止', 'limit': '达到本轮上限', 'failed': '未完成',
           'unfinished': '仍需处理', 'needs_work': '仍需处理', 'interrupted': '上次任务中断',
@@ -33,6 +39,32 @@ PERMISSION_HINTS = {
 }
 CONTINUE_TASK = '继续上次未完成的任务，先检查当前文件和执行结果。'
 INTERRUPTED_ANSWER = '上次项目任务中断，可以从这张任务卡继续。'
+ASSISTANT_CONTINUE_TASK = '继续上次未完成的任务，先检查已有的工具结果。'
+
+
+def assistant_workspace(identity, *, create=False):
+    from project_agent import _pinned, _workspace
+
+    if not isinstance(identity, str):
+        raise ValueError('智能助手会话编号无效。')
+    try:
+        session = UUID(hex=identity)
+    except ValueError as error:
+        raise ValueError('智能助手会话编号无效。') from error
+    if session.hex != identity or session.version != 4:
+        raise ValueError('智能助手会话编号无效。')
+    root = _workspace(ARTIFACTS)
+    parts = ('assistant_workspaces', identity)
+    if create:
+        with _pinned(root, parts, directory=True, create=lambda path, _: path.mkdir(exist_ok=True)):
+            return _workspace(root.joinpath(*parts))
+    return _workspace(root.joinpath(*parts))
+
+
+def is_assistant_workspace(folder):
+    internal = ARTIFACTS / 'assistant_workspaces'
+    selected = Path(folder)
+    return selected.absolute().is_relative_to(internal.absolute()) or selected.resolve().is_relative_to(internal.resolve())
 
 
 def apply_task_state(result, state):
@@ -74,29 +106,34 @@ def recorded_run_changes(run_dir, workspace):
 
 
 class ActivityCard:
-    def __init__(self, controller, workspace, record=None):
+    def __init__(self, controller, workspace, record=None, *, assistant=False):
         self.controller, self.app = controller, controller.app
         self.workspace, self.result, self.assistant_index = workspace, None, None
         self.identity = self.app.session_id
+        self.assistant = record['result'].get('capability_mode') == 'assistant' if record else assistant
         self.activity, self.expanded, self.request, self.steps = '', False, None, 0
-        self.frame = tk.Frame(self.app.transcript, bg=C['bg'], padx=9, pady=4,
-                              highlightthickness=1, highlightbackground=C['line'])
-        self.inner = tk.Frame(self.frame, bg=C['bg'])
+        self.frame = tk.Frame(self.app.transcript, bg=C['side'], padx=12, pady=8, bd=0, highlightthickness=0)
+        self.inner = tk.Frame(self.frame, bg=C['side'])
         self.inner.pack(fill='both', expand=True)
-        self.header = tk.Frame(self.inner, bg=C['bg'])
+        self.header = tk.Frame(self.inner, bg=C['side'])
         self.header.pack(fill='x')
-        self.status = tk.StringVar(value='正在准备项目任务')
-        self.status_label = label(self.header, textvariable=self.status, size=11, anchor='w', justify='left')
+        self.status = tk.StringVar(value='正在准备任务' if self.assistant else '正在准备项目任务')
+        self.status_label = label(self.header, textvariable=self.status, size=11, bold=True, anchor='w', justify='left')
+        self.expand_button = FlatButton(self.header, '详情', self.toggle, variant='ghost', height=26, font_size=10,
+                                        icon='chevron_down', icon_side='right')
+        self.expand_button.pack(side='right', padx=(8, 0))
         self.status_label.pack(side='left', fill='x', expand=True)
-        self.expand_button = FlatButton(self.header, '详情 ▾', self.toggle, variant='ghost', height=26, width=72, font_size=10)
-        self.expand_button.pack(side='right')
-        self.progress = label(self.inner, '', size=10, anchor='w', justify='left')
+        self.progress = label(self.inner, '', size=10, color=C['muted'], anchor='w', justify='left')
+        from reasoning_view import ReasoningPanel
+        self.reasoning_panel = ReasoningPanel(self.inner, on_resize=self.resize)
         self.resume_button = FlatButton(self.inner, '继续任务', lambda: self.controller.resume(self),
                                         variant='primary', height=30, font_size=10)
         self.recovery_button = FlatButton(self.inner, '核实中断后继续', self.confirm_recovery,
                                           variant='ghost', height=30, font_size=10)
-        self.detail = tk.Text(self.inner, bg=C['surface'], fg=C['text'], height=8, width=1,
-                              wrap='word', font=ui_font(self.app.root, 10), bd=0, padx=9, pady=8, state='disabled')
+        self.detail = tk.Text(self.inner, bg=C['surface'], fg=C['text'], height=7, width=1,
+                              wrap='word', font=ui_font(self.app.root, 10), bd=0, padx=10, pady=8,
+                              spacing3=2, state='disabled', highlightbackground=C['surface'])
+        self.detail.tag_configure('heading', font=ui_font(self.app.root, 10, bold=True))
         self.approval_box = tk.Frame(self.inner, bg=C['tint'], padx=10, pady=9)
         self.command_label = label(self.approval_box, '', size=10, anchor='w', justify='left')
         self.command_label.pack(fill='x')
@@ -113,14 +150,16 @@ class ActivityCard:
         self.approve_button = FlatButton(actions, '执行这条命令', lambda: self.decide(True), variant='primary', height=32, font_size=10)
         self.approve_button.pack(side='left')
         FlatButton(actions, '跳过', lambda: self.decide(False), variant='ghost', height=32, font_size=10).pack(side='left', padx=10)
-        self.tools = tk.Frame(self.inner, bg=C['bg'])
+        self.tools = tk.Frame(self.inner, bg=C['side'])
         self.review_button = FlatButton(self.tools, '查看改动', self.toggle_review, variant='ghost',
                                         height=30, font_size=10, state='disabled')
-        self.review_button.pack(side='left')
         self.undo_button = FlatButton(self.tools, '撤回文件修改', self.confirm_undo, variant='ghost', height=30, font_size=10)
-        self.undo_button.pack(side='left', padx=6)
-        FlatButton(self.tools, '打开记录文件夹', self.open_records, variant='ghost', height=30, font_size=10).pack(side='left', padx=6)
-        self.check_tools = tk.Frame(self.inner, bg=C['bg'])
+        if not self.assistant:
+            self.review_button.pack(side='left')
+            self.undo_button.pack(side='left', padx=(4, 0))
+        FlatButton(self.tools, '打开记录文件夹', self.open_records, variant='ghost', height=30,
+                   font_size=10).pack(side='left', padx=(0 if self.assistant else 4, 0))
+        self.check_tools = tk.Frame(self.inner, bg=C['side'])
         self.check_button = FlatButton(self.check_tools, '检查项目结果', self.toggle_check,
                                       variant='ghost', height=30, font_size=10)
         self.check_button.pack(side='left')
@@ -135,7 +174,7 @@ class ActivityCard:
         self.run_check_button = FlatButton(self.check_box, '运行这条检查', lambda: self.controller.verify(self),
                                           variant='primary', height=30, font_size=10)
         self.run_check_button.pack(anchor='w')
-        self.review_box = tk.Frame(self.inner, bg=C['bg'])
+        self.review_box = tk.Frame(self.inner, bg=C['side'])
         self.review_label = label(self.review_box, '本轮项目文件变化', size=10, color=C['muted'], anchor='w')
         self.review_label.pack(fill='x', pady=(3, 4))
         self.review_text = tk.Text(self.review_box, bg=C['surface'], fg=C['text'], height=10, width=1,
@@ -177,16 +216,17 @@ class ActivityCard:
         self._resizing = True
         try:
             available = max(250, self.app.transcript.winfo_width() - 42)
-            width = available if self.expanded or self.request or self.undo_box.winfo_manager() else min(available, 420)
-            self.status_label.configure(wraplength=width - 96)
-            self.progress.configure(wraplength=width - 44)
-            self.command_label.configure(wraplength=width - 44)
-            self.undo_label.configure(wraplength=width - 44)
-            self.check_hint.configure(wraplength=width - 44)
+            width = available if (self.expanded or self.request or self.undo_box.winfo_manager()
+                                  or self.reasoning_panel.text and self.reasoning_panel.expanded) else min(available, 420)
+            inner_width = width - 2 * int(self.frame.cget('padx'))
+            self.status_label.configure(wraplength=inner_width - self.expand_button.winfo_reqwidth() - 8)
+            self.progress.configure(wraplength=inner_width)
+            for widget in (self.command_label, self.undo_label, self.check_hint):
+                widget.configure(wraplength=inner_width - 2 * int(widget.master.cget('padx')))
             self.frame.pack_propagate(False)
             self.frame.configure(width=width)
             self.inner.update_idletasks()
-            self.frame.configure(height=self.inner.winfo_reqheight() + 10)
+            self.frame.configure(height=self.inner.winfo_reqheight() + 2 * int(self.frame.cget('pady')))
         finally:
             self._resizing = False
 
@@ -197,8 +237,9 @@ class ActivityCard:
             anchor = self.progress if self.progress.winfo_manager() else self.header
             self.detail.pack(fill='x', pady=(8, 0), after=anchor)
             if self.result and self.result.get('run_dir'):
-                self.tools.pack(fill='x', pady=(4, 0))
-                self.check_tools.pack(fill='x')
+                self.tools.pack(fill='x', pady=(6, 0))
+                if not self.assistant:
+                    self.check_tools.pack(fill='x')
         else:
             self.detail.pack_forget()
             self.tools.pack_forget()
@@ -206,7 +247,8 @@ class ActivityCard:
             self.check_box.pack_forget()
             self.close_review()
             self.cancel_undo()
-        self.expand_button.configure(text='收起 ▴' if self.expanded else '详情 ▾')
+        self.expand_button.configure(text='收起' if self.expanded else '详情',
+                                     icon=None if self.expanded else 'chevron_down')
         self.resize()
 
     def close_review(self):
@@ -214,6 +256,8 @@ class ActivityCard:
         self.review_button.configure(text='查看改动')
 
     def toggle_check(self):
+        if self.assistant:
+            return
         if self.check_box.winfo_manager():
             self.check_box.pack_forget()
         else:
@@ -224,6 +268,8 @@ class ActivityCard:
         self.resize()
 
     def toggle_review(self):
+        if self.assistant:
+            return
         if self.review_box.winfo_manager():
             self.close_review()
             self.refresh_detail()
@@ -272,8 +318,16 @@ class ActivityCard:
         self.review_text.insert('end', '\n')
 
     def refresh_detail(self):
-        state = (self.result or {}).get('task_state') or {}
+        result = self.result or {}
+        state = result.get('task_state') or {}
         sections = []
+        if result.get('web_sources'):
+            sources = []
+            for source in result['web_sources']:
+                title = ' '.join(source.get('title', '').split())
+                heading = WEB_SOURCE_LABELS[source['kind']]
+                sources.append((heading + ' · ' + title if title else heading) + '\n' + source['url'])
+            sections.append('本轮联网来源\n' + '\n'.join(sources))
         if state.get('plan'):
             sections.append('执行计划\n' + '\n'.join(
                 f'{PLAN_STATES.get(step.get("status"), "待处理")} · {step["text"]}'
@@ -282,8 +336,11 @@ class ActivityCard:
             sections.append('任务累计编辑的文件\n' + '\n'.join(row['path'] for row in state['edits']))
         if state.get('failed_writes'):
             sections.append('待完成的文件修改\n' + '\n'.join(state['failed_writes']))
+        if state.get('failed_utilities'):
+            sections.append('待完成的工具调用\n' + '\n'.join(
+                TITLES.get(tool, tool) for tool in state['failed_utilities']))
         verification = state.get('verification', {})
-        summary = self.verification_summary(state)
+        summary = '' if self.assistant else self.verification_summary(state)
         if summary:
             checks = []
             for check in verification.get('checks', []):
@@ -301,11 +358,43 @@ class ActivityCard:
         snapshot = (self.result or {}).get('snapshot')
         if snapshot:
             sections.append('项目文件快照\n' + snapshot.get('notice', ''))
-        sections.append(self.activity[-50000:] or '暂无执行记录。')
         self.detail.configure(state='normal')
         self.detail.delete('1.0', 'end')
-        self.detail.insert('1.0', '\n\n'.join(sections))
+        for section in sections:
+            heading, newline, body = section.partition('\n')
+            self.detail.insert('end', heading + newline, 'heading')
+            self.detail.insert('end', body + '\n\n')
+        self.detail.insert('end', self.activity[-50000:] or '暂无执行记录。')
         self.detail.configure(state='disabled')
+
+    def record_web_result(self, tool, result, outcome):
+        lines = [TITLES[tool] + ' · ' + outcome]
+        if result.get('query'):
+            lines.append('搜索词 · ' + result['query'])
+        if result.get('url'):
+            lines.append('网页地址 · ' + result['url'])
+        if not result.get('ok') and result.get('message'):
+            lines.append('原因 · ' + str(result['message'])[:1000])
+        elif tool == 'web_search' and result.get('ok'):
+            matches = result.get('results', [])
+            lines.append(f'找到 {len(matches)} 条搜索结果')
+            lines.extend(row['url'] for row in matches)
+        elif result.get('truncated'):
+            lines.append('网页文字已达到读取上限。')
+        if result.get('ok'):
+            sources = {(source['url'], source['kind']): source
+                       for source in self.result.get('web_sources', [])}
+            kind = 'search' if tool == 'web_search' else 'page'
+            rows = result.get('results', []) if kind == 'search' else [result]
+            for row in rows:
+                url = row['url']
+                key = (url, kind)
+                sources.pop(key, None)
+                sources[key] = {'url': url, 'title': row.get('title', ''), 'kind': kind,
+                                'fetched_at': result.get('fetched_at', '')}
+            self.result = {**self.result, 'web_sources': list(sources.values())[-20:]}
+            self.show_progress()
+        self.append('\n'.join(lines))
 
     def append(self, text):
         self.activity = (self.activity + text + '\n').encode('utf-8')[-280000:].decode('utf-8', errors='ignore')
@@ -327,12 +416,24 @@ class ActivityCard:
                 self.result = {**self.result, 'engine': 'harness'}
             if event.get('run_dir'):
                 self.result = {**self.result, 'run_dir': event['run_dir'], 'continuation_available': True}
-            if mode in PROJECT_PERMISSION_MODES:
+            if not self.assistant and mode in PROJECT_PERMISSION_MODES:
                 self.result = {**self.result, 'permission_mode': mode}
                 self.append('权限 · ' + PERMISSION_LABELS[mode])
             self.result = apply_task_state(self.result, event.get('task_state'))
-            self.status.set(STATES['running'])
+            self.status.set('智能助手正在处理' if self.assistant else STATES['running'])
             self.show_progress()
+        elif kind == 'model_start':
+            self.status.set('正在分析任务 · 第 ' + str(event.get('round', 1)) + ' 轮')
+        elif kind == 'reasoning':
+            text = event.get('text')
+            if isinstance(text, str) and text:
+                self.result = {**(self.result or {}), 'reasoning': text[:24000]}
+                self.reasoning_panel.set_text(text)
+                self.reasoning_panel.pack(fill='x', pady=(6, 0), after=self.header)
+                self.status.set('模型正在思考…')
+        elif kind == 'model_end':
+            self.reasoning_panel.finish()
+            self.status.set('正在整理结果…')
         elif kind == 'progress':
             task_state = event.get('task_state')
             if isinstance(task_state, dict):
@@ -349,18 +450,25 @@ class ActivityCard:
                 if result.get('status') == 'exited' and 'returncode' in result:
                     outcome = '退出码 ' + str(result['returncode'])
             self.status.set(f'{title} · {outcome} · {self.steps} 步')
-            self.append(title)
-            if 'returncode' in result:
-                self.append('退出码：' + str(result['returncode']))
-            for key in ('path', 'content', 'stdout', 'stderr', 'message'):
-                if result.get(key):
-                    self.append(str(result[key])[:6000])
-            if result.get('files'):
-                self.append('\n'.join(result['files']))
-            if result.get('matches'):
-                self.append('\n'.join(f'{match["path"]}:{match["line"]}' for match in result['matches']))
-            if result.get('instruction_files'):
-                self.append('读取项目规范 · ' + '、'.join(result['instruction_files']))
+            if tool in ('web_search', 'web_fetch'):
+                self.record_web_result(tool, result, outcome)
+            else:
+                self.append(title)
+                if tool in ('calculate', 'check_json', 'current_time', 'summarize_csv'):
+                    evidence = result.get('evidence')
+                    if isinstance(evidence, dict):
+                        self.append(json.dumps(evidence, ensure_ascii=False)[:6000])
+                if 'returncode' in result:
+                    self.append('退出码：' + str(result['returncode']))
+                for key in ('path', 'content', 'stdout', 'stderr', 'message'):
+                    if result.get(key):
+                        self.append(str(result[key])[:6000])
+                if result.get('files'):
+                    self.append('\n'.join(result['files']))
+                if result.get('matches'):
+                    self.append('\n'.join(f'{match["path"]}:{match["line"]}' for match in result['matches']))
+                if result.get('instruction_files'):
+                    self.append('读取项目规范 · ' + '、'.join(result['instruction_files']))
         elif kind == 'plan':
             steps = event.get('steps', [])
             if all(isinstance(step, str) for step in steps):
@@ -375,13 +483,13 @@ class ActivityCard:
             self.append(title + ('\n' + '\n'.join(files) if files else ''))
         elif kind != 'finish':
             self.status.set(title + '…')
-        if kind in ('start', 'progress', 'tool_result', 'plan', 'instructions', 'context', 'resume', 'harness_text'):
+        if kind in ('start', 'progress', 'tool_result', 'plan', 'instructions', 'context', 'resume', 'harness_text', 'reasoning'):
             self.controller.save_card(self)
         self.resize()
         self.controller.refresh_summary()
 
     def show_approval(self, request):
-        if self.app.generation_cancel.is_set() or self.controller.active is not self:
+        if self.assistant or self.app.generation_cancel.is_set() or self.controller.active is not self:
             request['ready'].set()
             return
         self.request = request
@@ -423,24 +531,37 @@ class ActivityCard:
 
     def finish(self, result):
         self.decide(False)
+        if self.reasoning_panel.text and not result.get('reasoning'):
+            result = {**result, 'reasoning': self.reasoning_panel.text}
         self.result = result
+        if result.get('reasoning'):
+            self.reasoning_panel.set_text(result['reasoning'])
+            self.reasoning_panel.pack(fill='x', pady=(6, 0), after=self.header)
+        self.reasoning_panel.finish()
         snapshot = result.get('snapshot') or {}
         supported = bool(result.get('snapshot_dir') and snapshot.get('status') in ('ready', 'partial'))
-        count = snapshot.get('count', 0) if supported else len({row['path'] for row in result.get('changes', [])})
-        self.status.set(STATES.get(result.get('status'), '任务结束') + (f' · 修改 {count} 个文件' if count else ''))
+        count = 0 if self.assistant else (
+            snapshot.get('count', 0) if supported else len({row['path'] for row in result.get('changes', [])}))
+        self.status.set(self.status_text(result.get('status')) + (f' · 修改 {count} 个文件' if count else ''))
         self.show_progress()
         if '[已撤回文件修改]' in self.activity:
             self.status.set('已执行文件撤回 · 展开过程查看结果')
         if self.expanded and result.get('run_dir'):
-            self.tools.pack(fill='x', pady=(4, 0))
-            self.check_tools.pack(fill='x')
-        legacy = result.get('engine') != 'harness' and not supported
+            self.tools.pack(fill='x', pady=(6, 0))
+            if not self.assistant:
+                self.check_tools.pack(fill='x')
+        legacy = not self.assistant and result.get('engine') != 'harness' and not supported
         self.review_button.configure(state='normal' if result.get('run_dir') and (supported or legacy) else 'disabled')
         self.undo_button.configure(state='normal' if (supported or legacy) and count and '[已撤回文件修改]' not in self.activity else 'disabled')
         if result.get('acceptance', {}).get('argv'):
             self.check_command.set(json.dumps(result['acceptance']['argv'], ensure_ascii=False))
         self.sync_resume()
         self.resize()
+
+    def status_text(self, status):
+        if self.assistant and status == 'completed':
+            return '已回复'
+        return STATES.get(status, '任务结束')
 
     def show_progress(self):
         result = self.result or {}
@@ -451,13 +572,20 @@ class ActivityCard:
             complete = sum(step.get('status') == 'completed' for step in plan)
             current = next((step['text'] for step in plan if step.get('status') == 'in_progress'), '')
             lines.append(f'计划进度 {complete}/{len(plan)}' + (' · ' + current if current else ''))
-        check_summary = self.verification_summary(state)
+        check_summary = '' if self.assistant else self.verification_summary(state)
         if check_summary:
             lines.append(check_summary)
         if state.get('uncertain') or (result.get('status') == 'interrupted' and state.get('phase') == 'executing'):
             lines.append('上次操作结果仍需核实')
         if result.get('engine') == 'harness':
             lines.append('DeepSeek Harness · 执行结果需验收')
+        if result.get('web_sources'):
+            counts = []
+            for kind, source_label in WEB_SOURCE_LABELS.items():
+                count = sum(source['kind'] == kind for source in result['web_sources'])
+                if count:
+                    counts.append(f'{source_label} {count} 条')
+            lines.append('联网来源 · ' + ' · '.join(counts))
         snapshot = result.get('snapshot') or {}
         if snapshot.get('status') in ('ready', 'partial'):
             lines.append('已保存本轮项目文件快照' if snapshot.get('status') == 'ready' else '项目文件快照仅覆盖部分内容，详情可查看范围')
@@ -473,11 +601,11 @@ class ActivityCard:
                 summary += '（历史结果）'
             lines.append('项目固定检查 · ' + summary)
         mode = result.get('permission_mode')
-        if mode in ('readonly', 'automatic'):
+        if not self.assistant and mode in ('readonly', 'automatic'):
             lines.append('权限 · ' + PERMISSION_LABELS[mode])
         self.progress.configure(text='\n'.join(lines))
         if lines:
-            self.progress.pack(fill='x', pady=(5, 0), after=self.header)
+            self.progress.pack(fill='x', pady=(2, 0), after=self.header)
         else:
             self.progress.pack_forget()
         if self.expanded:
@@ -508,7 +636,8 @@ class ActivityCard:
             self.recovery_button.configure(state='disabled' if self.app.busy else 'normal')
         else:
             self.recovery_button.pack_forget()
-        self.run_check_button.configure(state='disabled' if self.app.busy or self.controller.permission_mode.get() == 'readonly' else 'normal')
+        self.run_check_button.configure(state='disabled' if self.assistant or self.app.busy
+            or self.controller.permission_mode.get() == 'readonly' else 'normal')
 
     def confirm_recovery(self):
         state = (self.result or {}).get('task_state') or {}
@@ -517,15 +646,17 @@ class ActivityCard:
         operations = [TITLES.get(row['tool'], row['tool']) + ' · ' + row['subject']
                       for row in state.get('unresolved', [])]
         details = '\n'.join(operations) or '上次记录未提供具体操作，请查看运行记录。'
+        instructions = ('请先核实这些工具是否已执行。确认继续任务吗？' if self.assistant else
+            '请先检查相关文件、命令是否已执行及其副作用。'
+            '你已核实这些操作的实际结果，确认继续任务吗？未完成的检查仍需执行。')
         confirmed = messagebox.askyesno('核实中断后继续',
-            '待核实的操作\n' + details + '\n\n请先检查相关文件、命令是否已执行及其副作用。'
-            '你已核实这些操作的实际结果，确认继续任务吗？未完成的检查仍需执行。',
+            '待核实的操作\n' + details + '\n\n' + instructions,
             parent=self.app.root, default=messagebox.NO)
         if confirmed:
             self.controller.resume(self, recovery_confirmed=True)
 
     def confirm_undo(self):
-        if not self.app.busy:
+        if not self.assistant and not self.app.busy:
             if ((self.result or {}).get('snapshot_dir')
                     and ((self.result or {}).get('snapshot') or {}).get('status') in ('ready', 'partial')):
                 self.undo_label.configure(text='选择要恢复到任务开始前的文件。任务运行期间你自己的编辑也可能列在这里，请逐项核对。任务结束后又改过的文件会保留。未列出的文件和外部操作不受此撤回影响。')
@@ -558,9 +689,12 @@ class ActivityCard:
 
     def destroy(self):
         # Release callbacks that retain the card so its Tk variables are freed on the UI thread.
-        for button in (self.expand_button, self.resume_button, self.recovery_button, self.undo_button, self.review_button,
-                       self.check_button, self.run_check_button, self.undo_select_all):
-            button.command = None
+        widgets = self.frame.winfo_children()
+        while widgets:
+            widget = widgets.pop()
+            if isinstance(widget, FlatButton):
+                widget.command = None
+            widgets.extend(widget.winfo_children())
         self.frame.destroy()
 
 
@@ -572,17 +706,22 @@ class ProjectConversation:
         self.permission_mode = tk.StringVar(value='standard')
         self.menu_permission_mode = tk.StringVar(value='standard')
         self.allow_write = tk.BooleanVar(value=True)
+        self.allow_web = tk.BooleanVar(value=False)
+        self.menu_allow_web = tk.BooleanVar(value=False)
+        self.assistant_enabled = tk.BooleanVar(value=True)
+        self.menu_assistant_enabled = tk.BooleanVar(value=True)
         self.use_memory = tk.BooleanVar(value=False)
         self.bar = tk.Frame(app.context_bar, bg=C['bg'])
         self.bar.pack(fill='x')
-        self.folder_button = FlatButton(self.bar, '选择项目 ▾', self.choose_workspace,
-                                        variant='ghost', height=32, max_width=200, font_size=11)
-        self.chat_button = FlatButton(self.bar, '日常对话', lambda: self.set_mode(False),
+        self.folder_button = FlatButton(self.bar, '选择项目', self.choose_workspace,
+                                        variant='ghost', height=32, max_width=200, font_size=11, icon='folder')
+        self.chat_button = FlatButton(self.bar, '智能助手', lambda: self.set_mode(False),
                                       variant='selected', height=32, font_size=11)
         self.project_button = FlatButton(self.bar, '项目助手', lambda: self.set_mode(True),
                                          variant='ghost', height=32, font_size=11)
-        self.permissions_button = FlatButton(app.composer_tools, '逐条确认命令 ▾', self.show_permissions,
-                                             variant='ghost', height=30, font_size=10)
+        self.permissions_button = FlatButton(app.composer_tools, '助手能力', self.show_permissions,
+                                             variant='ghost', height=30, font_size=10,
+                                             icon='chevron_down', icon_side='right')
         self.permissions_menu = tk.Menu(app.root, tearoff=0, bg=C['surface'], fg=C['text'],
                                         activebackground=C['tint'], activeforeground=C['text'])
         for mode, title in PERMISSION_LABELS.items():
@@ -592,11 +731,21 @@ class ProjectConversation:
         self.permissions_menu.add_checkbutton(label='允许文件工具修改', variable=self.allow_write,
                                              command=self.save_file_permission)
         self.write_permission_option = self.permissions_menu.index('end')
+        self.permissions_menu.add_checkbutton(label='允许联网查资料', variable=self.menu_allow_web,
+                                             command=self.save_web_permission)
+        self.web_permission_option = self.permissions_menu.index('end')
+        self.permissions_menu.add_checkbutton(label='自动使用工具', variable=self.menu_assistant_enabled,
+                                             command=self.save_assistant_permission)
+        self.assistant_permission_option = self.permissions_menu.index('end')
         self.permissions_menu.add_checkbutton(label='参考经验', variable=self.use_memory, command=self.save_settings)
+        self.memory_permission_option = self.permissions_menu.index('end')
         self.permissions_menu.add_separator()
-        self.permissions_menu.add_command(label='在编辑器中打开项目', command=self.open_project_in_editor)
-        self.permissions_menu.add_command(label='固定项目检查…', command=self.configure_fixed_check)
-        self.permissions_menu.add_command(label='在终端中打开项目', command=self.open_project_terminal)
+        self.project_menu_options = list(range(len(PERMISSION_LABELS)))
+        for title, command in (('在编辑器中打开项目', self.open_project_in_editor),
+                               ('固定项目检查…', self.configure_fixed_check),
+                               ('在终端中打开项目', self.open_project_terminal)):
+            self.permissions_menu.add_command(label=title, command=command)
+            self.project_menu_options.append(self.permissions_menu.index('end'))
         self.location = label(self.bar, '', size=9, color=C['muted'])
         app.transcript.bind('<Configure>', lambda event: self.resize_cards(), add='+')
         self.bar.bind('<Configure>', lambda event: self.layout_bar())
@@ -630,8 +779,9 @@ class ProjectConversation:
             self.app.memories.refresh()
 
     def show_permissions(self):
-        if self.app.busy or not self.enabled.get():
+        if self.app.busy:
             return
+        self.menu_assistant_enabled.set(self.assistant_enabled.get())
         button = self.permissions_button
         try:
             self.permissions_menu.tk_popup(button.winfo_rootx(), button.winfo_rooty() + button.winfo_height())
@@ -644,24 +794,31 @@ class ProjectConversation:
         self.project_button.configure(variant='selected' if enabled else 'ghost')
         workspace = self.workspace.get()
         name = Path(workspace).name or workspace
-        self.folder_button.configure(text=(name or '选择项目') + ' ▾')
+        self.folder_button.configure(text=name or '选择项目')
         self.location.configure(text='项目：' + (workspace or '尚未选择'))
+        hints = ['Ctrl + Enter 发送 · Enter 换行']
         if enabled:
             mode = self.permission_mode.get()
-            self.permissions_button.configure(text=PERMISSION_LABELS[mode] + ' ▾')
-            hints = ['本地处理' if self.app.backend == 'local' else '任务和读取的文件将发往已选 API',
-                     PERMISSION_HINTS[mode]]
+            self.permissions_button.configure(text=PERMISSION_LABELS[mode])
+            if self.app.backend != 'local':
+                hints.append('任务和读取的文件将发往已选 API')
+            if mode != 'standard':
+                hints.append(PERMISSION_HINTS[mode])
             if mode == 'automatic':
                 hints.append('文件工具限于所选项目')
             if mode != 'readonly':
                 hints.append('文件工具修改可撤回' if self.allow_write.get() else '文件工具修改关闭')
-            if CONTEXTS[self.app.context.get()] < 16384:
-                hints.append('项目使用 16K 记忆容量')
-            self.app.chat_hint.set(' · '.join(hints))
+            hints.append('内置执行可自动搜索和读取公开网页' if self.allow_web.get() else '联网查资料关闭')
             self.app.skill_button.configure(state='disabled')
         else:
+            self.permissions_button.configure(text='助手能力')
             self.app.skill_button.configure(state='normal')
-            self.app.chat_hint.set('Ctrl + Enter 发送 · Enter 换行')
+            if self.assistant_enabled.get():
+                hints.append('允许联网查资料' if self.allow_web.get() else '联网查资料关闭')
+            else:
+                hints.append('自动使用工具关闭')
+        self.app.chat_hint.set(' · '.join(hints))
+        self.menu_assistant_enabled.set(self.assistant_enabled.get())
         self.layout_bar()
         self.sync_busy()
         self.app.layout_composer_tools()
@@ -706,6 +863,39 @@ class ProjectConversation:
         self.save_settings()
         self.refresh()
 
+    def save_web_permission(self):
+        current = self.allow_web.get()
+        if self.app.busy:
+            self.menu_allow_web.set(current)
+            self.app.status.set('先停止当前任务，再更改联网权限。')
+            return
+        allowed = self.menu_allow_web.get()
+        try:
+            self.save_settings(allow_web=allowed)
+        except Exception:
+            logging.exception('Web permission update failed')
+            self.menu_allow_web.set(current)
+            self.app.status.set('未能保存联网权限。')
+            return
+        self.allow_web.set(allowed)
+        self.refresh()
+
+    def save_assistant_permission(self):
+        current = self.assistant_enabled.get()
+        if self.app.busy or self.enabled.get():
+            self.menu_assistant_enabled.set(current)
+            return
+        enabled = self.menu_assistant_enabled.get()
+        try:
+            self.save_settings(assistant_enabled=enabled)
+        except Exception:
+            logging.exception('Assistant tool permission update failed')
+            self.menu_assistant_enabled.set(current)
+            self.app.status.set('未能保存助手工具设置。')
+            return
+        self.assistant_enabled.set(enabled)
+        self.refresh()
+
     def configure_fixed_check(self):
         if self.app.busy:
             return
@@ -730,12 +920,14 @@ class ProjectConversation:
         except (ValueError, OSError, RuntimeError) as error:
             self.app.status.set(str(error))
 
-    def save_settings(self, **overrides):
-        if self.app.session_id:
-            self.app.sessions.set_project_settings(self.app.session_id, {
+    def save_settings(self, *, session_id=None, **overrides):
+        identity = session_id if session_id is not None else self.app.session_id
+        if identity:
+            self.app.sessions.set_project_settings(identity, {
                 'enabled': self.enabled.get(), 'workspace': self.workspace.get(),
                 'allow_write': self.allow_write.get(), 'use_memory': self.use_memory.get(),
-                'permission_mode': self.permission_mode.get(), **overrides})
+                'permission_mode': self.permission_mode.get(), 'allow_web': self.allow_web.get(),
+                'assistant_enabled': self.assistant_enabled.get(), **overrides})
 
     def choose_workspace(self):
         if self.app.busy:
@@ -744,6 +936,13 @@ class ProjectConversation:
         if not folder:
             return
         folder = str(Path(folder).absolute())
+        try:
+            if is_assistant_workspace(folder):
+                self.app.status.set('智能助手的记录目录不能作为项目。')
+                return
+        except (OSError, ValueError, RuntimeError) as error:
+            self.app.status.set(str(error))
+            return
         if Path(folder) == Path(self.workspace.get()):
             if not self.enabled.get():
                 self.set_mode(True)
@@ -777,23 +976,28 @@ class ProjectConversation:
         if not isinstance(mode, str) or mode not in PROJECT_PERMISSION_MODES:
             mode = 'standard' if allow_write else 'readonly'
         self.apply_permission(mode, allow_write)
+        self.allow_web.set(settings.get('allow_web') is True)
+        self.menu_allow_web.set(self.allow_web.get())
+        self.assistant_enabled.set(settings.get('assistant_enabled', True) is not False)
+        self.menu_assistant_enabled.set(self.assistant_enabled.get())
         self.use_memory.set(settings.get('use_memory', False))
         self.refresh()
         rows = self.app.sessions.project_runs(identity) if identity else []
         for row in rows:
             result = row['result']
+            assistant = result.get('capability_mode') == 'assistant'
             if result.get('acceptance'):
                 result['acceptance'] = {**result['acceptance'], 'stale': True}
             if result.get('fixed_check'):
                 result['fixed_check'] = {**result['fixed_check'], 'stale': True}
-            if result.get('snapshot_dir') and not result.get('snapshot'):
+            if not assistant and result.get('snapshot_dir') and not result.get('snapshot'):
                 try:
                     from project_snapshot import describe_snapshot
                     result['snapshot'] = describe_snapshot(ARTIFACTS / 'project_snapshots', result['snapshot_dir'], row['workspace'])
                 except (OSError, ValueError, RuntimeError):
                     result['snapshot'] = {'status': 'unavailable', 'files': [], 'count': 0,
                                           'notice': '无法读取已保存的项目快照，请检查记录文件夹。'}
-            if result.get('engine') != 'harness' and result.get('run_dir') and (result.get('status') in ACTIVE_STATES | {'interrupted'}
+            if not assistant and result.get('engine') != 'harness' and result.get('run_dir') and (result.get('status') in ACTIVE_STATES | {'interrupted'}
                                           or (result.get('task_state') or {}).get('parent_run')):
                 result = {**result, 'changes': recorded_run_changes(result['run_dir'], row['workspace'])}
                 row['result'] = result
@@ -802,11 +1006,16 @@ class ProjectConversation:
             if result.get('run_dir'):
                 from agent_task_state import load_task
                 try:
+                    if assistant and Path(row['workspace']) != assistant_workspace(identity):
+                        raise ValueError('智能助手任务不属于此会话。')
                     state = load_task(ARTIFACTS / 'project_runs', result['run_dir'], row['workspace']).export()
                     result = apply_task_state(result, {**state, 'status': 'interrupted'})
                 except (OSError, ValueError, RuntimeError):
                     pass
-            answer = INTERRUPTED_ANSWER if result.get('continuation_available') else '上次项目任务中断。'
+            interrupted = '上次任务中断。' if assistant else '上次项目任务中断。'
+            answer = interrupted
+            if result.get('continuation_available'):
+                answer = '上次任务中断，可以从这张任务卡继续。' if assistant else INTERRUPTED_ANSWER
             result = {**result, 'status': 'interrupted', 'answer': answer}
             row['result'] = result
             index = row['assistant_index']
@@ -824,12 +1033,17 @@ class ProjectConversation:
 
     def sync_busy(self):
         state = 'disabled' if self.app.busy else 'normal'
+        project_state = state if self.enabled.get() else 'disabled'
         for button in (self.chat_button, self.project_button, self.folder_button, self.permissions_button):
             button.configure(state=state)
-        for index in range(len(PERMISSION_LABELS)):
-            self.permissions_menu.entryconfigure(index, state=state)
+        for index in self.project_menu_options:
+            self.permissions_menu.entryconfigure(index, state=project_state)
         self.permissions_menu.entryconfigure(self.write_permission_option,
-            state='disabled' if self.permission_mode.get() == 'readonly' else state)
+            state='disabled' if self.permission_mode.get() == 'readonly' else project_state)
+        self.permissions_menu.entryconfigure(self.web_permission_option, state=state)
+        self.permissions_menu.entryconfigure(self.assistant_permission_option,
+            state='disabled' if self.enabled.get() else state)
+        self.permissions_menu.entryconfigure(self.memory_permission_option, state=project_state)
         for card in self.cards:
             card.sync_resume()
         if self.enabled.get():
@@ -886,7 +1100,7 @@ class ProjectConversation:
 
     def verify(self, card):
         app = self.app
-        if app.busy or card not in self.cards or not card.result or not card.result.get('run_dir'):
+        if app.busy or card.assistant or card not in self.cards or not card.result or not card.result.get('run_dir'):
             return
         if self.permission_mode.get() == 'readonly':
             app.status.set('只看项目模式不能运行检查，请先选择命令权限。')
@@ -945,6 +1159,9 @@ class ProjectConversation:
     def resume(self, card, *, recovery_confirmed=False):
         if self.app.busy or card not in self.cards or not card.can_resume():
             return
+        if card.assistant:
+            self.send(resume_from=card.result['run_dir'], recovery_confirmed=recovery_confirmed, assistant=True)
+            return
         try:
             folder = self.workspace.get().strip()
             same_workspace = bool(folder) and Path(folder).resolve(strict=True) == Path(card.workspace).resolve(strict=True)
@@ -957,25 +1174,10 @@ class ProjectConversation:
             self.set_mode(True)
         self.send(resume_from=card.result['run_dir'], recovery_confirmed=recovery_confirmed)
 
-    def send(self, *, resume_from=None, recovery_confirmed=False, repair_attempt=0):
+    def send(self, *, resume_from=None, recovery_confirmed=False, repair_attempt=0, assistant=False):
         app = self.app
         if app.busy:
             return
-        draft = '' if repair_attempt else app.input.get('1.0', 'end').strip()
-        task = (f'自动续修 {repair_attempt}/{MAX_REPAIR_ATTEMPTS}：固定检查未通过。请根据实际失败输出修复原任务，程序会重新检查。'
-                if repair_attempt else draft or (CONTINUE_TASK if resume_from else ''))
-        folder = self.workspace.get().strip()
-        if not task:
-            return
-        if not folder or not Path(folder).is_dir():
-            app.status.set('先选择这段对话的项目文件夹，输入内容会保留。')
-            return
-        if not repair_attempt and (app.image_path or app.skill_file):
-            app.status.set('做项目暂时只处理文字文件。请先在 + 菜单移除图片或 CSV 附件，草稿会保留。')
-            return
-        from harness_settings import load_preferences as load_execution_preferences
-        execution = load_execution_preferences(app.sessions)
-        engine = execution['engine']
         source = None
         resume_notice = ''
         if resume_from:
@@ -983,7 +1185,46 @@ class ProjectConversation:
             if source is None:
                 app.status.set('无法找到原任务，草稿已保留。')
                 return
-            engine = source.result.get('engine', 'builtin')
+            assistant = source.assistant
+        draft = '' if repair_attempt else app.input.get('1.0', 'end').strip()
+        continue_task = ASSISTANT_CONTINUE_TASK if assistant else CONTINUE_TASK
+        task = (f'自动续修 {repair_attempt}/{MAX_REPAIR_ATTEMPTS}：固定检查未通过。请根据实际失败输出修复原任务，程序会重新检查。'
+                if repair_attempt else draft or (continue_task if resume_from else ''))
+        folder = self.workspace.get().strip()
+        if not task:
+            return
+        if assistant:
+            if app.image_path:
+                app.status.set('此任务使用文字和 CSV。请先移除图片，草稿会保留。')
+                return
+            csv_path = app.skill_file
+            if source and source.result.get('csv_attachment') and not csv_path:
+                app.status.set('继续这条任务前，请从 + 菜单重新选择要分析的 CSV 文件。')
+                return
+            if csv_path and not Path(csv_path).is_file():
+                app.status.set('找不到已选择的 CSV 文件。请重新选择，当前草稿仍保留。')
+                return
+            engine = 'builtin'
+        else:
+            if not folder or not Path(folder).is_dir():
+                app.status.set('先选择这段对话的项目文件夹，输入内容会保留。')
+                return
+            try:
+                if is_assistant_workspace(folder):
+                    app.status.set('智能助手的记录目录不能作为项目。')
+                    return
+                if source and Path(folder).resolve(strict=True) != Path(source.workspace).resolve(strict=True):
+                    app.status.set('请选择这条任务原来的项目文件夹，再继续任务。')
+                    return
+            except (OSError, ValueError, RuntimeError) as error:
+                app.status.set(str(error))
+                return
+            if not repair_attempt and (app.image_path or app.skill_file):
+                app.status.set('做项目暂时只处理文字文件。请先在 + 菜单移除图片或 CSV 附件，草稿会保留。')
+                return
+            from harness_settings import load_preferences as load_execution_preferences
+            execution = load_execution_preferences(app.sessions)
+            engine = source.result.get('engine', 'builtin') if source else execution['engine']
         if engine == 'harness':
             try:
                 from harness_agent import validate_selection, resolve_resume, validate_task
@@ -1006,6 +1247,8 @@ class ProjectConversation:
         if local:
             from model_catalog import is_chat_model
             if not is_chat_model(app.manager.catalog, app.selected_model) or not app.manager.ready(app.selected_model):
+                if assistant:
+                    app.show_capabilities('models')
                 app.status.set('请先选择已下载的文字模型，或接通 API；草稿会保留。')
                 return
             from local_project_model import LocalProjectModel
@@ -1014,51 +1257,75 @@ class ProjectConversation:
             try:
                 model = app.make_api_client()
             except Exception:
+                if assistant:
+                    app.show_api_settings()
                 app.status.set('API 配置不可用，请在设置里检查；草稿会保留。')
                 return
-        identity, history = app.session_id, list(app.history)
+        identity = app.session_id
+        if assistant:
+            try:
+                if identity is None:
+                    identity = app.sessions.create()
+                internal = assistant_workspace(identity, create=source is None)
+                if source and (source.identity != identity or Path(source.workspace) != internal):
+                    raise ValueError('智能助手任务不属于此会话。')
+                folder = internal
+            except (OSError, ValueError, RuntimeError, sqlite3.Error) as error:
+                app.status.set(f'无法准备智能助手的记录目录，草稿会保留。{error}')
+                return
+        history = list(app.history)
         workspace = str(Path(folder).absolute())
-        previous_workspace = None
-        for previous in self.cards:
-            index = getattr(previous, 'history_index', previous.assistant_index)
-            if index is None or not 0 <= index < len(history) or history[index]['role'] != 'assistant':
-                continue
-            reply = history[index]
-            history[index] = {**reply, 'content': '该项目回复对应的工作区：' + previous.workspace + '\n\n' + reply['content']}
-            previous_workspace = previous.workspace
         model_task = task
-        if previous_workspace and os.path.normcase(previous_workspace) != os.path.normcase(workspace):
-            model_task += '\n\n本轮已切换项目目录。请先重新检查当前工作区的文件。历史项目操作的结果仅适用于其标注的工作区。'
-        if source and source.result.get('acceptance'):
+        if not assistant:
+            previous_workspace = None
+            for previous in self.cards:
+                index = getattr(previous, 'history_index', previous.assistant_index)
+                if previous.assistant or index is None or not 0 <= index < len(history) or history[index]['role'] != 'assistant':
+                    continue
+                reply = history[index]
+                history[index] = {**reply, 'content': '该项目回复对应的工作区：' + previous.workspace + '\n\n' + reply['content']}
+                previous_workspace = previous.workspace
+            if previous_workspace and os.path.normcase(previous_workspace) != os.path.normcase(workspace):
+                model_task += '\n\n本轮已切换项目目录。请先重新检查当前工作区的文件。历史项目操作的结果仅适用于其标注的工作区。'
+        if not assistant and source and source.result.get('acceptance'):
             from project_verification import format_verification_context
             model_task += '\n\n用户在本机运行的上轮检查结果（历史证据，需要重跑）：\n' + format_verification_context(source.result['acceptance'])
-        if source and source.result.get('fixed_check'):
+        if not assistant and source and source.result.get('fixed_check'):
             from project_verification import format_verification_context
             model_task += '\n\n' + format_verification_context(source.result['fixed_check'])
-        try:
-            fixed_command = load_project_check(app.sessions, workspace)
-        except (ValueError, OSError, RuntimeError) as error:
-            app.status.set(f'无法读取固定项目检查，请在项目菜单重新配置。{error}')
-            return
+        fixed_command = ''
+        if not assistant:
+            try:
+                fixed_command = load_project_check(app.sessions, workspace)
+            except (ValueError, OSError, RuntimeError) as error:
+                app.status.set(f'无法读取固定项目检查，请在项目菜单重新配置。{error}')
+                return
         if engine == 'harness':
             try:
                 validate_task(model_task)
             except ValueError as error:
                 app.status.set(str(error))
                 return
-        if app.session_id is None:
-            app.session_id = app.sessions.create()
-        identity = app.session_id
-        self.save_settings()
-        self.invalidate_checks(workspace)
         context = max(16384, CONTEXTS[app.context.get()])
-        permission_mode = self.permission_mode.get()
-        allow_write, use_memory = self.allow_write.get(), self.use_memory.get()
+        permission_mode = 'readonly' if assistant else self.permission_mode.get()
+        allow_write, use_memory = not assistant and self.allow_write.get(), not assistant and self.use_memory.get()
+        allow_web = self.allow_web.get() and engine == 'builtin'
         personal_options = app.memories.snapshot(app.backend)
-        if not repair_attempt and hasattr(app, 'draft_session_id'):
-            app.sessions.append(identity, 'user', task, draft_from=app.draft_session_id)
-        else:
-            app.sessions.append(identity, 'user', task)
+        try:
+            if identity is None:
+                identity = app.sessions.create()
+            self.save_settings(session_id=identity)
+            if not repair_attempt and hasattr(app, 'draft_session_id'):
+                app.sessions.append(identity, 'user', task, draft_from=app.draft_session_id)
+            else:
+                app.sessions.append(identity, 'user', task)
+        except (OSError, sqlite3.Error, ValueError):
+            logging.exception('Task submission could not be saved')
+            app.status.set('未能保存会话，草稿会保留。')
+            return
+        app.session_id = identity
+        if not assistant:
+            self.invalidate_checks(workspace)
         app.history.append({'role': 'user', 'content': task})
         app.append_heading('自动续修' if repair_attempt else '你', 'user')
         app.write(app.transcript, task + '\n\n', True)
@@ -1073,13 +1340,20 @@ class ProjectConversation:
         app.update_placeholder()
         app.layout_chat()
         app.root.update_idletasks()
-        card = ActivityCard(self, workspace)
-        initial_result = {'status': 'running', 'answer': '项目任务执行中。', 'run_dir': '',
-                          'changes': [], 'continuation_available': False, 'permission_mode': permission_mode,
-                          'engine': engine}
-        if source and source.result.get('acceptance'):
+        card = ActivityCard(self, workspace, assistant=assistant)
+        initial_result = {'status': 'running', 'answer': '任务执行中。' if assistant else '项目任务执行中。',
+                          'run_dir': '', 'changes': [], 'continuation_available': False, 'engine': engine}
+        if assistant:
+            initial_result['capability_mode'] = 'assistant'
+            if csv_path:
+                initial_result['csv_attachment'] = True
+        else:
+            initial_result['permission_mode'] = permission_mode
+        if engine == 'builtin':
+            initial_result['allow_web'] = allow_web
+        if not assistant and source and source.result.get('acceptance'):
             initial_result['acceptance'] = {**source.result['acceptance'], 'stale': True}
-        if source and source.result.get('fixed_check'):
+        if not assistant and source and source.result.get('fixed_check'):
             initial_result['fixed_check'] = {**source.result['fixed_check'], 'stale': True}
         card.result = initial_result
         if resume_notice:
@@ -1126,7 +1400,7 @@ class ProjectConversation:
             runner = None
             try:
                 from project_agent import ProjectAgent
-                if permission_mode != 'readonly':
+                if not assistant and permission_mode != 'readonly':
                     from project_snapshot import start_snapshot
                     snapshot_state['directory'] = start_snapshot(ARTIFACTS / 'project_snapshots', workspace,
                                                                  cancel_event=app.generation_cancel)
@@ -1140,12 +1414,15 @@ class ProjectConversation:
                         context=context, permission_mode=permission_mode,
                         personal_memory=app.personal_memory, read_memory=personal_options['read'])
                 else:
+                    capabilities = ({'capability_mode': 'assistant', 'csv_path': csv_path} if assistant
+                                    else {'integrated_tools': True})
                     runner = ProjectAgent(workspace, model, runs_root=ARTIFACTS / 'project_runs',
                         approve_command=approve, on_event=on_event,
                         cancel_event=app.generation_cancel, allow_write=allow_write, max_steps=16,
                         context=context, knowledge=app.knowledge, use_memory=use_memory,
                         personal_memory=app.personal_memory, read_memory=personal_options['read'],
-                        write_memory=personal_options['write'], permission_mode=permission_mode)
+                        write_memory=personal_options['write'], permission_mode=permission_mode, allow_web=allow_web,
+                        **capabilities)
                 if resume_from:
                     if recovery_confirmed:
                         result = runner.run(model_task, history=history, resume_from=resume_from,
@@ -1169,10 +1446,16 @@ class ProjectConversation:
                         if check['status'] == 'failed' and repair_attempt == MAX_REPAIR_ATTEMPTS:
                             result['answer'] += '\n已达到自动续修次数上限。'
             except Exception:
-                logging.exception('Project task failed')
+                logging.exception('Conversation task failed')
                 directory = getattr(runner, 'run_dir', None)
+                stopped = app.generation_cancel.is_set()
+                if assistant:
+                    answer = ('任务已停止。' if stopped else '智能助手未能完成任务，请查看运行记录后重试。')
+                else:
+                    answer = ('项目任务已停止。' if stopped else
+                              '项目准备或执行失败，请检查目录、运行记录和磁盘空间。已有改动会保留。')
                 result = {'status': 'stopped' if app.generation_cancel.is_set() else 'failed',
-                        'answer': '项目任务已停止。' if app.generation_cancel.is_set() else '项目准备或执行失败，请检查目录、运行记录和磁盘空间。已有改动会保留。',
+                        'answer': answer,
                         'run_dir': str(directory) if directory else '', 'changes': getattr(runner, 'changes', []),
                         'episode_id': None, 'continuation_available': directory is not None, 'engine': engine}
             if snapshot_state.get('directory'):
@@ -1207,7 +1490,7 @@ class ProjectConversation:
             app.pending_chat = None
             app.write(app.transcript, app.last_answer + '\n\n', True)
             app.format_transcript()
-            notice = STATES.get(result.get('status'), '任务结束') + '，可以在这里继续提出下一步。'
+            notice = card.status_text(result.get('status')) + '，可以在这里继续提出下一步。'
             saved = self.save_card(card)
             if card.assistant_index is None:
                 try:
@@ -1216,13 +1499,13 @@ class ProjectConversation:
                 except Exception:
                     logging.exception('Project reply creation failed')
             if not saved:
-                notice = '未能保存本轮对话和项目卡片，请保留运行记录文件夹。'
+                notice = '未能保存本轮对话和任务卡片，请保留运行记录文件夹。'
                 card.append(notice)
             app.status.set(notice)
             app.refresh_model_state()
             self.sync_busy()
             self.refresh_summary()
-            if (saved and repair_attempt < MAX_REPAIR_ATTEMPTS and not denied.is_set()
+            if (not assistant and saved and repair_attempt < MAX_REPAIR_ATTEMPTS and not denied.is_set()
                     and not app.generation_cancel.is_set() and card.can_resume()
                     and app.session_id == identity and card in self.cards
                     and os.path.normcase(self.workspace.get()) == os.path.normcase(workspace)
@@ -1230,10 +1513,12 @@ class ProjectConversation:
                     and not result.get('fixed_check', {}).get('stale')
                     and result.get('fixed_check', {}).get('status') == 'failed'):
                 self.send(resume_from=result['run_dir'], repair_attempt=repair_attempt + 1)
-        app.submit('项目助手正在处理', work, done, cancellable=True)
+        app.submit('智能助手正在处理' if assistant else '项目助手正在处理', work, done, cancellable=True)
         self.sync_busy()
 
     def undo(self, card):
+        if card.assistant:
+            return
         snapshot = (card.result or {}).get('snapshot') or {}
         use_snapshot = bool((card.result or {}).get('snapshot_dir') and snapshot.get('status') in ('ready', 'partial'))
         if (self.app.busy or not card.result or (card.result.get('engine') == 'harness' and not use_snapshot) or not card.result.get('run_dir')

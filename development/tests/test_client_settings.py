@@ -62,7 +62,8 @@ class NativeSettingsScenario(unittest.TestCase):
         app.select_page(0)
         self.assertTrue(app.sidebar.winfo_manager())
         app.select_page(2)
-        self.assertEqual(list(panel.category_buttons), ['general', 'coding', 'models', 'appearance', 'storage', 'about'])
+        self.assertEqual(list(panel.category_buttons),
+                         ['general', 'coding', 'models', 'appearance', 'shortcuts', 'storage', 'about'])
         self.assertEqual(visible_sections(), {'general': 2})
         self.assertEqual(panel.heading.cget('text'), '常规与权限')
         self.assertEqual(app.project.permission_mode.get(), 'standard')
@@ -71,7 +72,10 @@ class NativeSettingsScenario(unittest.TestCase):
         for query in ('长期记忆', '外置上下文', '记忆'):
             panel.query.set(query)
             root.update_idletasks()
-            self.assertEqual(visible_sections(), {'general': 1})
+            expected_sections = {'general': 1}
+            if query != '外置上下文':
+                expected_sections['shortcuts'] = 1
+            self.assertEqual(visible_sections(), expected_sections)
             self.assertTrue(panel.memory_options[0].winfo_viewable())
         self.assertEqual(panel.memory_options[0].cget('variable'), app.memories.options[0].cget('variable'))
         panel.memory_options[0].invoke()

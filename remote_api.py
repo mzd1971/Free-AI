@@ -292,21 +292,41 @@ def _opener(state):
 
 class _TextStream:
     """Separate explicit think blocks, including tags split across SSE chunks."""
-    def __init__(self):
+
+    def __init__(self, on_thought, prefilled=False):
         self.buffer = ''
         self.thinking = False
-        self.reasoning = []
+        self.undecided = prefilled
+        self.on_thought = on_thought
 
     def feed(self, text, final=False):
         self.buffer += text
+        if self.undecided:
+            if self.buffer.lstrip().startswith('<think>'):
+                self.undecided = False
+            elif '</think>' in self.buffer:
+                thought, self.buffer = self.buffer.split('</think>', 1)
+                self.on_thought(thought)
+                self.undecided = False
+            elif not final:
+                return ''
+            else:
+                self.undecided = False
         answer = []
+
+        def append(fragment):
+            if self.thinking:
+                self.on_thought(fragment)
+            else:
+                answer.append(fragment)
+
         while self.buffer:
             found = [(self.buffer.find(tag), tag) for tag in ('<think>', '</think>')]
             found = [(offset, tag) for offset, tag in found if offset >= 0]
             if found:
                 offset, tag = min(found)
                 fragment, self.buffer = self.buffer[:offset], self.buffer[offset + len(tag):]
-                (self.reasoning if self.thinking else answer).append(fragment)
+                append(fragment)
                 self.thinking = tag == '<think>'
                 continue
             keep = 0
@@ -315,14 +335,160 @@ class _TextStream:
                     for count in range(1, len(tag)):
                         if self.buffer.endswith(tag[:count]):
                             keep = max(keep, count)
-            fragment = self.buffer[:-keep] if keep else self.buffer
-            (self.reasoning if self.thinking else answer).append(fragment)
+            append(self.buffer[:-keep] if keep else self.buffer)
             self.buffer = self.buffer[-keep:] if keep else ''
             break
         return ''.join(answer)
 
 
+class _CompletionText:
+    """Keep provider reasoning separate from answer text and tool arguments."""
+
+    def __init__(self, on_reasoning=None, *, prefilled=False):
+        self._on_reasoning = on_reasoning
+        self._tagged = []
+        self._structured = []
+        self._structured_seen = False
+        self._mirror = ''
+        self._mirror_index = 0
+        self._text = _TextStream(self._tagged_delta, prefilled=prefilled)
+
+    @property
+    def reasoning(self):
+        if self._structured_seen:
+            return ''.join(self._structured)
+        return ''.join(self._tagged) if self._tagged else None
+
+    def _emit(self, text):
+        if text and self._on_reasoning is not None:
+            self._on_reasoning(text)
+
+    def _tagged_delta(self, text):
+        if text and not self._structured_seen:
+            self._tagged.append(text)
+            self._emit(text)
+
+    def feed(self, message):
+        thought = message.get('reasoning_content')
+        if not isinstance(thought, str) or not thought:
+            alias = message.get('reasoning')
+            if isinstance(alias, str):
+                thought = alias
+        if isinstance(thought, str):
+            if not self._structured_seen and thought:
+                self._structured_seen = True
+                self._text.undecided = False
+                self._mirror = ''.join(self._tagged)
+                self._tagged.clear()
+            if self._structured_seen and thought:
+                self._structured.append(thought)
+                # Some endpoints mirror the same thought in both fields. Skip a
+                # matching prefix already emitted from the tagged representation.
+                duplicate = 0
+                while (duplicate < len(thought) and self._mirror_index < len(self._mirror)
+                       and thought[duplicate] == self._mirror[self._mirror_index]):
+                    duplicate += 1
+                    self._mirror_index += 1
+                if duplicate != len(thought) or self._mirror_index == len(self._mirror):
+                    self._mirror = ''
+                    self._mirror_index = 0
+                self._emit(thought[duplicate:])
+        content = message.get('content')
+        return self._text.feed(content if isinstance(content, str) else '')
+
+    def finish(self):
+        return self._text.feed('', final=True)
+
+
+def _is_event_stream(response):
+    return response.headers.get('Content-Type', '').split(';', 1)[0].strip().lower() == 'text/event-stream'
+
+
+def _stream_events(response, check):
+    total, data_lines, event_type = 0, [], ''
+    while True:
+        raw = response.readline(1024 * 1024 + 1)
+        check()
+        if not raw:
+            break
+        total += len(raw)
+        if len(raw) > 1024 * 1024 or total > MAX_RESPONSE_BYTES:
+            raise APIError('API 流式回答超过接收上限，已停止接收。')
+        try:
+            line = raw.decode('utf-8').rstrip('\r\n')
+        except UnicodeError:
+            raise APIError('API 流式内容编码无效，回答可能不完整。') from None
+        if line.startswith('data:'):
+            data_lines.append(line[5:].lstrip(' '))
+        elif line.startswith('event:'):
+            event_type = line[6:].strip()
+        elif not line:
+            if event_type == 'error':
+                raise APIError('API 返回生成错误，本次内容可能不完整；本程序没有自动重试。')
+            event_type = ''
+            if not data_lines:
+                continue
+            body, data_lines = '\n'.join(data_lines), []
+            if body.strip() == '[DONE]':
+                return
+            try:
+                event = json.loads(body)
+            except ValueError:
+                raise APIError('API 流式内容格式不正确，回答可能不完整。') from None
+            if not isinstance(event, dict):
+                raise APIError('API 流式内容结构不正确。')
+            yield event
+    raise APIError('API 回答连接提前结束，已显示的内容可能不完整；本程序没有自动重试。')
+
+
+class _StreamedToolCalls:
+    def __init__(self):
+        self._calls = {}
+
+    def feed(self, deltas):
+        if not isinstance(deltas, list) or len(deltas) > MAX_TOOL_CALLS:
+            raise APIError(INVALID_TOOL_CALL)
+        indices = set()
+        for delta in deltas:
+            index = delta.get('index') if isinstance(delta, dict) else None
+            if type(index) is not int or not 0 <= index < MAX_TOOL_CALLS or index in indices:
+                raise APIError(INVALID_TOOL_CALL)
+            indices.add(index)
+            call = self._calls.setdefault(index, {'id': '', 'type': 'function',
+                                                   'function': {'name': '', 'arguments': ''}})
+            kind = delta.get('type')
+            if kind is not None and kind != 'function':
+                raise APIError(INVALID_TOOL_CALL)
+            identity = delta.get('id')
+            if identity is not None:
+                if not isinstance(identity, str) or (call['id'] and call['id'] != identity):
+                    raise APIError(INVALID_TOOL_CALL)
+                call['id'] = identity
+            function = delta.get('function')
+            if function is None:
+                continue
+            if not isinstance(function, dict):
+                raise APIError(INVALID_TOOL_CALL)
+            for key in ('name', 'arguments'):
+                fragment = function.get(key)
+                if fragment is None:
+                    continue
+                if not isinstance(fragment, str):
+                    raise APIError(INVALID_TOOL_CALL)
+                limit = 64 if key == 'name' else MAX_TOOL_ARGUMENT_BYTES
+                if len(fragment) + len(call['function'][key]) > limit:
+                    raise APIError(INVALID_TOOL_CALL)
+                call['function'][key] += fragment
+
+    def finish(self):
+        if set(self._calls) != set(range(len(self._calls))):
+            raise APIError(INVALID_TOOL_CALL)
+        return [self._calls[index] for index in range(len(self._calls))]
+
+
 class APIClient:
+    supports_reasoning_callback = True
+
     def __init__(self, base_url, model, api_key, max_output_tokens=1024, thinking=None):
         self.base_url = normalize_base_url(base_url)
         if (not isinstance(model, str) or not model.strip() or len(model) > 256
@@ -451,6 +617,8 @@ class APIClient:
                 'message': '已连通并取得模型列表。仅查询列表，未发送生成请求；尚不能确认所选模型可以生成回答。'}
 
     def _messages(self, message, history, context):
+        from clock_context import temporal_context
+        system = SYSTEM + '\n' + temporal_context()
         if not isinstance(message, str) or not message.strip():
             raise ValueError('请输入要发送给 API 的问题。')
         if isinstance(context, bool) or not isinstance(context, int) or not 512 <= context <= 262144:
@@ -470,7 +638,7 @@ class APIClient:
                 pending = None
         removed = 0
         while True:
-            messages = [{'role': 'system', 'content': SYSTEM}]
+            messages = [{'role': 'system', 'content': system}]
             messages.extend(row for turn in turns for row in turn)
             messages.append({'role': 'user', 'content': message})
             characters = sum(len(row['content']) + 16 for row in messages)
@@ -487,7 +655,8 @@ class APIClient:
             turns.pop(0)
             removed += 1
 
-    def generate(self, message, history=None, on_token=None, cancel_event=None, context=4096):
+    def generate(self, message, history=None, on_token=None, cancel_event=None, context=4096,
+                 on_reasoning=None):
         messages, output_limit = self._messages(message, history, context)
         payload = {'model': self.model, 'messages': messages, 'max_tokens': output_limit, 'stream': True}
         if self.thinking is not None:
@@ -495,8 +664,14 @@ class APIClient:
         self.last_usage, self.last_reasoning = {}, ''
 
         def work(state):
-            parts, reasoning, usage, finish_reason = [], [], {}, None
-            parser = _TextStream()
+            parts, usage, finish_reason = [], {}, None
+
+            def emit_reasoning(text):
+                state.check()
+                if on_reasoning is not None:
+                    on_reasoning(text)
+
+            parser = _CompletionText(emit_reasoning, prefilled=self._prefilled_thinking())
 
             def emit(text):
                 state.check()
@@ -524,60 +699,23 @@ class APIClient:
                 content = choice.get('delta' if streaming else 'message') or {}
                 if not isinstance(content, dict):
                     raise APIError('API 返回的文字内容格式不正确。')
-                thought = content.get('reasoning_content')
-                if isinstance(thought, str):
-                    reasoning.append(thought)
-                text = content.get('content')
-                if isinstance(text, str):
-                    emit(parser.feed(text))
+                emit(parser.feed(content))
                 if choice.get('finish_reason') is not None:
                     finish_reason = choice['finish_reason']
 
             with self._request('/chat/completions', state, payload) as response:
-                content_type = response.headers.get('Content-Type', '').split(';', 1)[0].strip().lower()
-                if content_type == 'text/event-stream':
-                    complete, total, data_lines, event_type = False, 0, [], ''
-                    while True:
-                        raw = response.readline(1024 * 1024 + 1)
-                        state.check()
-                        if not raw:
-                            break
-                        total += len(raw)
-                        if len(raw) > 1024 * 1024 or total > MAX_RESPONSE_BYTES:
-                            raise APIError('API 流式回答超过接收上限，已停止接收。')
-                        try:
-                            line = raw.decode('utf-8').rstrip('\r\n')
-                        except UnicodeError:
-                            raise APIError('API 流式内容编码无效，回答可能不完整。') from None
-                        if line.startswith('data:'):
-                            data_lines.append(line[5:].lstrip(' '))
-                        elif line.startswith('event:'):
-                            event_type = line[6:].strip()
-                        elif not line and data_lines:
-                            if event_type == 'error':
-                                raise APIError('API 返回生成错误，本次内容可能不完整；本程序没有自动重试。')
-                            event_type = ''
-                            body, data_lines = '\n'.join(data_lines), []
-                            if body.strip() == '[DONE]':
-                                complete = True
-                                break
-                            try:
-                                event = json.loads(body)
-                            except ValueError:
-                                raise APIError('API 流式内容格式不正确，回答可能不完整。') from None
-                            if not isinstance(event, dict):
-                                raise APIError('API 流式内容结构不正确。')
-                            consume(event, True)
-                    if not complete:
-                        raise APIError('API 回答连接提前结束，已显示的内容可能不完整；本程序没有自动重试。')
+                if _is_event_stream(response):
+                    for event in _stream_events(response, state.check):
+                        consume(event, True)
                 else:
                     # Some compatible services ignore stream=true and return
                     # one JSON response. Parse that same response; never resend.
                     consume(self._json(response, state), False)
-            emit(parser.feed('', final=True))
+            emit(parser.finish())
+            reasoning = parser.reasoning or ''
             answer = ''.join(parts).strip()
             if not answer:
-                if any(reasoning) or any(parser.reasoning):
+                if reasoning:
                     raise APIError('API 只返回了思考内容，没有最终答案。可关闭思考或调整回答上限后手动重试。')
                 raise APIError('API 没有返回可显示的文字回答，请检查模型或调整问题。')
             if finish_reason == 'length':
@@ -587,13 +725,18 @@ class APIClient:
             elif finish_reason in ('content_filter', 'tool_calls', 'function_call'):
                 raise APIError('API 未返回完整文字答案；当前仅支持文字对话。')
             state.check()
-            return {'answer': answer, 'reasoning': ''.join(reasoning + parser.reasoning), 'usage': usage}
+            return {'answer': answer, 'reasoning': reasoning, 'usage': usage}
 
         result = self._run(work, cancel_event=cancel_event)
         self.last_usage, self.last_reasoning = result['usage'], result['reasoning']
         return result['answer']
 
-    def complete_tools(self, messages, tools, cancel_event=None, context=16384):
+    def _prefilled_thinking(self):
+        model = self.model.lower()
+        return ((self.thinking is True and 'deepseek' in model) or
+                (self.thinking is None and model.endswith('deepseek-reasoner')))
+
+    def complete_tools(self, messages, tools, cancel_event=None, context=16384, on_reasoning=None):
         """Return one assistant message for the caller's tool conversation."""
         _RequestState(cancel_event).check()
         if isinstance(context, bool) or not isinstance(context, int) or not 512 <= context <= 262144:
@@ -602,7 +745,7 @@ class APIClient:
         definitions, names = _tool_definitions(tools)
         output_limit = min(self.max_output_tokens, context // 2)
         payload = {'model': self.model, 'messages': history, 'max_tokens': output_limit,
-                   'stream': False}
+                   'stream': on_reasoning is not None}
         if definitions:
             payload['tools'] = definitions
         if self.thinking is not None:
@@ -610,14 +753,35 @@ class APIClient:
         if _json_size(payload, 'API 工具对话含有无法编码的数据。') + output_limit + 128 > context:
             raise APIError('API 工具对话超过估算容量。请增加对话容量、缩短工具结果或开始新任务。')
 
+        error = 'API 未返回完整的工具对话消息，请检查所选模型是否支持工具调用。'
+
         def work(state):
+            def emit_reasoning(text):
+                state.check()
+                if on_reasoning is not None:
+                    on_reasoning(text)
+
+            parser = _CompletionText(emit_reasoning, prefilled=self._prefilled_thinking())
             with self._request('/chat/completions', state, payload) as response:
-                value = self._json(response, state)
-            error = 'API 未返回完整的工具对话消息，请检查所选模型是否支持工具调用。'
-            choices = value.get('choices')
-            if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
-                raise APIError(error)
-            choice = choices[0]
+                if on_reasoning is not None and _is_event_stream(response):
+                    choice = self._stream_tool_choice(response, state, parser, error)
+                else:
+                    value = self._json(response, state)
+                    choices = value.get('choices')
+                    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
+                        raise APIError(error)
+                    choice = choices[0]
+                    message = choice.get('message')
+                    if (isinstance(message, dict) and message.get('role') == 'assistant'
+                            and choice.get('finish_reason') in ('stop', 'tool_calls')):
+                        content, reasoning = message.get('content'), message.get('reasoning_content')
+                        if (content is not None and not isinstance(content, str)
+                                or reasoning is not None and not isinstance(reasoning, str)):
+                            raise APIError(error)
+                        clean = parser.feed(message) + parser.finish()
+                        choice = dict(choice, message=dict(message, content=(clean if content is not None else None),
+                                                           reasoning_content=parser.reasoning
+                                                           if parser.reasoning is not None else reasoning))
             finish = choice.get('finish_reason')
             if finish == 'length':
                 raise APIError('API 工具对话达到回答长度上限。请增加回答上限或缩短输入后重试。')
@@ -648,3 +812,38 @@ class APIClient:
             return result
 
         return self._run(work, cancel_event=cancel_event)
+
+    @staticmethod
+    def _stream_tool_choice(response, state, parser, error):
+        calls = _StreamedToolCalls()
+        parts, finish = [], None
+        has_content = False
+        for event in _stream_events(response, state.check):
+            if event.get('error'):
+                raise APIError('API 返回生成错误，本次内容可能不完整；本程序没有自动重试。')
+            choices = event.get('choices')
+            if choices == []:
+                continue
+            if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
+                raise APIError(error)
+            choice = choices[0]
+            if choice.get('index', 0) != 0 or finish is not None:
+                raise APIError(error)
+            delta = choice.get('delta')
+            if delta is None:
+                delta = {}
+            if not isinstance(delta, dict) or delta.get('role') not in (None, 'assistant'):
+                raise APIError(error)
+            for field in ('content', 'reasoning_content', 'reasoning'):
+                if delta.get(field) is not None and not isinstance(delta[field], str):
+                    raise APIError(error)
+            has_content |= isinstance(delta.get('content'), str)
+            parts.append(parser.feed(delta))
+            if delta.get('tool_calls') is not None:
+                calls.feed(delta['tool_calls'])
+            finish = choice.get('finish_reason')
+        parts.append(parser.finish())
+        return {'finish_reason': finish, 'message': {
+            'role': 'assistant', 'content': ''.join(parts) if has_content else None,
+            'tool_calls': calls.finish(), 'reasoning_content': parser.reasoning,
+        }}

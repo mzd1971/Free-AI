@@ -8,8 +8,10 @@ import json
 import os
 from pathlib import Path
 import re
+from urllib.parse import unquote
 
 from agent_memory import SECRET
+from unified_tools import UTILITY_NAMES
 
 
 STATE_FILE = 'task.json'
@@ -21,6 +23,9 @@ CHECK_LIMIT = 16
 CHECK_ID_LIMIT = 1600
 OBSERVATION_LIMIT = 16
 OPERATION_LIMIT = 16
+WEB_FAILURE_LIMIT = 128
+WEB_FAILURE_SUBJECT_LIMIT = 240
+WEB_SUBJECTS = {'web_search': 'query', 'web_fetch': 'url'}
 CHECK_STATES = {'pending', 'exited', 'timeout', 'denied', 'cancelled', 'error', 'limit'}
 STATUSES = {'running', 'completed', 'failed', 'stopped', 'limit', 'unfinished'}
 PHASES = {'ready', 'executing'}
@@ -31,6 +36,12 @@ NAMED_SECRET = re.compile(
     r"""(?i)(\b[\w-]*(?:api[_ -]?key|access[_ -]?token|secret[_ -]?key|password|passwd|token)\b["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;}]+)"""
 )
 URL_CREDENTIAL = re.compile(r'(\b[\w+.-]+://)[^\s/:@]+:[^\s/@]+@')
+WEB_URL_USERINFO = re.compile(r'(\bhttps?://)[^\s/?#]+@', re.IGNORECASE)
+WEB_URL_PARAMETER = re.compile(r'([?&#;])([^\s?&#;=]+)=([^\s&#;]*)')
+WEB_SECRET_PARAMETER = re.compile(
+    r'(?:^|[-_])(?:key|auth|authorization|password|passwd|token|secret|credential|signature|sig|code)(?:$|[-_])',
+    re.IGNORECASE,
+)
 SECRET_OPTION = re.compile(
     r'--(?:[\w-]*api[-_]?key|[\w-]*access[-_]?token|secret[-_]?key|password|passwd|token|secret)'
     r'(?:=.*)?\Z', re.IGNORECASE,
@@ -57,6 +68,34 @@ def _clean(value, limit, *, strip=True):
     value = URL_CREDENTIAL.sub(lambda match: match[1] + HIDDEN + '@', value)
     value = ''.join(char for char in value if ord(char) >= 32 or char in '\t\n')
     return _clip(value.strip() if strip else value, limit)
+
+
+def _web_preview(value, limit):
+    if not isinstance(value, str):
+        return ''
+    value = WEB_URL_USERINFO.sub(lambda match: match[1] + HIDDEN + '@', value)
+    value = WEB_URL_PARAMETER.sub(
+        lambda match: match[1] + match[2] + '=' + HIDDEN
+        if WEB_SECRET_PARAMETER.search(unquote(match[2])) else match[0], value,
+    )
+    return _clean(value, limit)
+
+
+def _web_source_detail(tool, result):
+    rows = result.get('results') if tool == 'web_search' else [result]
+    if not isinstance(rows, list) or not rows:
+        return '未返回来源。'
+    limit = min(3, len(rows))
+    row_budget = 560 // limit - 1
+    title_budget = min(170, row_budget // 3)
+    summaries = []
+    for row in rows[:limit]:
+        if isinstance(row, dict):
+            title = _web_preview(row.get('title'), title_budget)
+            url = _web_preview(row.get('url'), row_budget - len(title.encode('utf-8')) - 1)
+            if url:
+                summaries.append(' '.join(filter(None, (title, url))))
+    return '\n'.join(summaries) or '未返回来源。'
 
 
 def _command(arguments, workspace):
@@ -139,6 +178,13 @@ def _operation(tool, arguments, workspace):
     if tool == 'run_command':
         subject, identity = _command(arguments, workspace)
         identity = [identity, arguments.get('purpose', 'task')]
+    elif tool in WEB_SUBJECTS:
+        identity = arguments.get(WEB_SUBJECTS[tool])
+        if tool == 'web_search' and isinstance(identity, str):
+            identity = identity.strip()
+        subject = _web_preview(identity, 520)
+        if not subject:
+            identity = None
     else:
         identity = arguments
     digest = hashlib.sha256(json.dumps([tool, identity], ensure_ascii=True,
@@ -158,10 +204,10 @@ def _merge_rows(older, newer, key, limit):
 def _validate(state, run_dir, workspace):
     fields = {'version', 'run_id', 'workspace', 'task', 'parent_run', 'status', 'phase', 'uncertain',
               'plan', 'revision', 'edits', 'checks', 'check_statuses', 'omitted_checks', 'observations',
-              'inflight', 'unresolved', 'failed_writes'}
+              'inflight', 'unresolved', 'failed_writes', 'failed_web', 'omitted_web_failures', 'failed_utilities'}
     if not isinstance(state, dict) or state.keys() != fields:
         raise ValueError('任务记录字段不完整或版本不受支持。')
-    if (type(state['version']) is not int or state['version'] != 2
+    if (type(state['version']) is not int or state['version'] != 4
             or state['run_id'] != run_dir.name or not _text(state['workspace'], 16384)
             or state['workspace'] != os.path.normcase(str(workspace))
             or not _text(state['task'], TASK_LIMIT) or not state['task'].strip()
@@ -211,6 +257,17 @@ def _validate(state, run_dir, workspace):
     if (not isinstance(state['failed_writes'], list) or len(state['failed_writes']) > EDIT_LIMIT
             or not all(_text(path, 1024) for path in state['failed_writes'])):
         raise ValueError('未完成文件修改记录无效。')
+    if (type(state['omitted_web_failures']) is not bool
+            or not _valid_rows(state['failed_web'], WEB_FAILURE_LIMIT, {
+                'id': _hash, 'tool': lambda item: item in WEB_SUBJECTS,
+                'subject': lambda item: _text(item, WEB_FAILURE_SUBJECT_LIMIT),
+            }) or len({row['id'] for row in state['failed_web']}) != len(state['failed_web'])):
+        raise ValueError('未完成联网请求记录无效。')
+    utilities = state['failed_utilities']
+    if (not isinstance(utilities, list) or len(utilities) > len(UTILITY_NAMES)
+            or not all(isinstance(name, str) and name in UTILITY_NAMES for name in utilities)
+            or len(set(utilities)) != len(utilities)):
+        raise ValueError('未完成通用工具记录无效。')
     for row in state['checks']:
         terminal = row['status'] in ('exited', 'timeout')
         if terminal != (type(row['returncode']) is int):
@@ -239,12 +296,13 @@ class TaskJournal:
         workspace = _workspace(workspace)
         parent = _parent_name(parent_run) if parent_run is not None else None
         self._state = {
-            'version': 2, 'run_id': self._run_dir.name,
+            'version': 4, 'run_id': self._run_dir.name,
             'workspace': os.path.normcase(str(workspace)),
             'task': _clean(task, TASK_LIMIT), 'parent_run': parent,
             'status': 'running', 'phase': 'ready', 'uncertain': False, 'plan': [], 'revision': 0,
             'edits': [], 'checks': [], 'check_statuses': {}, 'omitted_checks': False, 'observations': [],
             'inflight': None, 'unresolved': [], 'failed_writes': [],
+            'failed_web': [], 'omitted_web_failures': False, 'failed_utilities': [],
         }
         _validate(self._state, self._run_dir, workspace)
 
@@ -258,6 +316,9 @@ class TaskJournal:
         state['task'] = source['task']
         state['plan'] = deepcopy(source['plan'])
         state['failed_writes'] = deepcopy(source['failed_writes'])
+        state['failed_web'] = deepcopy(source['failed_web'])
+        state['omitted_web_failures'] = source['omitted_web_failures']
+        state['failed_utilities'] = source['failed_utilities'][:]
         state['edits'] = deepcopy(source['edits'])
         state['observations'] = deepcopy(source['observations'])
         state['unresolved'] = deepcopy(source['unresolved'])
@@ -363,7 +424,7 @@ class TaskJournal:
             'status': 'confirmed', 'detail': '用户确认已检查现场；未执行或失败的检查仍需处理。'})
         del self._state['observations'][:-OBSERVATION_LIMIT]
 
-    def observe(self, tool, arguments, result):
+    def observe(self, tool, arguments, result, *, clear_utility_failure=True):
         """Store metadata and bounded output, excluding file contents and edit payloads."""
         if not self._writable:
             raise ValueError('上次运行的任务记录仅供读取。')
@@ -402,6 +463,27 @@ class TaskJournal:
         status = result.get('status') or ('ok' if result.get('ok') is True else 'error')
         subject = _clean(result.get('path') or arguments.get('path'), 520)
         detail = _clean(result.get('message'), 560)
+        if tool in WEB_SUBJECTS and result.get('status') != 'unavailable':
+            subject = operation['subject']
+            failures = self._state['failed_web']
+            corrected_missing_subject = successful and bool(subject)
+            failures[:] = [row for row in failures if row['id'] != operation['id']
+                           and not (corrected_missing_subject and row['tool'] == tool and not row['subject'])]
+            if successful:
+                detail = _web_source_detail(tool, result)
+            else:
+                detail = _web_preview(result.get('message'), 560)
+                failures.append({'id': operation['id'], 'tool': tool,
+                                 'subject': _clip(subject, WEB_FAILURE_SUBJECT_LIMIT)})
+                if len(failures) > WEB_FAILURE_LIMIT:
+                    self._state['omitted_web_failures'] = True
+                    del failures[:-WEB_FAILURE_LIMIT]
+        if tool in UTILITY_NAMES and result.get('status') != 'unavailable':
+            failures = self._state['failed_utilities']
+            if successful and clear_utility_failure and tool in failures:
+                failures.remove(tool)
+            elif not successful and tool not in failures:
+                failures.append(tool)
         if tool in ('write_file', 'replace_text') and result.get('changed') is True:
             path = _clean(result.get('path') or arguments.get('path'), 1024)
             sha = result.get('sha256')
@@ -432,7 +514,15 @@ class TaskJournal:
         if status not in STATUSES or phase not in PHASES:
             raise ValueError('任务检查点状态无效。')
         state = {**self._state, 'status': status, 'phase': phase}
-        data = (json.dumps(state, ensure_ascii=False, separators=(',', ':')) + '\n').encode('utf-8')
+        disk_state = state.copy()
+        # Keep checkpoints readable by older releases when newer fields are empty.
+        if not state['failed_utilities']:
+            disk_state['version'] = 3
+            del disk_state['failed_utilities']
+            if not state['failed_web'] and not state['omitted_web_failures']:
+                disk_state['version'] = 2
+                del disk_state['failed_web'], disk_state['omitted_web_failures']
+        data = (json.dumps(disk_state, ensure_ascii=False, separators=(',', ':')) + '\n').encode('utf-8')
         if len(data) > STATE_LIMIT:
             raise ValueError('任务记录超过大小上限。')
         root = self._run_dir.parent
@@ -474,7 +564,8 @@ class TaskJournal:
         if not ready and state['inflight']:
             unresolved = _merge_rows(unresolved, [state['inflight']], 'id', OPERATION_LIMIT)
         return {**deepcopy({key: state[key] for key in (
-            'run_id', 'task', 'parent_run', 'status', 'phase', 'plan', 'edits', 'observations', 'failed_writes',
+            'run_id', 'task', 'parent_run', 'status', 'phase', 'plan', 'edits', 'observations',
+            'failed_writes', 'failed_web', 'omitted_web_failures', 'failed_utilities',
         )}), 'unresolved': unresolved, 'uncertain': state['uncertain'] or not ready or bool(unresolved),
                 'verification': {'status': verification, 'checks': checks}}
 
@@ -491,6 +582,16 @@ class TaskJournal:
                              'blocked': '已申请的检查被拒绝、未能启动或尚未执行。'}[verification])
         if data['failed_writes']:
             blockers.append('仍有未完成的文件修改：' + '、'.join(data['failed_writes'][:3]))
+        if data['failed_web']:
+            targets = '、'.join(
+                row['tool'] + ' ' + (_clip(row['subject'], 120) or '缺少关键词或地址')
+                for row in data['failed_web'][:3]
+            )
+            blockers.append('联网请求尚未成功，请重试相同的搜索词或网页地址：' + targets)
+        if data['omitted_web_failures']:
+            blockers.append('未完成的联网请求超出记录容量，部分失败已无法逐项核实。')
+        if data['failed_utilities']:
+            blockers.append('工具尚未执行成功，请根据报错修正后重试：' + '、'.join(data['failed_utilities']) + '。')
         if any(step['status'] != 'completed' for step in data['plan']):
             blockers.append('计划中仍有待处理或进行中的步骤。')
         return blockers
@@ -510,6 +611,10 @@ class TaskJournal:
                       '任务目标 ' + _clip(data['task'], min(1000, budget * 2 // 5))))
         if data['failed_writes']:
             lines.append('待完成文件修改 ' + '、'.join(data['failed_writes'][:3]))
+        if data['omitted_web_failures']:
+            lines.append('未完成的联网请求超出记录容量，部分失败已无法逐项核实。')
+        if data['failed_utilities']:
+            lines.append('待重试通用工具 ' + '、'.join(data['failed_utilities']))
         for operation in data['unresolved'][:3]:
             lines.append('待核实操作 ' + operation['tool'] + ' ' + _clip(operation['subject'], 240))
         checks = list(reversed(verification['checks']))
@@ -529,10 +634,14 @@ class TaskJournal:
         for edit in reversed(data['edits'][-6:]):
             edit_lines.append('已改动 ' + _clip(edit['path'], 220)
                               + (' SHA-256 ' + edit['sha256'] if edit['sha256'] else ''))
+        web_lines = [f"待重试 {row['tool']} {_clip(row['subject'], 200)}" for row in data['failed_web'][:3]]
+        observations = list(reversed(data['observations']))
+        web_sources = [row for row in observations if row['tool'] in WEB_SUBJECTS and row['status'] == 'ok']
+        web_lines += [f"第三方网页来源 {_clip(row['subject'], 120)}\n{row['detail']}" for row in web_sources[:3]]
         recent = [f"观察 {row['tool']} {row['status']} {_clip(row['subject'], 120)} {_clip(row['detail'], 160)}"
-                  for row in reversed(data['observations'][-4:])]
+                  for row in observations if row not in web_sources][:4]
         summary = _clip('\n'.join(lines), budget)
-        sections = [section for section in (check_lines, plan_lines, edit_lines, recent) if section]
+        sections = [section for section in (web_lines, check_lines, plan_lines, edit_lines, recent) if section]
         for index, section in enumerate(sections):
             remaining = budget - len(summary.encode('utf-8'))
             if remaining <= 1:
@@ -577,6 +686,14 @@ def load_task(runs_root, run_dir, workspace, *, _visited=()):
                 state.update(version=2, inflight=None, unresolved=[], failed_writes=[])
                 for check in state.get('checks', []):
                     check['argv_id'] = ''
+            if isinstance(state, dict) and type(state.get('version')) is int and state['version'] == 2:
+                if 'failed_web' in state or 'omitted_web_failures' in state:
+                    raise ValueError('旧任务包含不受支持的字段。')
+                state.update(version=3, failed_web=[], omitted_web_failures=False)
+            if isinstance(state, dict) and type(state.get('version')) is int and state['version'] == 3:
+                if 'failed_utilities' in state:
+                    raise ValueError('旧任务包含不受支持的字段。')
+                state.update(version=4, failed_utilities=[])
             _validate(state, path.parent, workspace)
             if legacy and state['parent_run']:
                 try:
@@ -590,6 +707,9 @@ def load_task(runs_root, run_dir, workspace, *, _visited=()):
                     state['uncertain'] = state['uncertain'] or parent['uncertain']
                     state['edits'] = _merge_rows(parent['edits'], state['edits'], 'path', EDIT_LIMIT)
                     state['observations'] = (deepcopy(parent['observations']) + state['observations'])[-OBSERVATION_LIMIT:]
+                    state['failed_web'] = deepcopy(parent['failed_web'])
+                    state['omitted_web_failures'] = parent['omitted_web_failures']
+                    state['failed_utilities'] = parent['failed_utilities'][:]
         except (TypeError, ValueError, RecursionError) as exc:
             raise ValueError('续跑记录损坏、版本不受支持或属于其他工作区。') from exc
         snapshot = TaskJournal(path.parent, workspace, state['task'], state['parent_run'])

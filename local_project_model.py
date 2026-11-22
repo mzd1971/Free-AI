@@ -29,6 +29,8 @@ def _loopback_api_url(value):
 class LocalProjectModel:
     """Project-model adapter. An explicitly supplied runtime remains caller-owned."""
 
+    supports_reasoning_callback = True
+
     def __init__(self, runtime=None, model_id='text-default', max_output_tokens=2048):
         if not isinstance(model_id, str) or not model_id.strip():
             raise ValueError('请选择本地项目模型。')
@@ -38,8 +40,9 @@ class LocalProjectModel:
         self.model_id = model_id
         self.max_output_tokens = max_output_tokens
 
-    def complete_tools(self, messages, tools, cancel_event=None, context=16384):
+    def complete_tools(self, messages, tools, cancel_event=None, context=16384, on_reasoning=None):
         from local_runtime import MissingCapability, RuntimeCancelled
+        from compute_guard import ComputeBusy
 
         cancelled_message = '已停止本地项目模型的本次生成。'
         if cancel_event is not None and cancel_event.is_set():
@@ -61,6 +64,9 @@ class LocalProjectModel:
                 url = runtime.ensure_server(context, False, cancel_event, self.model_id)
             except (RuntimeCancelled, APICancelled):
                 raise
+            except ComputeBusy:
+                raise APIError('本地模型正被另一个 Free AI 窗口或训练任务占用。'
+                               '请等待任务结束，或在那个窗口的设置中释放模型后重试。') from None
             except MissingCapability as error:
                 if error.package_id in ('engine-cpu', 'engine-cuda'):
                     message = '本地运行组件缺失或不完整，请在能力中心安装或修复。'
@@ -77,7 +83,8 @@ class LocalProjectModel:
             except (AttributeError, TypeError, ValueError):
                 raise APIError('本地工具调用连接配置无效。') from None
             client.request_timeout = max(client.request_timeout, getattr(runtime, 'request_timeout', 300), 300)
-            return client.complete_tools(messages, tools, cancel_event=cancel_event, context=context)
+            return client.complete_tools(messages, tools, cancel_event=cancel_event, context=context,
+                                         on_reasoning=on_reasoning)
         except (RuntimeCancelled, APICancelled):
             cancelled = True
             raise APICancelled(cancelled_message) from None

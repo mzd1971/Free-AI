@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--state', choices=('home', 'chat', 'compact'), default='home')
+    parser.add_argument('--state', choices=('home', 'chat', 'compact', 'activity'), default='home')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--capture-tool', type=Path)
     args = parser.parse_args()
@@ -21,11 +21,14 @@ def main():
         sys.path.insert(0, str(ROOT))
         import tkinter as tk
         from client_app import ClientApp
+        if sys.platform == 'win32':
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
         root = tk.Tk()
         app = ClientApp(root)
         root.title('Free AI · 布局预览')
         if args.state == 'compact':
-            root.geometry('940x740+20+20')
+            root.geometry(f'{app.px(940)}x{app.px(740)}+20+20')
             app.text_size_choice.set('特大')
             app.change_text_size()
         else:
@@ -43,6 +46,19 @@ def main():
             app.load_conversation(identity)
             app.input.insert('1.0', '接下来，帮我检查项目的测试结果。')
             app.project.set_mode(True)
+            if args.state == 'activity':
+                from project_chat import ActivityCard
+                app.append_heading('Free AI', 'assistant')
+                card = ActivityCard(app.project, scratch, assistant=True)
+                app.project.cards.append(card)
+                card.activity = '布局演示数据：任务过程、模型说明和正式回答分别显示。'
+                card.finish({'status': 'completed', 'answer': '布局预览', 'capability_mode': 'assistant',
+                             'reasoning': '这是展示区域的排版示例。实际使用时，仅显示模型接口返回的说明。',
+                             'task_state': {'plan': [{'text': '整理输入内容', 'status': 'completed'},
+                                                     {'text': '展示结果', 'status': 'completed'}]}})
+                card.toggle()
+                app.write(app.transcript, '\n这里继续展示正式回答。展开过程不会打开新页面。\n', True)
+                app.transcript.see('end')
 
         def ready():
             app.layout_chat()

@@ -11,6 +11,8 @@ import sqlite3
 import unicodedata
 import uuid
 
+from clock_context import clock_query_kind
+
 
 KINDS = frozenset({'preference', 'fact', 'procedure', 'note'})
 SCOPES = frozenset({'global', 'agent', 'project'})
@@ -32,6 +34,58 @@ SECRET = re.compile(
 )
 STOP_TERMS = frozenset({'the', 'and', 'that', 'with', 'from', 'this', 'for', 'have',
                         '这个', '需要', '可以', '如何', '怎么', '请帮', '一下', '我的', '这个', '一个'})
+_ACKNOWLEDGMENT = re.compile(
+    r'(?:好[的呀啊吧]?|嗯+|收到|明白了?|知道了|了解了?|继续|谢谢(?:你)?|多谢|你好|再见'
+    r'|ok(?:ay)?|yes|sure|got it|understood|continue|go on|thanks|thank you|hi|hello|bye)'
+)
+_TURN_LABEL = re.compile(
+    r'(?:本轮|当前)?用户(?:原话|消息|输入|提问|问题|请求)|本轮(?:消息|对话|提问)'
+    r'|(?:the )?user(?:\'s)? (?:message|input|query|question|request)'
+)
+_CLOCK_LABEL = re.compile(
+    r'(?:今天|今日|明天|昨日|昨天|当前|现在|目前|本地|系统)(?:的)?(?:日期|时间|时刻|星期|星期几|星期[一二三四五六日天])'
+    r'|(?:today\'s|tomorrow\'s|yesterday\'s|current|local|system) (?:date|time|day)(?: of the week)?'
+)
+_WEEKDAY = r'(?:星期|周|礼拜)[一二三四五六日天]|(?:mon|tues|wednes|thurs|fri|satur|sun)day'
+_CLOCK_VALUE = (
+    r'(?:\d{4}\s*年\s*)?\d{1,2}\s*月\s*\d{1,2}\s*[日号]'
+    r'|\d{4}[-/.]\d{1,2}[-/.]\d{1,2}'
+    r'|(?:january|february|march|april|may|june|july|august|september|october|november|december) \d{1,2},? \d{4}'
+    r'|\d{1,2}:\d{2}(?::\d{2})?(?:\s*[ap]m)?'
+    r'|\d{1,2}点(?:\d{1,2}分?)?'
+    rf'|{_WEEKDAY}'
+)
+_CLOCK_ONLY = re.compile(rf'(?:{_CLOCK_VALUE})(?:[\s,、]+(?:{_CLOCK_VALUE})|\s*\((?:{_WEEKDAY})\))*')
+_CLOCK_STATEMENT = re.compile(
+    r'(?:今天|今日|明天|昨日|昨天|当前|现在|目前|本地|系统)(?:的)?(?:日期|时间|时刻)?\s*(?:是|为|:)\s*'
+    r'|(?:today(?:\'s (?:date|day))?|tomorrow|yesterday|(?:current|local|system) (?:date|time))\s*(?:is|:)\s*'
+)
+
+
+def _normalized_label(value):
+    normalized = unicodedata.normalize('NFKC', value).casefold().replace('’', "'")
+    return ' '.join(normalized.split()).strip(' !?。,.，:：')
+
+
+def is_transient_turn(value):
+    """Recognize simple clock queries and stand-alone conversational acknowledgments."""
+    if clock_query_kind(value):
+        return True
+    parts = [part.strip() for part in re.split(r'[,、。!?;]+', _normalized_label(value)) if part.strip()]
+    return bool(parts) and all(_ACKNOWLEDGMENT.fullmatch(part) for part in parts)
+
+
+def is_turn_label(value):
+    return bool(_TURN_LABEL.fullmatch(_normalized_label(value)))
+
+
+def is_clock_snapshot(title, content):
+    """Recognize a relative date or clock reading recorded as a fact."""
+    content = _normalized_label(content)
+    opening = _CLOCK_STATEMENT.match(content)
+    if opening and _CLOCK_ONLY.fullmatch(content[opening.end():]):
+        return True
+    return bool(_CLOCK_LABEL.fullmatch(_normalized_label(title)) and _CLOCK_ONLY.fullmatch(content))
 
 
 def _now():
@@ -297,14 +351,20 @@ class AgentMemoryStore:
         if budget < len(HEADER.encode('utf-8')) + 40:
             return {'context': '', 'memory_ids': []}
         query_terms = _terms(query)
+        clock_query = clock_query_kind(query)
         overview = MEMORY_OVERVIEW.fullmatch(unicodedata.normalize('NFKC', query).strip().rstrip('?!。！').strip())
         ranked = []
         for item in self.list(agent_id=agent_id, workspace=workspace, include_disabled=False):
             if item['status'] != 'active':
                 continue
+            user = item['source'] == 'user'
+            if (clock_query or not user) and is_clock_snapshot(item['title'], item['content']):
+                continue
+            if (not user and is_transient_turn(item['content'])
+                    and (is_turn_label(item['title']) or is_transient_turn(item['title']))):
+                continue
             title_match = len(query_terms & _terms(item['title']))
             body_match = len(query_terms & _terms(item['content']))
-            user = item['source'] == 'user'
             if title_match or body_match or item['kind'] == 'preference' or item['pinned'] or overview:
                 ranked.append(((user, item['pinned'], title_match * 3 + body_match), item))
         ranked.sort(key=lambda match: match[0], reverse=True)

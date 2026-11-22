@@ -5,7 +5,9 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import random
+import tempfile
 import time
 from contextlib import nullcontext
 from datetime import datetime
@@ -17,12 +19,54 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
 from paths import ROOT, RUNS_ROOT, DATA_ROOT, base_model_path
 from compute_guard import ComputeLease
+from training_evaluation import ACCEPTANCE_FILE, evaluate_comparison
+
 MODEL = "Qwen/Qwen3-0.6B"
 SYSTEM = "你是一个中文助手。请准确、简洁地回答；不确定时说明不确定，不要编造已执行的操作。"
+CHECKPOINT_FILES = ("adapter/adapter_config.json", "adapter/adapter_model.safetensors")
 
 
 def dump(path, obj):
-    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    path = Path(path)
+    stream = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                        prefix=path.name + ".", suffix=".tmp", delete=False)
+    temporary = Path(stream.name)
+    try:
+        with stream:
+            json.dump(obj, stream, ensure_ascii=False, indent=2, allow_nan=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def file_sha256(path, check_stop=None):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        while chunk := stream.read(4 * 1024 * 1024):
+            if check_stop:
+                check_stop()
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verified_base(snapshot, check_stop=None):
+    catalog = json.loads((ROOT / "capability_catalog.json").read_text(encoding="utf-8"))
+    spec = next(item for item in catalog["packages"] if item["id"] == "legacy-training-model")
+    required = {"config.json", "model.safetensors", "tokenizer.json", "tokenizer_config.json"}
+    verified = {}
+    for asset in spec["assets"]:
+        name = asset["filename"]
+        path = Path(snapshot) / name
+        if name not in required and not path.exists():
+            continue
+        if not path.is_file() or path.stat().st_size != asset["size"] or file_sha256(path, check_stop) != asset["sha256"]:
+            raise ValueError(f"基础模型文件 {name} 与能力中心固定的训练版本不一致。")
+        verified[name] = asset["sha256"]
+    if not required.issubset(verified):
+        raise ValueError("缺少可验证的基础模型文件。")
+    return spec["version"], verified
 
 
 def read_rows(name, data_dir=None):
@@ -74,8 +118,9 @@ def answer(model, tokenizer, prompt, max_tokens=192):
                                   eos_token_id=tokenizer.eos_token_id)
     output = model.generate(input_ids=inputs, attention_mask=torch.ones_like(inputs), generation_config=generation)
     new_ids = output[0, inputs.shape[1]:]
+    ended = len(new_ids) > 0 and int(new_ids[-1].item()) == tokenizer.eos_token_id
     return {"text": tokenizer.decode(new_ids, skip_special_tokens=True).strip(),
-            "new_tokens": len(new_ids), "hit_token_limit": len(new_ids) >= max_tokens}
+            "new_tokens": len(new_ids), "hit_token_limit": len(new_ids) >= max_tokens and not ended}
 
 
 def run(epochs=3, data_dir=None, initial_adapter=None, output_prefix="qwen-lora", learning_rate=0.0001, stop_file=None):
@@ -96,17 +141,18 @@ def run(epochs=3, data_dir=None, initial_adapter=None, output_prefix="qwen-lora"
     check_stop()
     files = ["sft_train.jsonl", "sft_validation.jsonl", "sft_test.jsonl", "sft_general_test.jsonl"]
     groups = [read_rows(name, data_dir) for name in files]
+    if not groups[0] or not groups[1]:
+        raise ValueError("训练集和验证集都需要至少一道题。")
     all_prompts = [row["prompt"].strip() for group in groups for row in group]
     if len(all_prompts) != len(set(all_prompts)):
         raise ValueError("数据存在重复问题，停止训练。")
     for name, group in zip(files, groups):
         (target / name).write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in group), encoding="utf-8")
-    snapshot = base_model_path()
-    manifest = Path(snapshot) / 'bundle_source.json'
-    revision = json.loads(manifest.read_text(encoding='utf-8'))['revision'] if manifest.exists() else Path(snapshot).name
-    tokenizer = AutoTokenizer.from_pretrained(snapshot, local_files_only=True)
+    snapshot = str(base_model_path())
+    revision, base_hashes = verified_base(snapshot, check_stop)
+    tokenizer = AutoTokenizer.from_pretrained(snapshot, local_files_only=True, use_fast=True)
     base = AutoModelForCausalLM.from_pretrained(snapshot, torch_dtype=torch.bfloat16,
-        device_map={"": "cuda"}, attn_implementation="sdpa", local_files_only=True)
+        device_map={"": "cuda"}, attn_implementation="sdpa", local_files_only=True, use_safetensors=True)
     torch.cuda.reset_peak_memory_stats()
     model = (PeftModel.from_pretrained(base, initial_adapter, is_trainable=True) if initial_adapter else
         get_peft_model(base, LoraConfig(r=8, lora_alpha=16, lora_dropout=0.05,
@@ -115,6 +161,7 @@ def run(epochs=3, data_dir=None, initial_adapter=None, output_prefix="qwen-lora"
     val_batches = [encode_row(tokenizer, row) for row in groups[1]]
     test_rows = [dict(row, group=label) for rows, label in [(groups[2], "domain"), (groups[3], "general")] for row in rows]
     config = {"base_model": MODEL, "revision": revision, "base_snapshot": snapshot,
+        "base_model_sha256": base_hashes["model.safetensors"], "base_assets_sha256": base_hashes,
         "system_prompt": SYSTEM, "epochs": epochs, "learning_rate": learning_rate,
         "initial_adapter": str(initial_adapter) if initial_adapter else None,
         "baseline": "initial_adapter" if initial_adapter else "base_model",
@@ -128,9 +175,11 @@ def run(epochs=3, data_dir=None, initial_adapter=None, output_prefix="qwen-lora"
         "gpu": torch.cuda.get_device_name(0), "torch": str(torch.__version__),
         "precision": "bfloat16 base, float32 trainable adapter", "generation_max_tokens": 192}
     dump(target / "run_config.json", config)
+    publication_inputs = {"run_config.json": file_sha256(target / "run_config.json")}
     print(json.dumps({"event": "loaded", "run": str(target), **config}, ensure_ascii=False), flush=True)
     metrics = []
     comparisons = []
+    dump(target / "comparison.json", comparisons)
     with (nullcontext() if initial_adapter else model.disable_adapter()):
         baseline_val = validation_loss(model, val_batches, check_stop)
         for row in test_rows:
@@ -172,36 +221,46 @@ def run(epochs=3, data_dir=None, initial_adapter=None, output_prefix="qwen-lora"
                     "allocated_gb": torch.cuda.memory_allocated() / 2**30}), flush=True)
         val = validation_loss(model, val_batches, check_stop)
         check_stop()
-        metrics.append({"epoch": epoch, "updates": updates, "train_loss": total_loss / len(order), "validation_loss": val})
-        dump(target / "metrics.json", {"baseline_validation_loss": baseline_val, "epochs": metrics})
-        if val < best_loss:
+        metrics.append({"epoch": epoch, "updates": updates, "train_loss": total_loss / len(order),
+                        "validation_loss": val if math.isfinite(val) else None})
+        dump(target / "metrics.json", {"baseline_validation_loss": baseline_val if math.isfinite(baseline_val) else None,
+                                       "epochs": metrics})
+        if math.isfinite(val) and 0 <= val < best_loss:
             best_loss, best_epoch = val, epoch
             model.save_pretrained(target / "adapter")
             tokenizer.save_pretrained(target / "adapter")
-        print(json.dumps({"event": "epoch_end", **metrics[-1], "best_epoch": best_epoch}), flush=True)
+        print(json.dumps({"event": "epoch_end", **metrics[-1], "validation_loss": val, "best_epoch": best_epoch}), flush=True)
     training_seconds = time.monotonic() - training_start
     model.gradient_checkpointing_disable()
     model.disable_input_require_grads()
-    # 只按验证损失选检查点；留出测试不用于选择或调参。
-    model.load_adapter(target / "adapter", adapter_name="selected", is_trainable=False)
-    model.set_adapter("selected")
-    model.eval()
-    for row in comparisons:
-        check_stop()
-        row["after"] = answer(model, tokenizer, row["prompt"])
-        check_stop()
-        dump(target / "comparison.json", comparisons)
-        print(json.dumps({"event": "evaluation", "id": row["id"]}), flush=True)
-    summary = {"run_dir": str(target), "baseline_validation_loss": baseline_val,
-        "best_validation_loss": best_loss, "best_epoch": best_epoch, "updates": updates,
+    if best_epoch:
+        # 只按验证损失选检查点；留出测试不用于选择或调参。
+        publication_inputs.update({name: file_sha256(target / name, check_stop) for name in CHECKPOINT_FILES})
+        model.load_adapter(target / "adapter", adapter_name="selected", is_trainable=False)
+        model.set_adapter("selected")
+        model.eval()
+        for row in comparisons:
+            check_stop()
+            row["after"] = answer(model, tokenizer, row["prompt"])
+            check_stop()
+            dump(target / "comparison.json", comparisons)
+            print(json.dumps({"event": "evaluation", "id": row["id"]}), flush=True)
+    publication_inputs["comparison.json"] = file_sha256(target / "comparison.json", check_stop)
+    acceptance = evaluate_comparison(comparisons, baseline_val_loss=baseline_val, best_val_loss=best_loss,
+                                     expected_test_count=len(test_rows), checkpoint_available=best_epoch > 0)
+    summary = {"run_dir": str(target), "baseline_validation_loss": acceptance["validation"]["baseline_loss"],
+        "best_validation_loss": acceptance["validation"]["best_loss"], "best_epoch": best_epoch, "updates": updates,
         "training_seconds": training_seconds, "total_seconds": time.monotonic() - start,
         "peak_allocated_gb": torch.cuda.max_memory_allocated() / 2**30,
         "peak_reserved_gb": torch.cuda.max_memory_reserved() / 2**30,
-        "test_count": len(comparisons), "completed": True}
+        "test_count": len(test_rows), "completed": True, "status": "completed",
+        "acceptance_status": acceptance["status"], "acceptance_file": ACCEPTANCE_FILE,
+        "publication_inputs": publication_inputs}
     check_stop()
+    dump(target / ACCEPTANCE_FILE, acceptance)
     dump(target / "summary.json", summary)
     print(json.dumps(summary, ensure_ascii=False), flush=True)
-    if output_prefix != 'desktop-smoke':
+    if output_prefix != 'desktop-smoke' and acceptance["status"] == "passed":
         try:
             from epistemology import record_training
             print(json.dumps({'event': 'training_experience', **record_training(summary)}, ensure_ascii=False), flush=True)

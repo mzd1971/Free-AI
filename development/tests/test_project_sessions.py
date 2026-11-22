@@ -57,6 +57,21 @@ class ProjectSessionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             sessions.set_project_settings('missing', {'enabled': True})
 
+    def test_assistant_settings_and_failed_tool_record_survive_reopen(self):
+        sessions = Sessions(self.root)
+        identity = sessions.create()
+        sessions.set_project_settings(identity, {'assistant_enabled': False, 'allow_web': True})
+        sessions.append(identity, 'user', '检查 JSON')
+        result = {'answer': '仍需修正', 'status': 'unfinished', 'capability_mode': 'assistant',
+                  'csv_attachment': True, 'task_state': {'failed_utilities': ['check_json']}}
+        sessions.append_project_reply(identity, result, 'D:/internal-assistant', 'JSON 检查失败')
+        reopened = Sessions(self.root)
+        self.assertEqual(reopened.project_settings(identity), {'assistant_enabled': False, 'allow_web': True})
+        self.assertEqual(reopened.project_runs(identity)[0]['result'], result)
+        for invalid in ({'capability_mode': 'full'}, {'csv_attachment': 'true'}):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                sessions.append_project_reply(identity, {**result, **invalid}, '', '')
+
     def test_permission_mode_stays_with_its_workspace(self):
         sessions = Sessions(self.root)
         first, second = sessions.create(), sessions.create()

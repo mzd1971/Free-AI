@@ -2,12 +2,13 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from queue import Queue
+from types import SimpleNamespace
 import threading
 import unittest
 from unittest.mock import patch
 
 from local_project_model import LocalProjectModel
-from local_runtime import RuntimeCancelled
+from local_runtime import LocalRuntime, RuntimeCancelled
 from remote_api import APICancelled, APIError
 
 
@@ -17,6 +18,12 @@ TOOLS = [{'type': 'function', 'function': {'name': 'read_file', 'parameters': {
     'type': 'object', 'properties': {'path': {'type': 'string'}}}}}]
 CALL = {'id': 'call_fixture', 'type': 'function', 'function': {
     'name': 'read_file', 'arguments': '{"path":"fixture.txt"}'}}
+
+
+def stream(*deltas):
+    lines = [f'data: {json.dumps({"choices": [{"delta": delta, "finish_reason": finish}]})}'
+             for delta, finish in deltas]
+    return ('\n\n'.join(lines + ['data: [DONE]']) + '\n\n').encode('utf-8')
 
 
 class FixtureRuntime:
@@ -60,10 +67,14 @@ class LocalProjectModelTests(unittest.TestCase):
                 if reply is None:
                     release.wait(timeout=3)
                     return
-                message, reason = reply
-                raw = json.dumps({'choices': [{'message': message, 'finish_reason': reason}]}).encode('utf-8')
+                if isinstance(reply, bytes):
+                    raw, content_type = reply, 'text/event-stream'
+                else:
+                    message, reason = reply
+                    raw = json.dumps({'choices': [{'message': message, 'finish_reason': reason}]}).encode('utf-8')
+                    content_type = 'application/json'
                 self.send_response(200)
-                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Type', content_type)
                 self.send_header('Content-Length', str(len(raw)))
                 self.end_headers()
                 self.wfile.write(raw)
@@ -111,6 +122,40 @@ class LocalProjectModelTests(unittest.TestCase):
         self.assertEqual(self.requests.get_nowait()[2]['messages'], messages)
         self.assertFalse(self.runtime._request_lock.locked())
 
+    def test_local_tool_adapter_forwards_reasoning_callback(self):
+        self.replies.put(stream(
+            ({'reasoning_content': 'Inspect.'}, None),
+            ({'tool_calls': [dict(CALL, index=0)]}, 'tool_calls'),
+        ))
+        thoughts = []
+        model = LocalProjectModel(self.runtime)
+        assistant = model.complete_tools([USER], TOOLS, on_reasoning=thoughts.append)
+        self.assertIs(self.requests.get_nowait()[2]['stream'], True)
+        self.assertEqual(thoughts, ['Inspect.'])
+        self.assertEqual(assistant, {'role': 'assistant', 'content': None, 'tool_calls': [CALL],
+                                     'reasoning_content': 'Inspect.'})
+
+    def test_ordinary_local_chat_separates_thoughts_and_keeps_the_default_setting(self):
+        self.replies.put(stream(
+            ({'content': '<th'}, None),
+            ({'content': 'ink>A fixture thought</think>'}, None),
+            ({'content': 'The answer.'}, 'stop'),
+        ))
+        runtime = LocalRuntime(manager=SimpleNamespace())
+        runtime._base_url = self.runtime.url
+        self.addCleanup(runtime.shutdown)
+        tokens, thoughts = [], []
+        with patch.object(runtime, 'ensure_server'), patch.object(
+                runtime, '_messages', return_value=([USER], 256, 10)):
+            answer = runtime.generate('A fixture question.', on_token=tokens.append, on_reasoning=thoughts.append)
+        payload = self.requests.get_nowait()[2]
+        self.assertIs(payload['chat_template_kwargs']['enable_thinking'], False)
+        self.assertEqual(payload['reasoning_effort'], 'none')
+        self.assertEqual(answer, 'The answer.')
+        self.assertEqual(tokens, ['The answer.'])
+        self.assertEqual(thoughts, ['A fixture thought'])
+        self.assertEqual(runtime.last_reasoning, 'A fixture thought')
+
     def test_cancel_during_http_releases_lock_and_managed_runtime(self):
         self.replies.put(None)
         cancelled, results = threading.Event(), Queue()
@@ -144,6 +189,15 @@ class LocalProjectModelTests(unittest.TestCase):
     def test_startup_error_is_sanitized_and_lock_released(self):
         self.runtime.start_error = RuntimeError(TOKEN)
         with self.assertRaisesRegex(APIError, '无法启动') as outcome:
+            LocalProjectModel(self.runtime).complete_tools([USER], TOOLS)
+        self.assertNotIn(TOKEN, str(outcome.exception))
+        self.assertFalse(self.runtime._request_lock.locked())
+        self.assertTrue(self.requests.empty())
+
+    def test_busy_model_explains_how_to_release_without_exposing_owner(self):
+        from compute_guard import ComputeBusy
+        self.runtime.start_error = ComputeBusy({'kind': 'inference', 'pid': 999, 'description': TOKEN})
+        with self.assertRaisesRegex(APIError, '释放模型') as outcome:
             LocalProjectModel(self.runtime).complete_tools([USER], TOOLS)
         self.assertNotIn(TOKEN, str(outcome.exception))
         self.assertFalse(self.runtime._request_lock.locked())

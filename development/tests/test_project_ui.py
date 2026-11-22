@@ -94,15 +94,17 @@ class NativeProjectScenario(unittest.TestCase):
             self.assertFalse(app.project.enabled.get())
             self.assertIs(app.project.bar.master, app.context_bar)
             self.assertIs(app.project.permissions_button.master, app.composer_tools)
-            self.assertEqual(app.project.chat_button.cget('text'), '日常对话')
+            self.assertEqual(app.project.chat_button.cget('text'), '智能助手')
             self.assertEqual(app.project.project_button.cget('text'), '项目助手')
             self.assertTrue(app.project.folder_button.winfo_manager())
-            self.assertFalse(app.project.permissions_button.winfo_manager())
+            self.assertTrue(app.project.permissions_button.winfo_manager())
             with patch('project_chat.filedialog.askdirectory', return_value=''):
                 app.project.folder_button.invoke()
             self.assertFalse(app.project.enabled.get())
             self.assertFalse(app.project.workspace.get())
             draft(app, '这是原来的聊天问题')
+            # Explicit opt-out keeps the legacy plain-generation path covered.
+            app.project.assistant_enabled.set(False)
             with patch.object(app.manager, 'ready', return_value=True), patch('qwen_chat.chat',
                     return_value={'answer': '这是原来的聊天回答'}) as chat:
                 app.send_chat()
@@ -121,11 +123,13 @@ class NativeProjectScenario(unittest.TestCase):
             self.assertEqual(app.history, initial_history)
             self.assertEqual(app.input.get('1.0', 'end-1c'), first_task)
             self.assertEqual(app.project.workspace.get(), str(workspace))
-            self.assertEqual(app.project.folder_button.cget('text'), workspace.name + ' ▾')
+            self.assertEqual(app.project.folder_button.cget('text'), workspace.name)
+            self.assertEqual(app.project.folder_button.cget('icon'), 'folder')
             self.assertTrue(app.project.permissions_button.winfo_manager())
             self.assertFalse(app.project.location.winfo_manager())
             permissions = app.project.permissions_menu
-            self.assertEqual(app.project.permissions_button.cget('text'), '逐条确认命令 ▾')
+            self.assertEqual(app.project.permissions_button.cget('text'), '逐条确认命令')
+            self.assertEqual(app.project.permissions_button.cget('icon'), 'chevron_down')
             with patch.object(app, 'open_project_in_editor') as editor, patch.object(app, 'open_project_terminal') as terminal:
                 permissions.invoke('在编辑器中打开项目')
                 permissions.invoke('在终端中打开项目')
@@ -447,11 +451,11 @@ class NativeProjectScenario(unittest.TestCase):
                                                            'allow_write': False})
             app.load_conversation(legacy_id)
             self.assertEqual(app.project.permission_mode.get(), 'readonly')
-            self.assertEqual(app.project.permissions_button.cget('text'), '只看项目 ▾')
+            self.assertEqual(app.project.permissions_button.cget('text'), '只看项目')
             self.assertEqual(permissions.entrycget('允许文件工具修改', 'state'), 'disabled')
             self.assertIn('文件修改和命令执行关闭', app.chat_hint.get())
             app.project.chat_button.invoke()
-            self.assertFalse(app.project.permissions_button.winfo_manager())
+            self.assertTrue(app.project.permissions_button.winfo_manager())
             self.assertTrue(app.project.folder_button.winfo_manager())
             with patch('project_chat.filedialog.askdirectory', return_value=str(alternate)):
                 app.project.folder_button.invoke()
@@ -480,7 +484,7 @@ class NativeProjectScenario(unittest.TestCase):
 
             permissions.invoke('自动执行命令')
             self.assertEqual(app.project.permission_mode.get(), 'automatic')
-            self.assertEqual(app.project.permissions_button.cget('text'), '自动执行命令 ▾')
+            self.assertEqual(app.project.permissions_button.cget('text'), '自动执行命令')
             self.assertIn('可访问项目目录之外的文件和网络', app.chat_hint.get())
             app.new_conversation()
             self.assertEqual(app.project.permission_mode.get(), 'standard')

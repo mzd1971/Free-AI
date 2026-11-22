@@ -6,6 +6,7 @@ from tkinter import filedialog, ttk
 
 from api_panel import APISettingsPanel
 from coding_tools import load_preferences, save_preferences
+from keyboard_shortcuts import COMPOSER_SHORTCUTS, SHORTCUTS
 from paths import ARTIFACTS, ROOT
 from project_chat import PERMISSION_LABELS
 from ui_kit import CLIENT_SKINS, COLORS as C, FONT, FlatButton, RoundedFrame, ScrollArea, label, ui_font
@@ -17,6 +18,7 @@ CATEGORIES = {
     'coding': '编程工具',
     'models': '模型与 API',
     'appearance': '外观',
+    'shortcuts': '快捷键',
     'storage': '文件位置',
     'about': '关于',
 }
@@ -71,6 +73,7 @@ class SettingsPanel(tk.Frame):
         self.build_coding_tools()
         self.build_models()
         self.build_appearance()
+        self.build_shortcuts()
         self.build_storage()
         self.build_about()
         area.bind_wheel(self.body)
@@ -310,6 +313,11 @@ class SettingsPanel(tk.Frame):
         self.description(models, '模型位置可在安装时选择，默认为 FreeAI 文件夹内的 models 目录。').pack(
             fill='x', pady=(6, 0))
         self.actions(models, [('打开模型文件夹', app.open_model_folder)])
+
+    def build_shortcuts(self):
+        entries = (*COMPOSER_SHORTCUTS, *((item.keys, item.description) for item in SHORTCUTS))
+        for keys, description in entries:
+            self.card('shortcuts', keys, description)
 
     def build_about(self):
         about = self.card('about', 'Free AI', '版本 2.8.0', '使用说明 帮助')

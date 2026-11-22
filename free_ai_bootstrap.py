@@ -80,6 +80,10 @@ def self_test(trainer=False):
                 app.send_chat()
                 assert app.current_page == 1
                 assert app.input.get('1.0', 'end').strip() == '缺少模型时保留草稿'
+                assert app.project.assistant_enabled.get()
+                # Keep the streaming/cancel smoke on the plain generator. The
+                # unified tool loop is covered by the native integration suite.
+                app.project.assistant_enabled.set(False)
                 app.input.delete('1.0', 'end')
                 app.input.insert('1.0', '保存对话测试')
                 def fake_chat(*args, **kwargs):

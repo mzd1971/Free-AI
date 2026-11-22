@@ -24,6 +24,7 @@ import wave
 import zlib
 
 from compute_guard import ComputeLease, WindowsJob
+from remote_api import APIError, _CompletionText, _stream_events
 
 
 SYSTEM = (
@@ -41,59 +42,6 @@ _DEFAULT_MODEL = {'id': DEFAULT_MODEL_ID, 'title': '默认文字模型',
     'chat_template_kwargs': {'enable_thinking': False}}
 
 
-class _ThoughtFilter:
-    """Separate tagged reasoning even when control tags straddle SSE chunks.
-
-    Structured reasoning is handled by the server. For older/raw streams,
-    DeepSeek may prefill the opening think tag: delay undecided content until a
-    closing tag or completion, so it cannot leak into the saved final answer.
-    """
-    def __init__(self):
-        self.buffer = ''
-        self.in_thought = False
-        self.undecided = True
-        self.thoughts = []
-
-    def structured_reasoning_seen(self):
-        self.undecided = False
-
-    def feed(self, text, final=False):
-        self.buffer += text
-        if self.undecided:
-            stripped = self.buffer.lstrip()
-            if stripped.startswith('<think>'):
-                self.undecided = False
-            elif '</think>' in self.buffer:
-                thought, self.buffer = self.buffer.split('</think>', 1)
-                self.thoughts.append(thought)
-                self.undecided = False
-            elif not final:
-                return ''
-            else:
-                self.undecided = False
-        output = []
-        while self.buffer:
-            tags = [(self.buffer.find(tag), tag) for tag in ('<think>', '</think>')]
-            tags = [(offset, tag) for offset, tag in tags if offset >= 0]
-            if tags:
-                offset, tag = min(tags)
-                fragment, self.buffer = self.buffer[:offset], self.buffer[offset + len(tag):]
-                (self.thoughts if self.in_thought else output).append(fragment)
-                self.in_thought = tag == '<think>'
-                continue
-            keep = 0
-            if not final:
-                for tag in ('<think>', '</think>'):
-                    for count in range(1, len(tag)):
-                        if self.buffer.endswith(tag[:count]):
-                            keep = max(keep, count)
-            fragment = self.buffer[:-keep] if keep else self.buffer
-            (self.thoughts if self.in_thought else output).append(fragment)
-            self.buffer = self.buffer[-keep:] if keep else ''
-            break
-        return ''.join(output)
-
-
 class RuntimeCancelled(RuntimeError):
     """The user stopped an active operation; partial output is not a success."""
 
@@ -105,6 +53,8 @@ class MissingCapability(RuntimeError):
 
 
 class LocalRuntime:
+    supports_reasoning_callback = True
+
     def __init__(self, manager=None, startup_timeout=180, request_timeout=300,
                  compute_root=None):
         if manager is None:
@@ -215,6 +165,8 @@ class LocalRuntime:
             command += ['--chat-template-kwargs', json.dumps(spec['chat_template_kwargs'], separators=(',', ':'))]
         if spec.get('reasoning_style') == 'deepseek':
             command += ['--reasoning-format', 'deepseek']
+        if spec.get('local_training') is True:
+            command += ['--lora', str(self._require(model_id, '经过验收的训练成果'))]
         if image_mode:
             command += ['--mmproj', str(self._require('vision', '看图能力包')),
                         '--image-max-tokens', str(IMAGE_TOKENS)]
@@ -244,7 +196,9 @@ class LocalRuntime:
         log_dir.mkdir(parents=True, exist_ok=True)
         command = self._command(executable, model, context, image_mode, port,
                                 gpu=engine == 'engine-cuda', model_id=model_id)
-        self._mark_packages([engine, model_id] + (['vision'] if image_mode else []), True)
+        spec = self._model_spec(model_id)
+        dependencies = [spec['base_model_id']] if spec.get('local_training') is True else []
+        self._mark_packages([engine, model_id, *dependencies] + (['vision'] if image_mode else []), True)
         env = {key: value for key, value in os.environ.items()
                if not key.startswith(('LLAMA_', 'MTMD_'))}
         env['LLAMA_API_KEY'] = self._token
@@ -291,10 +245,14 @@ class LocalRuntime:
 
     def ensure_server(self, context=4096, image_mode=False, cancel_event=None,
                       model_id=DEFAULT_MODEL_ID):
+        if isinstance(model_id, str) and model_id.startswith('trained-'):
+            self.manager.refresh_trained_models()
         spec = self._selection(model_id, context, image_mode)
         context = self._validate_context(context, spec)
         self._cancelled(cancel_event)
         model = self._require(model_id, spec.get('short_name') or spec['title'])
+        if spec.get('local_training') is True:
+            model = self._require(spec['base_model_id'], '与训练成果匹配的基础模型')
         if image_mode:
             self._require('vision', '看图能力包')
         engine = 'engine-cuda' if self.manager.ready('engine-cuda') else 'engine-cpu'
@@ -398,6 +356,8 @@ class LocalRuntime:
 
     def _messages(self, message, history, context, image_path=None,
                   model_id=DEFAULT_MODEL_ID):
+        from clock_context import temporal_context
+        system = SYSTEM + '\n' + temporal_context()
         spec = self._selection(model_id, context, bool(image_path))
         turns = self._history_turns(history)
         prompt = {'role': 'user', 'content': message}
@@ -410,9 +370,9 @@ class LocalRuntime:
         while True:
             messages = [dict(row) for turn in turns for row in turn] + [dict(prompt)]
             if spec.get('system_prompt_mode') == 'prepend_user':
-                messages[0]['content'] = SYSTEM + '\n\n' + messages[0]['content']
+                messages[0]['content'] = system + '\n\n' + messages[0]['content']
             else:
-                messages.insert(0, {'role': 'system', 'content': SYSTEM})
+                messages.insert(0, {'role': 'system', 'content': system})
             # Image bytes are not text tokens. Count text and reserve the configured
             # maximum image tokens; the server still rejects any overflow.
             counting = [dict(row) for row in messages]
@@ -436,7 +396,7 @@ class LocalRuntime:
                 return
 
     def generate(self, message, history=None, context=4096, image_path=None,
-                 on_token=None, cancel_event=None, model_id=DEFAULT_MODEL_ID):
+                 on_token=None, cancel_event=None, model_id=DEFAULT_MODEL_ID, on_reasoning=None):
         if not isinstance(message, str) or not message.strip():
             raise ValueError('请输入你想问的问题。')
         spec = self._selection(model_id, context, bool(image_path))
@@ -466,56 +426,43 @@ class LocalRuntime:
                 payload['chat_template_kwargs'] = spec['chat_template_kwargs']
             if spec.get('reasoning_style') == 'disabled':
                 payload['reasoning_effort'] = 'none'
-            thought_filter = _ThoughtFilter() if spec.get('reasoning_style') == 'deepseek' else None
-            if thought_filter is not None:
+            prefilled = spec.get('reasoning_style') == 'deepseek'
+            if prefilled:
                 payload['reasoning_format'] = 'deepseek'
-            parts, completed, reason = [], False, None
+            parts, reason = [], None
+
+            def check():
+                self._cancelled(cancel_event)
+
+            def emit_reasoning(text):
+                check()
+                if on_reasoning is not None:
+                    on_reasoning(text)
+
+            def emit(text):
+                check()
+                if text:
+                    parts.append(text)
+                    if on_token is not None:
+                        on_token(text)
+
+            parser = _CompletionText(emit_reasoning, prefilled=prefilled)
             with self._http.open(self._request('/v1/chat/completions', payload),
                                  timeout=self.request_timeout) as response:
-                for raw in response:
-                    self._cancelled(cancel_event)
-                    line = raw.decode('utf-8').strip()
-                    if not line.startswith('data:'):
-                        continue
-                    content = line[5:].strip()
-                    if content == '[DONE]':
-                        completed = True
-                        break
-                    event = json.loads(content)
+                for event in _stream_events(response, check):
                     if event.get('error'):
-                        raise RuntimeError('生成失败：' + str(event['error']))
+                        raise RuntimeError('生成失败，请检查模型和本地运行记录。')
                     if event.get('usage'):
                         self.last_usage = event['usage']
                     choices = event.get('choices') or []
                     if not choices:
                         continue
                     delta = choices[0].get('delta') or {}
-                    reasoning = delta.get('reasoning_content') or delta.get('reasoning')
-                    if isinstance(reasoning, str) and reasoning:
-                        self.last_reasoning += reasoning
-                        if thought_filter is not None:
-                            thought_filter.structured_reasoning_seen()
-                    token = delta.get('content')
-                    if isinstance(token, str) and token:
-                        if thought_filter is not None:
-                            token = thought_filter.feed(token)
-                        if token:
-                            parts.append(token)
-                            if on_token is not None:
-                                on_token(token)
+                    emit(parser.feed(delta))
                     if choices[0].get('finish_reason') is not None:
                         reason = choices[0]['finish_reason']
-            self._cancelled(cancel_event)
-            if not completed:
-                raise RuntimeError('生成连接提前结束。已显示的内容可能不完整，请重试。')
-            if thought_filter is not None:
-                tail = thought_filter.feed('', final=True)
-                self.last_reasoning += ''.join(thought_filter.thoughts)
-                if tail:
-                    parts.append(tail)
-                    if on_token is not None:
-                        on_token(tail)
-                self._cancelled(cancel_event)
+            emit(parser.finish())
+            self.last_reasoning = parser.reasoning or ''
             answer = ''.join(parts).strip()
             if not answer:
                 if self.last_reasoning:
@@ -528,6 +475,9 @@ class LocalRuntime:
                     on_token(suffix)
             self.last_usage.setdefault('prompt_tokens', prompt_tokens)
             return answer
+        except APIError as exc:
+            self._cancelled(cancel_event)
+            raise RuntimeError(str(exc)) from None
         except (OSError, urllib.error.URLError) as exc:
             self._cancelled(cancel_event)
             raise RuntimeError(self._error(exc)) from exc

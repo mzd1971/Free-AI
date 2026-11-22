@@ -1,6 +1,6 @@
 ﻿# Export the approved transparent artwork without changing the source design.
 [CmdletBinding()]
-param([string]$SourceArtwork = 'assets\free-ai-knowledge.png')
+param([string]$SourceArtwork = 'assets\free-ai-white.png')
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
