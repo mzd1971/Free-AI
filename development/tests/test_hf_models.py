@@ -45,6 +45,36 @@ class HuggingFaceModelTests(unittest.TestCase):
         self.addCleanup(scratch.cleanup)
         self.root = Path(scratch.name)
 
+    def test_bundled_recommendations_are_available_as_text_choices_without_downloading(self):
+        expected = (
+            ('text-qwen3-1-7b', 'Qwen3-1.7B-Q8_0.gguf', 1834426016, 4, 'disabled'),
+            ('text-qwen3-4b-instruct-2507', 'Qwen3-4B-Instruct-2507-Q4_K_M.gguf', 2497281120, 6, 'none'),
+            ('text-code-7b', 'qwen2.5-coder-7b-instruct-q4_k_m.gguf', 4683073536, 8, 'none'),
+        )
+        with patch.object(hf_models, '_get_json', side_effect=AssertionError('No startup network allowed')):
+            manager = PackageManager(self.root)
+        runtime = LocalRuntime(manager)
+        for model_id, filename, byte_size, vram, reasoning in expected:
+            with self.subTest(model_id=model_id):
+                self.assertTrue(is_chat_model(manager.catalog, model_id))
+                self.assertFalse(manager.ready(model_id))
+                spec = runtime._selection(model_id, 4096)
+                self.assertEqual(spec['entrypoint'], filename)
+                self.assertEqual(spec['dependencies'], ['engine-cpu'])
+                self.assertEqual(spec['recommended_context'], 4096)
+                self.assertEqual(spec['recommended_vram_gb'], vram)
+                self.assertEqual(spec['reasoning_style'], reasoning)
+                self.assertEqual(spec['chat_template_kwargs'],
+                                 {'enable_thinking': False} if reasoning == 'disabled' else {})
+                self.assertRegex(spec['version'], r'^[a-f0-9]{40}$')
+                asset, = spec['assets']
+                self.assertEqual(asset['filename'], filename)
+                self.assertEqual(asset['size'], byte_size)
+                self.assertEqual(asset['url'], f"{spec['quantized_source']}/resolve/{spec['version']}/{filename}")
+                self.assertRegex(asset['sha256'], r'^[a-f0-9]{64}$')
+                with self.assertRaisesRegex(ValueError, '只支持文字'):
+                    runtime._selection(model_id, 4096, image_mode=True)
+
     def test_search_limits_and_encodes_query_with_list_metadata_only(self):
         requests = []
         rows = [{'id': REPO, 'downloads': 123, 'gated': 'manual'}, {'id': 'unsafe/../reponame'},

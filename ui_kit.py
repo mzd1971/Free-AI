@@ -7,24 +7,24 @@ from weakref import WeakSet
 from ui_preferences import DEFAULT_TEXT_SIZE, TEXT_SCALE
 
 LIGHT_COLORS = {
-    'bg': '#f8faff', 'side': '#edf4ff', 'surface': '#ffffff', 'input': '#ffffff',
-    'text': '#172554', 'muted': '#53627a', 'line': '#b7c9e2',
-    'accent': '#1d4ed8', 'tint': '#e4efff', 'success': '#18724b',
-    'hover': '#dbeafe', 'primary_bg': '#2563eb', 'primary_fg': '#ffffff',
-    'primary_hover': '#1d4ed8', 'disabled_bg': '#e2e8f0', 'disabled_fg': '#64748b',
-    'focus': '#1d4ed8', 'selection_bg': '#cfe2ff', 'selection_fg': '#102b59',
-    'card_border': '#cfdef1', 'selected_bg': '#dceaff', 'selected_fg': '#1e40af',
-    'brand': '#1d4ed8', 'secondary': '#0369a1',
+    'bg': '#f7f9fc', 'side': '#f3f5f9', 'surface': '#ffffff', 'input': '#ffffff',
+    'text': '#202937', 'muted': '#59677b', 'line': '#dce3ed',
+    'accent': '#245bcc', 'tint': '#eef4ff', 'success': '#18724b',
+    'hover': '#eaf0f9', 'primary_bg': '#2864e8', 'primary_fg': '#ffffff',
+    'primary_hover': '#2155ca', 'disabled_bg': '#e9edf3', 'disabled_fg': '#64748b',
+    'focus': '#245bcc', 'selection_bg': '#dce8ff', 'selection_fg': '#163b8c',
+    'card_border': '#e3e8f0', 'selected_bg': '#eaf1ff', 'selected_fg': '#204eaf',
+    'brand': '#202937', 'secondary': '#526176',
 }
 CLIENT_LIGHT_COLORS = {
-    'bg': '#ffffff', 'side': '#f6f7f9', 'surface': '#ffffff', 'input': '#ffffff',
-    'text': '#202630', 'muted': '#586477', 'line': '#e0e5ec',
-    'accent': '#2155c7', 'tint': '#edf3ff', 'success': '#16714c',
-    'hover': '#e9eef5', 'primary_bg': '#275bda', 'primary_fg': '#ffffff',
-    'primary_hover': '#204dbb', 'disabled_bg': '#e9edf3', 'disabled_fg': '#606b7c',
+    'bg': '#ffffff', 'side': '#f6f8fc', 'surface': '#ffffff', 'input': '#ffffff',
+    'text': '#202937', 'muted': '#59677b', 'line': '#dce3ed',
+    'accent': '#245bcc', 'tint': '#eef4ff', 'success': '#16714c',
+    'hover': '#eaf0f9', 'primary_bg': '#2864e8', 'primary_fg': '#ffffff',
+    'primary_hover': '#2155ca', 'disabled_bg': '#e9edf3', 'disabled_fg': '#606b7c',
     'focus': '#245bdb', 'selection_bg': '#dce8ff', 'selection_fg': '#133b96',
-    'card_border': '#e2e7ef', 'selected_bg': '#e8effe', 'selected_fg': '#1947af',
-    'brand': '#202630', 'secondary': '#526176',
+    'card_border': '#e3e8f0', 'selected_bg': '#eaf1ff', 'selected_fg': '#204eaf',
+    'brand': '#202937', 'secondary': '#526176',
 }
 DARK_COLORS = {
     'bg': '#161719', 'side': '#202226', 'surface': '#282b30', 'input': '#353940',
@@ -150,6 +150,7 @@ def setup_theme(root, title, size=(1320, 880), theme='light', *,
     style.map('.', foreground=[('disabled', COLORS['disabled_fg'])])
     style.configure('TFrame', background=COLORS['bg'])
     style.configure('TLabel', background=COLORS['bg'], foreground=COLORS['text'])
+    style.configure('TSeparator', background=COLORS['card_border'])
     style.configure('TButton', background=COLORS['side'], borderwidth=0, padding=(12, 8))
     style.map('TButton', background=[('disabled', COLORS['side']), ('active', COLORS['hover'])])
     style.configure('Primary.TButton', foreground=COLORS['primary_fg'], background=COLORS['primary_bg'])
@@ -166,6 +167,8 @@ def setup_theme(root, title, size=(1320, 880), theme='light', *,
     style.configure('Knowledge.TNotebook.Tab', font=ui_font(root))
     style.map('Treeview', background=[('selected', COLORS['tint'])], foreground=[('selected', COLORS['text'])])
     style.configure('TEntry', fieldbackground=COLORS['input'], borderwidth=0, padding=8)
+    style.map('TEntry', bordercolor=[('focus', COLORS['focus'])],
+              lightcolor=[('focus', COLORS['focus'])], darkcolor=[('focus', COLORS['focus'])])
     style.configure('TCombobox', fieldbackground=COLORS['input'], background=COLORS['side'],
                     foreground=COLORS['text'], arrowcolor=COLORS['text'], borderwidth=0, padding=6,
                     selectforeground=COLORS['selection_fg'], selectbackground=COLORS['selection_bg'])
@@ -266,10 +269,8 @@ class RoundedFrame(tk.Frame):
     def __init__(self, parent, bg=None, radius=18, padding=18, border=None, **kwargs):
         super().__init__(parent, bg=background(parent), bd=0, highlightthickness=0, **kwargs)
         self.color = bg or COLORS['surface']
-        themed_border = (COLORS['card_border']
-                         if getattr(self.winfo_toplevel(), '_free_ai_theme', 'light') != 'light' else self.color)
         self.radius = radius
-        self.border = border if border is not None else themed_border
+        self.border = border if border is not None else COLORS['card_border']
         self.canvas = tk.Canvas(self, bg=background(parent), highlightthickness=0, bd=0)
         self.canvas.place(x=0, y=0, relwidth=1, relheight=1)
         self.body = tk.Frame(self, bg=self.color, bd=0)
@@ -331,6 +332,7 @@ _BUTTON_ICON_PATHS = {
     'chevron_down': ((6, 9, 12, 15, 18, 9),),
     'more': (),
     'arrow_up': ((12, 20, 12, 4), (5, 11, 12, 4, 19, 11)),
+    'arrow_left': ((20, 12, 4, 12), (11, 5, 4, 12, 11, 19)),
     'stop': ((8, 6, 16, 6, 18, 8, 18, 16, 16, 18, 8, 18, 6, 16, 6, 8, 8, 6),),
     'copy': (
         (10, 8, 18, 8, 20, 10, 20, 19, 18, 21, 10, 21, 8, 19, 8, 10, 10, 8),

@@ -30,7 +30,7 @@ def domain_value(value):
 
 
 class EpistemologyPanel:
-    def __init__(self, app, page, *, responsive=False):
+    def __init__(self, app, page, *, responsive=False, auto_refresh=True):
         self.app, self.store = app, app.knowledge
         self.responsive = responsive
         self.episodes, self.rules = {}, {}
@@ -58,7 +58,8 @@ class EpistemologyPanel:
         self.notice = tk.StringVar(value='先在“中文聊天”或“自动办事”中完成一次任务，再选择记录进行反馈。')
         self._copy(page, textvariable=self.notice, legacy_wraplength=950).pack(
             side='bottom', fill='x', pady=(4, 0), before=self.notebook)
-        app.root.after_idle(self.refresh)
+        if auto_refresh:
+            app.root.after_idle(self.refresh)
 
     def _copy(self, parent, text='', size=12, bold=False, legacy_wraplength=0, **kwargs):
         if self.responsive:

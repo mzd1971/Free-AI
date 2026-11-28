@@ -18,7 +18,7 @@ from epistemology_ui import EpistemologyPanel
 import training_desktop as bridge
 import training_extension as extension
 from ui_kit import (
-    COLORS, FlatButton, RoundedFrame, ScrollArea, background, label,
+    COLORS, CLIENT_LIGHT_COLORS, FlatButton, RoundedFrame, ScrollArea, background, label,
     set_text_size, setup_theme, text_scale, ui_font,
 )
 from ui_preferences import TEXT_SIZES, load_text_size, save_text_size
@@ -26,7 +26,7 @@ from ui_preferences import TEXT_SIZES, load_text_size, save_text_size
 
 DATA_NAMES = {'sft_train.jsonl': '练习题', 'sft_validation.jsonl': '挑选成果用的新题',
               'sft_test.jsonl': '最后检查用的新题', 'sft_general_test.jsonl': '基础能力检查题'}
-TRAINER_CONTENT_WIDTH = 1120
+TRAINER_CONTENT_WIDTH = 1200
 TRAINER_THEMES = {'跟随客户端': 'client', '白蓝': 'light', '经典深色': 'dark', '边缘行者 · 霓虹': 'cyberpunk'}
 
 
@@ -126,7 +126,7 @@ def result_text(result):
 
 class TrainingKnowledgePanel(EpistemologyPanel):
     def __init__(self, app, page):
-        super().__init__(app, page, responsive=True)
+        super().__init__(app, page, responsive=True, auto_refresh=False)
         self.summary_scope_notice = (
             '让 AI 总结时，使用客户端当前选择的模型或 API。若选择 API，将把所选这一条记录的题目、'
             '结果与反馈发送到配置服务；其他记录和聊天不会发送。')
@@ -223,7 +223,9 @@ class TrainerApp:
         if self.theme not in ('cyberpunk', 'dark', 'light'):
             self.theme = 'light'
         preference = load_text_size()
-        setup_theme(root, 'Free AI · 训练工作台', size=(1320, 880), min_size=(760, 560), text_size=preference, theme=self.theme)
+        studio_palette = {**CLIENT_LIGHT_COLORS, 'bg': '#f5f7fa', 'side': '#f9fafb'}
+        setup_theme(root, 'Free AI · 训练工作台', size=(1440, 920), min_size=(760, 560),
+                    text_size=preference, theme=self.theme, palette=studio_palette if self.theme == 'light' else None)
         self.theme_choice = tk.StringVar(root, value=next(name for name, value in TRAINER_THEMES.items() if value == theme_choice))
         self.theme_notice = tk.StringVar(root)
         self.text_size = tk.StringVar(root, value=next(name for name, value in TEXT_SIZES.items() if value == preference))
@@ -248,20 +250,23 @@ class TrainerApp:
         except (OSError, ValueError):
             dataset_path = str(DATA_ROOT)
         self.dataset = tk.StringVar(value=dataset_path)
+        self.checked_dataset = None
         self.adapter = tk.StringVar()
         self.epochs = tk.StringVar(value='1')
         self.learning_rate = tk.StringVar(value='0.0001')
         self.agent_target = tk.BooleanVar(value=False)
         self.phase = tk.StringVar(value='等待开始')
-        self.data_notice = tk.StringVar(value='练习题和检查题分开保存，避免只会背答案。')
+        self.data_notice = tk.StringVar(value='练习题和检查题分开保存。')
         self.preparation_notice = tk.StringVar()
-        self.result_notice = tk.StringVar(value='完成后会自动比较训练前后的回答，并保留原始模型。')
+        self.result_notice = tk.StringVar(value='完成后可查看验收结论与回答对比。')
         self.result = None
         self.run_rows = {}
         self.finetune_details = None
         self.training_details = None
         self.last_episode = None
         self._build()
+        self.dataset.trace_add('write', self._dataset_changed)
+        self.phase.trace_add('write', lambda *_: self.refresh_studio())
         root.protocol('WM_DELETE_WINDOW', self.close)
         root.report_callback_exception = self.callback_error
         self.refresh_setup()
@@ -273,65 +278,23 @@ class TrainerApp:
         return tk.Frame(parent, bg=color or self.colors['bg'], **kwargs)
 
     def _build(self):
-        c = self.colors
-        body = self.frame(self.root)
-        body.pack(fill='both', expand=True)
-        side = self.frame(body, c['side'], width=174, padx=12, pady=28)
-        self.sidebar = side
-        side.pack(side='left', fill='y')
-        side.pack_propagate(False)
-        self._resize_sidebar()
-        self.brand_label = label(side, 'Free AI', size=25, bold=True, color=c.get('brand', c['text']))
-        self.brand_label.pack(anchor='w', padx=8)
-        label(side, '训练工作台', size=12, color=c['muted']).pack(anchor='w', padx=8, pady=(3, 30))
-        for index, title in enumerate(('训练', '训练记录', '经验改进')):
-            button = FlatButton(side, text=title, command=lambda i=index: self.select_page(i),
-                                variant='ghost', width=138, height=44, anchor='w')
-            button.pack(fill='x', pady=4)
-            self.nav.append(button)
-        self.wrap_label(side, '聊天请使用 Free AI 客户端', size=11, color=c['muted']).pack(
-            side='bottom', fill='x', padx=8, pady=8)
-        viewport = self.frame(body)
-        viewport.pack(side='left', fill='both', expand=True)
-        self.main = self.frame(viewport)
-        self.main.place(relx=.5, y=16, relheight=1, height=-32, anchor='n')
-        viewport.bind('<Configure>', lambda event: self.main.place_configure(
-            width=max(1, min(TRAINER_CONTENT_WIDTH, event.width - 32))))
-        tools = self.button_row(self.main)
-        tools.pack(side='top', fill='x', pady=(0, 10))
-        theme_group = self.frame(tools)
-        label(theme_group, '主题', size=11, color=c['muted']).pack(side='left', padx=(0, 8))
-        self.theme_picker = ttk.Combobox(theme_group, textvariable=self.theme_choice, state='readonly',
-                                        values=tuple(TRAINER_THEMES), width=20, font=ui_font(self.root))
-        self.theme_picker.pack(side='left')
-        self.theme_picker.bind('<<ComboboxSelected>>', self.change_theme)
-        size_group = self.frame(tools)
-        label(size_group, '文字大小', size=11, color=c['muted']).pack(side='left', padx=(8, 8))
-        self.text_size_picker = ttk.Combobox(size_group, textvariable=self.text_size, state='readonly',
-                                            values=tuple(TEXT_SIZES), width=9, font=ui_font(self.root))
-        self.text_size_picker.pack(side='left')
-        self.text_size_picker.current(tuple(TEXT_SIZES).index(self.text_size.get()))
-        self.text_size_picker.bind('<<ComboboxSelected>>', self.change_text_size)
-        self.theme_notice_label = self.wrap_label(self.main, textvariable=self.theme_notice, size=10, color=c['muted'])
-        footer = self.frame(self.main)
-        footer.pack(side='bottom', fill='x', pady=(10, 0))
-        self.stop_button = FlatButton(footer, text='停止当前任务', command=self.stop_training,
-                                      variant='secondary', width=145, height=36, state='disabled')
-        self.stop_button.pack(side='right', padx=(10, 0))
-        self.wrap_label(footer, textvariable=self.status, size=11, color=c['muted']).pack(
-            side='left', fill='x', expand=True)
-        self.stop_buttons.append(self.stop_button)
-        self.page_holder = self.frame(self.main)
-        self.page_holder.pack(fill='both', expand=True)
-        self.page_holder.pack_propagate(False)
-        self.pages = [ScrollArea(self.page_holder, scrollbar=True) for _ in range(3)]
-        self.train_scroll, self.records_scroll, self.knowledge_scroll = self.pages
+        from trainer_studio import build_shell
+        build_shell(self)
         self._training_page(self.train_scroll.body)
         self._records_page(self.records_scroll.body)
         self._knowledge_page(self.knowledge_scroll.body)
         for page in self.pages:
             page.bind_wheel(page.body)
-        self.root.bind('<<FreeAITextSizeChanged>>', lambda event: self.root.after_idle(self.reflow), add='+')
+        self.root.bind('<<FreeAITextSizeChanged>>', self._queue_reflow, add='+')
+
+    def refresh_studio(self, **kwargs):
+        from trainer_studio import refresh_studio
+        refresh_studio(self, **kwargs)
+
+    def _dataset_changed(self, *args):
+        self.checked_dataset = None
+        self.data_notice.set('数据位置已变更，请重新检查。')
+        self.refresh_studio()
 
     def change_text_size(self, event=None):
         choice = TEXT_SIZES[self.text_size.get()]
@@ -355,17 +318,25 @@ class TrainerApp:
         self.theme_notice.set('已保存主题，下次打开训练端时生效。')
         self.theme_notice_label.pack(fill='x', pady=(0, 8), before=self.page_holder)
 
+    def _queue_reflow(self, event=None):
+        if getattr(self, '_layout_after_id', None):
+            self.root.after_cancel(self._layout_after_id)
+        self._layout_after_id = self.root.after_idle(self.reflow)
+
     def reflow(self):
+        self._layout_after_id = None
+        from trainer_studio import arrange_studio
         self._resize_sidebar()
+        arrange_studio(self)
         for row in self.control_rows:
             row.reflow()
         self._arrange_comparisons()
+        self._arrange_record_stats()
         self.knowledge_panel.arrange_practice()
 
     def _resize_sidebar(self):
-        title_width = max(ui_font(self.sidebar, 25, bold=True).measure('Free AI'),
-                          ui_font(self.sidebar, 12).measure('训练工作台'))
-        self.sidebar.configure(width=max(174, title_width + 48))
+        from trainer_studio import resize_sidebar
+        resize_sidebar(self)
 
     def button_row(self, parent):
         row = ControlRow(parent)
@@ -379,16 +350,16 @@ class TrainerApp:
         return widget
 
     def heading(self, page, title, subtitle):
-        self.wrap_label(page, title, size=25, bold=True).pack(fill='x')
-        self.wrap_label(page, subtitle, size=12, color=self.colors['muted']).pack(fill='x', pady=(6, 16))
+        self.wrap_label(page, title, size=26, bold=True).pack(fill='x')
+        self.wrap_label(page, subtitle, size=11, color=self.colors['muted']).pack(fill='x', pady=(5, 18))
 
     def card(self, parent, title):
-        container = RoundedFrame(parent, bg=self.colors['surface'], radius=16,
-                                      padding=(20, 14), border=self.colors['line'])
-        container.pack(fill='x', pady=(0, 12))
+        container = RoundedFrame(parent, bg=self.colors['surface'], radius=14,
+                                 padding=(20, 16), border=self.colors['card_border'])
+        container.pack(fill='x', pady=(0, 14))
         box = container.body
         box.container = container
-        self.wrap_label(box, title, size=15, bold=True).pack(fill='x', pady=(0, 8))
+        self.wrap_label(box, title, size=14, bold=True).pack(fill='x', pady=(0, 10))
         return box
 
     def button(self, parent, text, command, variant='secondary', width=None):
@@ -406,6 +377,7 @@ class TrainerApp:
         widget = tk.Text(frame, width=28, height=height, wrap='word', font=ui_font(parent),
                          bg=self.colors['surface'], fg=self.colors['text'], insertbackground=self.colors['text'],
                          relief='flat', highlightthickness=1, highlightbackground=self.colors['line'],
+                         highlightcolor=self.colors['focus'],
                          padx=12, pady=10, undo=editable)
         bar = ttk.Scrollbar(frame, orient='vertical', command=widget.yview)
         bar.pack(side='right', fill='y')
@@ -438,120 +410,112 @@ class TrainerApp:
         widget.configure(state='disabled')
 
     def _training_page(self, page):
-        self.heading(page, '让 AI 学会你的做法', '从一小批可靠的题目开始，每次训练都用没教过的新题检查。')
-        self.setup_card = self.card(page, '选择训练模型')
-        self.wrap_label(self.setup_card, textvariable=self.preparation_notice, size=11,
-                        color=self.colors['muted']).pack(fill='x')
-        self.wrap_label(self.setup_card, '模型保存位置：' + str(self.manager.root), size=11,
-                        color=self.colors['muted']).pack(fill='x', pady=(5, 0))
-        row = self.button_row(self.setup_card)
-        row.pack(fill='x', pady=(8, 0))
-        self.tools_button = self.button(row, '准备训练工具', self.prepare_tools, width=180)
-        self.model_button = self.button(row, '下载入门训练模型', self.prepare_model, width=210)
-        self.use_model_button = self.button(row, '使用这个模型', self.use_training_model,
-                                            variant='primary', width=180)
-        first = self.card(page, '1   准备练习题')
-        self.data_card = first
-        ttk.Entry(first, textvariable=self.dataset, font=ui_font(first)).pack(fill='x', pady=(0, 8))
-        row = self.button_row(first)
-        row.pack(fill='x')
-        self.button(row, '选择文件夹', self.choose_data)
-        self.button(row, '检查数据', self.check_data)
-        self.button(row, '题目格式', self.data_help, variant='ghost', width=100)
-        self.online_data_button = self.button(row, '联网找训练数据', self.toggle_online_data, variant='accent', width=180)
-        self.wrap_label(first, textvariable=self.data_notice, size=11, color=self.colors['muted']).pack(fill='x')
-        from hf_dataset_panel import HuggingFaceDatasetPanel
-        self.dataset_panel = HuggingFaceDatasetPanel(self, first, self.imported_dataset)
-        second = self.card(page, '2   开始训练')
-        self.wrap_label(second, '选择模型后才能开始训练。学习成果单独保存，不会替换日常聊天模型。',
-                        size=11, color=self.colors['muted']).pack(fill='x')
-        row = self.button_row(second)
-        row.pack(fill='x', pady=(10, 0))
-        self.start_button = self.button(row, '开始训练', self.finetune, variant='primary', width=140)
-        stop_button = FlatButton(row, text='停止', command=self.stop_training,
-                                 variant='secondary', width=90, height=38, state='disabled')
-        self.stop_buttons.append(stop_button)
-        self.button(row, '更多设置', self.toggle_parameters, variant='ghost', width=115)
-        self.wrap_label(second, textvariable=self.phase, size=12, color=self.colors['muted']).pack(fill='x')
-        self.parameters = self.frame(second, self.colors['surface'])
-        row = self.button_row(self.parameters)
-        row.pack(fill='x', pady=(12, 4))
-        epochs = self.frame(row, self.colors['surface'])
-        label(epochs, '完整学习次数').pack(side='left', padx=(0, 8))
-        ttk.Spinbox(epochs, from_=1, to=10, textvariable=self.epochs, width=6).pack(side='left')
-        rate = self.frame(row, self.colors['surface'])
-        label(rate, '每次调整幅度').pack(side='left', padx=(0, 8))
-        ttk.Entry(rate, textvariable=self.learning_rate, width=10).pack(side='left')
-        ttk.Checkbutton(row, text='保存为工具使用练习成果', variable=self.agent_target)
-        self.wrap_label(self.parameters, '接着以前的成果学习（可留空）', size=11).pack(fill='x')
-        row = self.frame(self.parameters, self.colors['surface'])
-        row.pack(fill='x', pady=4)
-        button = self.button(row, '选择成果', self.choose_adapter)
-        button.pack_configure(side='right', padx=(8, 0))
-        ttk.Entry(row, textvariable=self.adapter).pack(side='left', fill='x', expand=True)
-        third = self.card(page, '3   查看真实变化')
-        self.wrap_label(third, textvariable=self.result_notice, size=12, color=self.colors['muted']).pack(fill='x')
-        row = self.button_row(third)
-        row.pack(fill='x', pady=(8, 0))
-        self.button(row, '查看最近结果', self.latest_result, variant='ghost', width=145)
-        self.button(row, '打开成果文件夹', self.open_outputs, variant='ghost', width=155)
-        label(page, '运行日志', size=14, bold=True).pack(anchor='w', pady=(3, 0))
-        self.log = self.text(page, height=4)
-        self.write(self.log, '检查数据后即可训练。停止时会等待当前步骤结束；未完成的实验不会被标成成功。')
+        from trainer_studio import build_training_page
+        build_training_page(self, page)
 
     def toggle_online_data(self):
         if self.dataset_panel.winfo_manager():
             self.dataset_panel.pack_forget()
-            self.online_data_button.configure(text='联网找训练数据')
+            self.online_data_button.configure(text='查找在线数据')
         else:
             self.dataset_panel.pack(fill='x', pady=(12, 4))
             self.online_data_button.configure(text='收起在线数据')
             self.dataset_panel.sync_busy()
             self.train_scroll.bind_wheel(self.dataset_panel)
+        from trainer_studio import arrange_studio
+        arrange_studio(self)
 
     def imported_dataset(self, result):
         directory = Path(result['path'])
         counts = bridge.inspect_data(directory)
         self.dataset.set(str(directory))
+        self.checked_dataset = self.dataset.get()
         self.settings.set('trainer_dataset', str(directory))
         self.data_notice.set('已导入并检查：' + ' · '.join(f'{DATA_NAMES[name]} {count} 条' for name, count in counts.items()))
         self.status.set('训练数据已准备好。核对内容后，再点击“开始训练”。')
         self.write(self.log, '\n在线数据保存位置：' + str(directory) + '\n来源与导入记录：' + str(result['report']) + '\n', True)
+        self.refresh_studio()
 
     def _records_page(self, page):
-        self.heading(page, '每一次训练，都留有依据', '看训练前后回答的变化，也检查有没有退步。数字变小并不代表每个回答都正确。')
-        toolbar = self.button_row(page)
-        toolbar.pack(fill='x', pady=(0, 10))
-        self.button(toolbar, '刷新记录', self.refresh_runs)
-        self.button(toolbar, '打开所选文件夹', self.open_selected_run)
-        self.button(toolbar, '查看详细数值', lambda: self.show_details('训练详细记录', self.finetune_details))
-        self.button(toolbar, '验收怎么判断', self.acceptance_help)
-        self.publish_button = self.button(toolbar, '加入客户端模型', self.publish_result, variant='accent', width=175)
-        self.publish_button.configure(state='disabled')
-        self.run_tree = self.tree(page, pady=(0, 12), columns=('status', 'name'),
-                                  show='headings', height=4, selectmode='browse')
-        self.run_tree.heading('status', text='结果')
-        self.run_tree.column('status', width=110, stretch=False)
-        self.run_tree.heading('name', text='训练记录')
-        self.run_tree.column('name', width=700, minwidth=400)
+        self.heading(page, '训练记录', '查看验收依据与回答对比。')
+        self.record_totals = {name: tk.StringVar(value='0') for name in ('all', 'passed', 'review', 'failed')}
+        self.record_stats = self.frame(page)
+        self.record_stats.pack(fill='x', pady=(0, 12))
+        self.record_tiles = []
+        for key, caption in (('all', '全部训练'), ('passed', '验收通过'), ('review', '待核实'), ('failed', '未通过 / 未完成')):
+            tile = RoundedFrame(self.record_stats, bg=self.colors['surface'], radius=12,
+                                border=self.colors['card_border'], padding=(16, 11))
+            label(tile.body, textvariable=self.record_totals[key], size=23, bold=True,
+                  color=self.colors['accent'] if key == 'passed' else self.colors['text']).pack(anchor='w')
+            label(tile.body, caption, size=10, color=self.colors['muted']).pack(anchor='w', pady=(3, 0))
+            self.record_tiles.append(tile)
+        self.record_stats.bind('<Configure>', self._arrange_record_stats)
+        self._arrange_record_stats()
+        library = self.card(page, '训练历史')
+        toolbar = self.button_row(library)
+        toolbar.pack(fill='x', pady=(0, 12))
+        self.record_filter = tk.StringVar(value='全部记录')
+        self.record_filter_picker = ttk.Combobox(toolbar, textvariable=self.record_filter, state='readonly',
+            values=('全部记录', '验收通过', '需要核实', '验收未通过', '未完成'), width=12,
+            font=ui_font(self.root, 11), style='Studio.TCombobox')
+        self.record_filter_picker.bind('<<ComboboxSelected>>', lambda event: self.refresh_runs())
+        self.button(toolbar, '刷新', self.refresh_runs, variant='ghost', width=75)
+        self.button(toolbar, '查看文件', self.open_selected_run, variant='ghost', width=100)
+        self.button(toolbar, '验收说明', self.acceptance_help, variant='ghost', width=100)
+        self.run_tree = self.tree(library, columns=('status', 'name'), show='headings', height=5)
+        self.run_tree.heading('status', text='验收状态')
+        self.run_tree.column('status', width=130, minwidth=90, stretch=False)
+        self.run_tree.heading('name', text='训练名称')
+        self.run_tree.column('name', width=680, minwidth=240)
         self.run_tree.bind('<<TreeviewSelect>>', self.select_run)
-        self.record_summary = tk.StringVar(value='完成一次训练后，这里会显示实际检查结果。')
-        self.wrap_label(page, textvariable=self.record_summary, size=12).pack(fill='x', pady=(0, 12))
+        self.records_empty = self.frame(library, self.colors['surface'])
+        self.records_empty_caption = tk.StringVar(value='还没有训练记录')
+        self.wrap_label(self.records_empty, textvariable=self.records_empty_caption, size=16, bold=True).pack(fill='x', pady=(20, 6))
+        self.wrap_label(self.records_empty, '完成一次训练后，结果会自动保存在这里。', size=11,
+                        color=self.colors['muted']).pack(fill='x', pady=(0, 18))
+        empty_actions = self.button_row(self.records_empty)
+        empty_actions.pack(fill='x', pady=(0, 18))
+        self.button(empty_actions, '前往训练工作室', lambda: self.select_page(0), variant='accent', width=190)
+        self.button(empty_actions, '显示全部记录', self.clear_record_filter, variant='ghost', width=155)
+        self.result_area = self.frame(page)
+        summary_card = self.card(self.result_area, '验收结果')
+        self.record_summary = tk.StringVar(value='选择一条训练记录，查看验收依据。')
+        self.wrap_label(summary_card, textvariable=self.record_summary, size=11).pack(fill='x', pady=(2, 10))
+        result_tools = self.button_row(summary_card)
+        result_tools.pack(fill='x')
+        self.publish_button = self.button(result_tools, '加入客户端模型', self.publish_result, variant='primary', width=185)
+        self.publish_button.configure(state='disabled')
+        self.button(result_tools, '详细检查结果', lambda: self.show_details('训练详细记录', self.finetune_details), variant='ghost', width=150)
+        answers = self.card(self.result_area, '回答对比')
         self.question = tk.StringVar()
-        self.question_picker = ttk.Combobox(page, textvariable=self.question, state='readonly')
-        self.question_picker.pack(fill='x', ipady=6, pady=(0, 10))
+        self.question_picker = ttk.Combobox(answers, textvariable=self.question, state='readonly',
+                                            font=ui_font(self.root, 11), style='Studio.TCombobox')
+        self.question_picker.pack(fill='x', pady=(0, 14))
         self.question_picker.bind('<<ComboboxSelected>>', self.select_question)
-        self.comparisons = self.frame(page)
+        self.comparisons = self.frame(answers, self.colors['surface'])
         self.comparisons.pack(fill='x')
-        self.before_panel, self.after_panel = self.frame(self.comparisons), self.frame(self.comparisons)
-        label(self.before_panel, '训练前', size=14, bold=True).pack(anchor='w')
-        label(self.after_panel, '训练后', size=14, bold=True).pack(anchor='w')
-        self.before_answer = self.text(self.before_panel, height=6)
-        self.after_answer = self.text(self.after_panel, height=6)
+        self.before_panel = self.frame(self.comparisons, self.colors['surface'])
+        self.after_panel = self.frame(self.comparisons, self.colors['surface'])
+        label(self.before_panel, '训练前', size=12, bold=True, color=self.colors['muted']).pack(anchor='w', pady=(0, 6))
+        label(self.after_panel, '训练后', size=12, bold=True, color=self.colors['accent']).pack(anchor='w', pady=(0, 6))
+        self.before_answer = self.text(self.before_panel, height=7)
+        self.after_answer = self.text(self.after_panel, height=7)
         self.comparisons.bind('<Configure>', self._arrange_comparisons)
         self._arrange_comparisons()
-        self.reference = tk.StringVar(value='选择一道检查题，查看题目、参考回答以及前后变化。')
-        self.wrap_label(page, textvariable=self.reference, size=11, color=self.colors['muted']).pack(fill='x', pady=(10, 0))
+        self.reference = tk.StringVar(value='选择一道检查题，查看训练前后的变化。')
+        self.wrap_label(answers, textvariable=self.reference, size=11, color=self.colors['muted']).pack(fill='x', pady=(12, 0))
+
+    def _arrange_record_stats(self, event=None):
+        columns = 4 if self.record_stats.winfo_width() >= 780 * text_scale(self.root) else 2
+        for column in range(4):
+            self.record_stats.columnconfigure(column, weight=int(column < columns), uniform='stats' if column < columns else '')
+        for index, tile in enumerate(self.record_tiles):
+            tile.grid(row=index // columns, column=index % columns, sticky='nsew',
+                      padx=(0, 12 if index % columns < columns - 1 else 0), pady=(0, 8))
+
+    def clear_record_filter(self):
+        self.record_filter.set('全部记录')
+        self.refresh_runs()
 
     def _arrange_comparisons(self, event=None):
         wide = self.comparisons.winfo_width() >= round(680 * text_scale(self.root))
@@ -565,11 +529,12 @@ class TrainerApp:
                               padx=(7 if wide else 0, 0), pady=(0 if wide else 8, 0))
 
     def _knowledge_page(self, page):
-        self.heading(page, '把一次纠错，变成可复用的做法', '保存实际结果，核对依据，再决定哪些做法值得下次使用。')
+        self.heading(page, '经验库', '保存实际结果，核对依据，把一次纠错变成可复用的做法。')
         self.knowledge_panel = TrainingKnowledgePanel(self, page)
         self.knowledge_panel.notice.set('训练结果与客户端的使用记录会保存在同一个经验库中。选择记录后即可纠错。')
 
     def select_page(self, index):
+        from trainer_studio import PAGE_TITLES
         if not 0 <= index < len(self.pages):
             raise ValueError('未知页面')
         for page in self.pages:
@@ -578,14 +543,19 @@ class TrainerApp:
         for number, button in enumerate(self.nav):
             button.configure(variant='selected' if number == index else 'ghost')
         self.page_index = index
+        self.page_caption.set(PAGE_TITLES[index])
         if index == 1:
             self.refresh_runs()
+        elif index == 2 and not self.busy:
+            self.knowledge_panel.refresh()
 
     def toggle_parameters(self):
         if self.parameters.winfo_manager():
             self.parameters.pack_forget()
+            self.parameters_button.configure(text='更多设置')
         else:
             self.parameters.pack(fill='x')
+            self.parameters_button.configure(text='收起设置')
 
     def choose_data(self):
         if self.busy:
@@ -612,16 +582,15 @@ class TrainerApp:
         tools_ready = extension.training_python() is not None
         model_ready = self.model_ready()
         selected = self.trainer_model.get() == 'legacy-training-model'
-        self.preparation_notice.set('推荐 Qwen3-0.6B · 独立的入门文字训练模型 · 约 1.5 GB\n' +
-            ('模型文件已下载' if model_ready else '模型文件未下载') + ' · ' +
-            ('已选择，仅开始训练时加载' if selected else '尚未选择，下载后请点“使用这个模型”') + '\n' +
-            ('训练工具已准备好' if tools_ready else '训练工具尚未准备，需另行下载约数 GB'))
+        self.preparation_notice.set('本地微调 · 模型约 1.5 GB' +
+                                    (' · 训练工具需另行下载数 GB' if not tools_ready else ''))
         self.tools_button.configure(text='训练工具已就绪' if tools_ready else '准备训练工具')
-        self.model_button.configure(text='模型已下载' if model_ready else '下载入门训练模型',
+        self.model_button.configure(text='模型已下载' if model_ready else '下载模型',
                                     state='disabled' if model_ready or self.busy else 'normal')
-        self.use_model_button.configure(text='已选择此模型' if selected else '使用这个模型',
+        self.use_model_button.configure(text='已选用' if selected else '选用模型',
                                        state='normal' if model_ready and not selected and not self.busy else 'disabled')
-        self.root.after_idle(self.tools_button.master.reflow)
+        self._queue_reflow()
+        self.refresh_studio(tools_ready=tools_ready, model_ready=model_ready)
 
     def use_training_model(self):
         if self.busy:
@@ -647,7 +616,7 @@ class TrainerApp:
     def prepare_model(self):
         if self.model_ready():
             self.refresh_setup()
-            self.status.set('已有模型文件可直接复用，无需重新下载。请点“使用这个模型”。')
+            self.status.set('已有模型文件。请选择“选用模型”。')
             return
         def progress(event):
             total = event.get('total', 0)
@@ -659,7 +628,12 @@ class TrainerApp:
 
     def check_data(self):
         directory = self.dataset.get()
+        self.checked_dataset = None
         def done(counts):
+            if self.dataset.get() != directory:
+                self.status.set('已检查原文件夹；当前数据位置已变化，请重新检查。')
+                return
+            self.checked_dataset = directory
             self.settings.set('trainer_dataset', directory)
             self.data_notice.set('检查通过 · ' + ' · '.join(f'{DATA_NAMES[name]} {count} 道' for name, count in counts.items()))
             self.write(self.log, '文件格式、空内容和重复项检查通过。教学内容仍需你核实，检查题不会用于训练。')
@@ -671,7 +645,7 @@ class TrainerApp:
         if self.trainer_model.get() != 'legacy-training-model':
             self.refresh_setup()
             self.select_page(0)
-            self.status.set('尚未选择训练模型。请先在推荐卡片中点击“使用这个模型”。')
+            self.status.set('尚未选择训练模型。请点击“选用模型”。')
             return
         interpreter = extension.training_python()
         if interpreter is None or not self.model_ready():
@@ -690,6 +664,9 @@ class TrainerApp:
         self.stop_path = stop_path
         self.training_details = {'events': []}
         self.finetune_details = self.training_details
+        from trainer_studio import set_log_visible
+        set_log_visible(self, True)
+        self.phase.set('等待开始')
         self.write(self.log, '开始检查教学数据并准备训练。原始模型与以前的成果都会保留。\n')
         def work():
             try:
@@ -712,13 +689,14 @@ class TrainerApp:
             self.training_details['result'] = result
             if result.get('cancelled'):
                 self.phase.set('已安全停止')
-                self.result_notice.set('这次训练未完成全部检查，不会标记为可用成果；原始记录仍然保留。')
+                self.status.set('训练已安全停止，本次任务未完成。')
+                self.result_notice.set('已安全停止。可在训练记录中查看本次运行。')
             else:
                 path = Path(result['run_dir'])
                 loaded = load_result(path)
                 self.phase.set('训练已结束 · ' + acceptance_label(loaded['acceptance']))
                 self.status.set(self.phase.get())
-                self.result_notice.set(result_text(loaded))
+                self.result_notice.set('结果已保存 · ' + acceptance_label(loaded['acceptance']))
                 self.refresh_runs()
         self.submit('正在训练，显卡暂由训练工作台使用', work, done, kind='training', cancellable=True)
 
@@ -762,6 +740,7 @@ class TrainerApp:
         else:
             self.status.set('正在停止准备任务，已下载的文件会保留。')
         self._set_stop('disabled')
+        self.refresh_studio()
 
     def _set_stop(self, state):
         for button in self.stop_buttons:
@@ -771,20 +750,39 @@ class TrainerApp:
         selected = self.run_tree.selection()
         selected_path = self.run_rows.get(selected[0], {}).get('path') if selected else None
         rows = training_runs()
+        statuses = [acceptance_label(row.get('acceptance', {})) if row['completed'] else '未完成' for row in rows]
+        counts = {'all': len(rows), 'passed': statuses.count('验收通过'),
+                  'review': statuses.count('需要核实'),
+                  'failed': statuses.count('验收未通过') + statuses.count('未完成')}
+        for key, value in counts.items():
+            self.record_totals[key].set(str(value))
+        chosen_filter = self.record_filter.get()
+        if chosen_filter != '全部记录':
+            rows = [row for row, status in zip(rows, statuses) if status == chosen_filter]
         self.run_rows = {str(index): row for index, row in enumerate(rows)}
         self.run_tree.delete(*self.run_tree.get_children())
         for identity, row in self.run_rows.items():
             status = acceptance_label(row.get('acceptance', {})) if row['completed'] else '未完成'
             self.run_tree.insert('', 'end', iid=identity, values=(status, row['name']))
+        self.run_tree.configure(height=min(6, max(2, len(rows))))
+        if rows:
+            self.records_empty.pack_forget()
+            self.run_tree.master.pack(fill='x')
+        else:
+            self.run_tree.master.pack_forget()
+            self.records_empty_caption.set('还没有训练记录' if counts['all'] == 0 else '没有符合条件的记录')
+            self.records_empty.pack(fill='x')
         identity = next((key for key, row in self.run_rows.items() if row['path'] == selected_path), None)
         if identity is not None:
             self.run_tree.selection_set(identity)
             self.select_run()
         else:
             self.result = None
+            self.result_area.pack_forget()
             self._refresh_publish_button()
 
     def latest_result(self):
+        self.record_filter.set('全部记录')
         self.select_page(1)
         completed = next((identity for identity, row in self.run_rows.items() if row['completed']), None)
         if completed is None:
@@ -798,9 +796,12 @@ class TrainerApp:
         selected = self.run_tree.selection()
         if not selected or selected[0] not in self.run_rows:
             self.result = None
+            self.result_area.pack_forget()
             self._refresh_publish_button()
             return
+        self.result_area.pack(fill='x', pady=(8, 0))
         row = self.run_rows[selected[0]]
+        self.finetune_details = row.get('summary', {})
         if not row['completed']:
             self.result = None
             self._refresh_publish_button()
@@ -827,6 +828,12 @@ class TrainerApp:
         except Exception as exc:
             self.result = None
             self.status.set('无法读取这次结果：' + str(exc))
+            self.record_summary.set('结果文件无法读取，请打开文件夹检查原始记录。')
+            self.question_picker.configure(values=())
+            self.question.set('')
+            self.reference.set('当前记录无法用于验收。')
+            self.write(self.before_answer, '')
+            self.write(self.after_answer, '')
         self._refresh_publish_button()
 
     def _refresh_publish_button(self):
@@ -918,9 +925,11 @@ class TrainerApp:
         self.current_job = kind
         self.cancel_event.clear()
         self.status.set(title)
+        self.phase.set('等待开始')
         for button in self.buttons:
             button.configure(state='disabled')
         self._set_stop('normal' if cancellable else 'disabled')
+        self.refresh_studio()
         def run():
             try:
                 self.events.put(('done', done, work()))
@@ -948,10 +957,13 @@ class TrainerApp:
                     self.status.set(message)
                     self.phase.set('已停止' if self.cancel_event.is_set() else '本次任务未完成')
                     self.write(self.log, '\n' + message + '\n', True)
+                    from trainer_studio import set_log_visible
+                    set_log_visible(self, True)
                 else:
-                    self.status.set('已完成，记录保存在本机。')
+                    self.status.set('本次操作已完成。')
                     callback(value)
                 self._refresh_publish_button()
+                self.refresh_setup()
         except queue.Empty:
             pass
         except Exception as exc:
@@ -969,6 +981,8 @@ class TrainerApp:
             self.status.set('正在停止当前任务。结束后可以关闭，训练记录会保留。')
             return
         self.root.after_cancel(self.poll_id)
+        if getattr(self, '_layout_after_id', None):
+            self.root.after_cancel(self._layout_after_id)
         self.root.destroy()
 
 

@@ -234,6 +234,31 @@ class DatasetPanelTests(unittest.TestCase):
         self.assertEqual(self.panel.fields['input'].get(), '')
         self.assertEqual(self.panel.import_button.cget('state'), 'normal')
 
+    def test_conversations_alias_requires_supported_message_format(self):
+        self.preview.return_value = {
+            'columns': ['conversations'],
+            'rows': [{'conversations': [{'from': 'human', 'value': '你好'},
+                                        {'from': 'gpt', 'value': '您好'}]}],
+            'total': 60,
+        }
+        self._preview_train()
+        self.assertEqual(self.panel.fields['messages'].get(), '')
+        self.assertEqual(self.panel.import_button.cget('state'), 'disabled')
+
+        self.preview.return_value['rows'] = [
+            {'conversations': [{'role': 'user', 'content': '你好'},
+                               {'role': 'assistant', 'content': '您好'}]},
+        ]
+        self.panel.preview_button.invoke()
+        self.app.complete()
+        self.assertEqual(self.panel.fields['messages'].get(), 'conversations')
+        self.assertEqual(self.panel.import_button.cget('state'), 'normal')
+
+        self.panel.import_button.invoke()
+        self.app.complete()
+        self.assertEqual(self.import_data.call_args.args[-1], {'messages': 'conversations'})
+        self.imported.assert_called_once_with(IMPORTED)
+
     def test_message_column_and_cancelled_import_can_retry(self):
         self.preview.return_value = {
             'columns': ['id', 'messages'],

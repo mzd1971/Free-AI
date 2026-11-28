@@ -213,7 +213,7 @@ class NativeComposerScenario(unittest.TestCase):
         self.assertLessEqual(app.sidebar.winfo_width(), 280)
         self.assertEqual(app.send_button.winfo_width(), app.send_button.winfo_height())
 
-        app.chat_hint.set('Ctrl + Enter 发送 · Enter 换行')
+        app.chat_hint.set('Enter 发送 · Shift + Enter 换行')
         session = app.sessions.create()
         app.sessions.append(session, 'user', '看看这个项目')
         app.sessions.append(session, 'assistant', '**中文排版**保持正文内容。')
@@ -280,7 +280,9 @@ class NativeComposerScenario(unittest.TestCase):
         with patch.object(self.app, 'send_chat') as send:
             self.app.input.event_generate('<Return>')
             self.app.input.event_generate('<Control-Return>')
-            self.assertIsNone(self.app.enter_send(SimpleNamespace(keycode=229)))
+            self.app.input.event_generate('<Shift-Return>')
+            ime_event = SimpleNamespace(widget=self.app.input, keycode=229, state=0, keysym='Return')
+            self.assertIsNone(self.app.enter_send(ime_event))
             root.update()
             send.assert_not_called()
         self.assertEqual(self.text(), '先写下一条\n')
@@ -324,7 +326,7 @@ class NativeComposerScenario(unittest.TestCase):
                 # Native Text bindings must retain the insertion point after
                 # Chinese text and a newline, without putting the hint in data.
                 app.input.insert('insert', '你好 Free AI')
-                app.input.event_generate('<Return>')
+                app.input.event_generate('<Shift-Return>')
                 root.update()
                 self.assertEqual(app.input.index('insert'), '2.0')
                 self.assertEqual(self.text(), '你好 Free AI\n')

@@ -10,6 +10,7 @@ from tkinter import filedialog, messagebox, simpledialog
 from uuid import UUID
 
 from app_state import CONTEXTS, PROJECT_PERMISSION_MODES
+from keyboard_shortcuts import shortcut_hint
 from paths import ARTIFACTS
 from project_checks import MAX_REPAIR_ATTEMPTS, load_project_check, save_project_check
 from ui_kit import COLORS as C, FlatButton, label, ui_font
@@ -796,7 +797,7 @@ class ProjectConversation:
         name = Path(workspace).name or workspace
         self.folder_button.configure(text=name or '选择项目')
         self.location.configure(text='项目：' + (workspace or '尚未选择'))
-        hints = ['Ctrl + Enter 发送 · Enter 换行']
+        hints = [shortcut_hint(self.app.send_key)]
         if enabled:
             mode = self.permission_mode.get()
             self.permissions_button.configure(text=PERMISSION_LABELS[mode])

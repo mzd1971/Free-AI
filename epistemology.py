@@ -322,7 +322,8 @@ def record_training(summary, store=None):
     task = '本地 LoRA 训练：增加轮数后是否出现过拟合，应选择哪个检查点？'
     identity = store.record(task, json.dumps(summary, ensure_ascii=False), domain='training', outcome='success',
         verification='objective', evidence={'metrics_file': str(run / 'metrics.json')}, source='training_run', training_eligible=False)
-    if len(metrics) > 1 and metrics[-1]['validation_loss'] > min(r['validation_loss'] for r in metrics):
+    losses = [row['validation_loss'] for row in metrics if row['validation_loss'] is not None]
+    if len(losses) > 1 and metrics[-1]['validation_loss'] is not None and losses[-1] > min(losses):
         rule = store.propose([identity], 'LoRA 训练 轮数 验证损失 过拟合',
             '本次实验后续轮次验证损失变差。增加轮数前先比较验证损失，按独立验证集选检查点；'
             '该现象不意味着所有数据都应该只训练一轮，还需检查数据多样性并另做留出评测。', author='metrics_diagnostic')

@@ -13,12 +13,14 @@ import tkinter as tk
 from tkinter import font as tkfont
 from unittest.mock import patch
 
-from paths import ARTIFACTS
+from development.tests.test_training_publish import fixture_run
+from paths import ARTIFACTS, RUNS_ROOT
 from trainer_app import TRAINER_CONTENT_WIDTH, TrainerApp, TrainingKnowledgePanel
 from ui_kit import ui_font
 from ui_preferences import load_text_size
 
-with patch.object(TrainingKnowledgePanel, 'refresh'), patch('trainer_app.training_runs', return_value=[]):
+fixture_run(RUNS_ROOT / 'qwen-lora-layout-fixture')
+with patch.object(TrainingKnowledgePanel, 'refresh'):
     root = tk.Tk()
     app = TrainerApp(root)
     errors = []
@@ -30,10 +32,9 @@ with patch.object(TrainingKnowledgePanel, 'refresh'), patch('trainer_app.trainin
     assert app.main.winfo_width() == TRAINER_CONTENT_WIDTH
     assert abs(2 * app.main.winfo_x() + app.main.winfo_width() - app.main.master.winfo_width()) <= 2
     assert len({button.winfo_y() for button in actions}) == 1
-    app.select_page(1)
+    app.latest_result()
     root.update()
     assert app.before_panel.grid_info()['row'] == app.after_panel.grid_info()['row']
-    app.run_tree.insert('', 'end', values=('已完成', 'fixture'))
     normal_row = app.run_tree.bbox(app.run_tree.get_children()[0])[3]
     app.select_page(2)
     root.update()
@@ -70,11 +71,10 @@ with patch.object(TrainingKnowledgePanel, 'refresh'), patch('trainer_app.trainin
     root.update()
     assert app.train_scroll.canvas.yview()[1] == 1.0
 
-    app.select_page(1)
+    app.latest_result()
     root.update()
     assert app.before_panel.grid_info()['row'] != app.after_panel.grid_info()['row']
     assert app.run_tree.cget('yscrollcommand') and app.run_tree.cget('xscrollcommand')
-    app.run_tree.insert('', 'end', values=('已完成', 'fixture'))
     assert app.run_tree.bbox(app.run_tree.get_children()[0])[3] > normal_row
     assert not errors, errors
     app.close()

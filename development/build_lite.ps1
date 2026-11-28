@@ -21,6 +21,10 @@ $taskRequired += @('clock_context.py')
 $taskRequired += @('unified_tools.py')
 $taskRequired += @('reasoning_view.py', 'keyboard_shortcuts.py')
 $taskRequired += @('training_evaluation.py', 'training_publish.py', 'training_gguf.py')
+$taskRequired += @('trainer_studio.py')
+$taskRequired += @('memory_retention.py', 'typing_extensions.py', 'training_memory.py')
+$taskRequired += @('memory_retrieval_panel.py')
+$taskRequired += @('ui_controls.py')
 foreach ($taskName in $taskRequired) {
     if (-not (Test-Path -LiteralPath (Join-Path $SourceRoot $taskName) -PathType Leaf)) { throw "Missing application source: $taskName" }
 }
@@ -46,6 +50,10 @@ foreach ($taskFile in Get-ChildItem -LiteralPath $SourceRoot -File -Filter '*.py
     Copy-Item -LiteralPath $taskFile.FullName -Destination (Join-Path $taskStage $taskFile.Name)
 }
 $taskStatic = @('capability_catalog.json','使用说明.md','assets\free-ai.ico','assets\free-ai-ui.png')
+$taskStatic += @('MEMORY.md', 'DIFY_REFERENCE.md')
+$taskStatic += @('fsrs\__init__.py','fsrs\card.py','fsrs\optimizer.py','fsrs\py.typed',
+    'fsrs\rating.py','fsrs\review_log.py','fsrs\scheduler.py','fsrs\state.py',
+    'third_party\fsrs-LICENSE','third_party\typing_extensions-LICENSE','third_party\memory-retention.md')
 $taskStarter = @('sft_general_test.jsonl','sft_test.jsonl','sft_train.jsonl','sft_validation.jsonl','train.txt','validation.txt')
 foreach ($taskName in $taskStarter) { $taskStatic += 'starter_data\teaching\' + $taskName }
 foreach ($taskRelative in $taskStatic) {

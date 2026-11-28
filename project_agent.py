@@ -1456,6 +1456,10 @@ class ProjectAgent:
                 self._event('model_end', '本轮模型生成已结束。', round=round_index + 1)
             if included_ids and not self.memory_ids:
                 self.memory_ids = included_ids
+                try:
+                    self.personal_memory.mark_used(included_ids)
+                except Exception:
+                    self._event('memory', '记忆引用统计未保存。')
                 self._event('memory', '已将长期记忆加入本轮模型上下文。', memory_ids=self.memory_ids)
             if not isinstance(message, dict) or message.get('role') != 'assistant':
                 raise APIError('模型未返回有效的项目工具消息。')

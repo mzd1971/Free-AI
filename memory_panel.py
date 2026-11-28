@@ -3,15 +3,19 @@ import re
 import tkinter as tk
 from tkinter import ttk
 
-from ui_kit import COLORS as C, FlatButton, RoundedFrame, ScrollArea, background, label, ui_font
+from memory_retrieval_panel import MemoryRetrievalPanel
+from ui_controls import SwitchRow
+from ui_kit import COLORS as C, FlatButton, RoundedFrame, ScrollArea, label, ui_font
 
 KINDS = {'偏好': 'preference', '事实': 'fact', '做法': 'procedure', '备忘': 'note'}
 SCOPES = {'这个助手': 'agent', '所有助手': 'global', '当前项目': 'project'}
+IMPORTANCE = {'普通': 0.5, '重要': 0.7}
 
 
 class MemoryPanel:
     def __init__(self, app):
         self.app, self.opened, self.identity, self.delete_pending = app, False, None, None
+        self._view = 'manage'
         self.rows = []
         self._source_evidence = ''
         self.read_enabled = tk.BooleanVar(value=app.sessions.get('personal_memory_read', True))
@@ -24,9 +28,23 @@ class MemoryPanel:
         top.pack(fill='x')
         label(top, '长期记忆', size=14, bold=True, color=C.get('brand', C['text'])).pack(side='left')
         FlatButton(top, '×', self.toggle, width=28, height=28, variant='ghost').pack(side='right')
-        footer = tk.Frame(self.frame.body, bg=C['surface'])
+        tabs = tk.Frame(self.frame.body, bg=C['surface'])
+        tabs.pack(fill='x', pady=(10, 8))
+        self.manage_tab = FlatButton(tabs, '管理', lambda: self._switch_view('manage'), variant='selected',
+                                     height=28, font_size=10)
+        self.manage_tab.pack(side='left')
+        self.retrieval_tab = FlatButton(tabs, '检索测试', lambda: self._switch_view('retrieval'), variant='ghost',
+                                        height=28, font_size=10)
+        self.retrieval_tab.pack(side='left', padx=(4, 0))
+        self.management = tk.Frame(self.frame.body, bg=C['surface'])
+        self.management.pack(fill='both', expand=True)
+        self.retrieval = MemoryRetrievalPanel(
+            self.frame.body, preview=lambda *args, **kwargs: app.personal_memory.preview_call(*args, **kwargs),
+            workspace=self.workspace, route=self._retrieval_route,
+        )
+        footer = tk.Frame(self.management, bg=C['surface'])
         footer.pack(side='bottom', fill='x', pady=(8, 0))
-        self.area = ScrollArea(self.frame.body, bg=C['surface'])
+        self.area = ScrollArea(self.management, bg=C['surface'])
         self.area.pack(fill='both', expand=True)
         scroll = ttk.Scrollbar(self.area, orient='vertical', command=self.area.canvas.yview)
         scroll.pack(side='right', fill='y', before=self.area.canvas)
@@ -36,12 +54,19 @@ class MemoryPanel:
             fill='x', pady=(9, 7))
         self._wrapped(host, textvariable=self.mode_state).pack(fill='x', pady=(0, 5))
         self.options = self.build_options(host)
-        self._wrapped(host, '勾选联网授权后，相关记忆可能随请求发给服务商，自动整理可能产生额外调用费用。').pack(
+        self._wrapped(host, '开启联网授权后，相关记忆可能随请求发给服务商，自动整理可能产生额外调用费用。').pack(
             fill='x', pady=(5, 9))
         label(host, '当前助手 / 当前项目的记忆', size=10, color=C['muted']).pack(anchor='w', pady=(2, 6))
-        self.listbox = tk.Listbox(host, height=5, font=ui_font(self.app.root, 10), bg=C['input'], fg=C['text'],
+        self.retention_note = self._wrapped(host, '未核实的 AI 记忆随时间变旧，可能自动归档，暂停检索。原文会保留，可以恢复。你保存、已核实或置顶的记忆不会自动归档。')
+        self.retention_note.pack(fill='x', pady=(0, 6))
+        self.list_frame = tk.Frame(host, bg=C['surface'])
+        self.list_frame.pack(fill='x')
+        self.listbox = tk.Listbox(self.list_frame, height=5, width=1, font=ui_font(self.app.root, 10), bg=C['input'], fg=C['text'],
             selectbackground=C['tint'], selectforeground=C['text'], bd=0, highlightthickness=0, exportselection=False)
-        self.listbox.pack(fill='x')
+        list_scroll = ttk.Scrollbar(self.list_frame, orient='vertical', command=self.listbox.yview)
+        list_scroll.pack(side='right', fill='y')
+        self.listbox.pack(side='left', fill='x', expand=True)
+        self.listbox.configure(yscrollcommand=list_scroll.set)
         self.empty_label = self._wrapped(host, '这里会显示你和 AI 保存的记忆。')
         self.empty_label.pack(fill='x', pady=(3, 0))
         self.listbox.bind('<<ListboxSelect>>', self.select)
@@ -50,6 +75,8 @@ class MemoryPanel:
         FlatButton(tools, '+ 新记忆', self.new, variant='ghost', height=30, font_size=10).pack(side='left')
         self.status_button = FlatButton(tools, '停用', self.change_status, variant='ghost', height=30, width=66, font_size=10)
         self.status_button.pack(side='right')
+        self.restore_button = FlatButton(host, '恢复记忆', self.restore, variant='secondary', height=28,
+                                         font_size=10, state='disabled')
         self.provenance = self._wrapped(host, '手工填写会作为你定义的记忆。')
         self.provenance.pack(fill='x', pady=(2, 7))
         self.source_actions = tk.Frame(host, bg=C['surface'])
@@ -84,8 +111,17 @@ class MemoryPanel:
         self.kind, self.scope = tk.StringVar(value='偏好'), tk.StringVar(value='这个助手')
         ttk.Combobox(selectors, values=list(KINDS), textvariable=self.kind, state='readonly', width=6).pack(side='left')
         ttk.Combobox(selectors, values=list(SCOPES), textvariable=self.scope, state='readonly', width=10).pack(side='right')
+        importance_row = tk.Frame(host, bg=C['surface'])
+        importance_row.pack(fill='x', pady=(0, 3))
+        label(importance_row, '重要性', size=10).pack(side='left', padx=(0, 8))
+        self.importance = tk.StringVar(value='普通')
+        self.importance_input = ttk.Combobox(importance_row, values=list(IMPORTANCE), textvariable=self.importance,
+                                            state='readonly', width=6, font=ui_font(self.app.root, 10))
+        self.importance_input.pack(side='left')
+        self.importance_input.bind('<<ComboboxSelected>>', self.change_importance)
+        self._wrapped(host, '设为重要可提高检索优先级，并延后自动归档。').pack(fill='x', pady=(0, 5))
         self.pin_enabled = tk.BooleanVar()
-        self.pin_option = self._checkbox(host, '每次都参考', self.pin_enabled, self.change_pin)
+        self.pin_option = self._switch(host, '每次都参考', self.pin_enabled, self.change_pin)
         self.pin_option.pack(fill='x')
         self.pin_scope_note = self._wrapped(host, '启用且在适用范围内时优先提供，上下文空间不足时可能省略。')
         self.pin_scope_note.pack(fill='x', pady=(0, 5))
@@ -109,18 +145,14 @@ class MemoryPanel:
         return self._wrap(label(parent, text, size=10, color=C['muted'], anchor='w',
                                 wraplength=270, justify='left', **options))
 
-    def _checkbox(self, parent, text, variable, command):
-        color = background(parent)
-        return self._wrap(tk.Checkbutton(
-            parent, text=text, variable=variable, command=command, bg=color, fg=C['text'],
-            activebackground=color, activeforeground=C['text'], selectcolor=C['input'],
-            font=ui_font(self.app.root, 10), anchor='w', justify='left', bd=0))
+    def _switch(self, parent, text, variable, command):
+        return SwitchRow(parent, text, variable, command, font_size=10)
 
     def build_options(self, parent):
         options = []
         for text, variable in [('使用长期记忆', self.read_enabled), ('允许 AI 自动记忆', self.auto_enabled),
                                ('联网模型也可读写记忆', self.remote_enabled)]:
-            check = self._checkbox(parent, text, variable, self.save_options)
+            check = self._switch(parent, text, variable, self.save_options)
             check.pack(fill='x')
             options.append(check)
         self._option_widgets.extend(options)
@@ -133,8 +165,30 @@ class MemoryPanel:
         allowed = backend != 'api' or self.remote_enabled.get()
         return {'read': bool(allowed and self.read_enabled.get()), 'write': bool(allowed and self.auto_enabled.get())}
 
+    def _retrieval_route(self, query):
+        from app_skills import get_skill
+        from clock_context import clock_query_kind
+
+        app = self.app
+        can_read = self.snapshot(app.backend)['read']
+        skill, tool_mode = app.skill.get(), app.tool_mode.get()
+        route, budget = '普通聊天', 1400
+        if app.project.enabled.get():
+            route, budget = '项目助手', 1800
+        elif tool_mode or get_skill(skill)['kind'] == 'tool':
+            can_read = False
+        elif skill == 'general' and not app.image_path:
+            if not app.skill_file and clock_query_kind(query):
+                can_read = False
+            elif app.project.assistant_enabled.get():
+                route, budget = '智能助手', 1800
+        message = (f'{route} · 检索预算 {budget} 字节' if can_read else '测试仅本地，当前回答不会读取记忆。')
+        return {'budget': budget, 'read_enabled': can_read, 'message': message}
+
     def refresh_mode(self):
         app = self.app
+        if self._view == 'retrieval':
+            self.retrieval.sync_route()
         if app.backend == 'api' and not self.remote_enabled.get():
             self.mode_state.set('联网模式 · 未授权长期记忆，读取和自动保存均关闭。')
             return
@@ -171,16 +225,45 @@ class MemoryPanel:
     def toggle(self):
         if self.opened:
             self.opened = False
+            self.retrieval.reset()
+            self._switch_view('manage')
             self.app.layout_chat()
         else:
             self.show()
+
+    def _switch_view(self, view):
+        if self._view == view:
+            return
+        self._view = view
+        testing = view == 'retrieval'
+        if testing:
+            self.retrieval.clear_results()
+        if testing and self.delete_pending:
+            self.delete_pending = None
+            self.delete_button.configure(text='删除')
+            self.notice.set('可继续编辑当前记忆。')
+        hidden, shown = (self.management, self.retrieval) if testing else (self.retrieval, self.management)
+        hidden.pack_forget()
+        shown.pack(fill='both', expand=True)
+        self.manage_tab.configure(variant='ghost' if testing else 'selected')
+        self.retrieval_tab.configure(variant='selected' if testing else 'ghost')
+        self.sync_busy()
+        self.refresh()
+        if testing:
+            self.retrieval.query_input.focus_set()
 
     def refresh(self):
         self.refresh_mode()
         if not self.opened:
             return
+        if self._view == 'retrieval':
+            self.sync_busy()
+            return
         try:
-            self.rows = self.app.personal_memory.list(workspace=self.workspace())
+            workspace = self.workspace()
+            if not self.app.busy:
+                self.app.personal_memory.maintain(workspace=workspace)
+            self.rows = self.app.personal_memory.list(workspace=workspace, include_archived=True)
         except Exception:
             self.notice.set('暂时无法读取记忆，请检查记录文件夹。')
             return
@@ -188,15 +271,17 @@ class MemoryPanel:
         if self.rows:
             self.empty_label.pack_forget()
         else:
-            self.empty_label.pack(fill='x', after=self.listbox, pady=(3, 0))
+            self.empty_label.pack(fill='x', after=self.list_frame, pady=(3, 0))
         for row in self.rows:
             source = '你' if row['source'] == 'user' else 'AI 已核实' if row['verified'] else 'AI 未核实'
             state = '停用 · ' if row['status'] == 'disabled' else '待确认 · ' if row['status'] == 'pending' else ''
             pinned = '置顶 · ' if row['pinned'] else ''
-            self.listbox.insert('end', f'{pinned}{state}{source} · {row["title"]}')
+            archived = '已归档 · ' if row['archived'] else ''
+            self.listbox.insert('end', f'{archived}{pinned}{state}{source} · {row["title"]}')
         selected = next((index for index, row in enumerate(self.rows) if row['id'] == self.identity), None)
         if selected is not None:
             self.listbox.selection_set(selected)
+            self.listbox.see(selected)
             self._show_provenance(self.rows[selected])
         elif self.identity:
             self.new()
@@ -204,11 +289,18 @@ class MemoryPanel:
 
     def sync_busy(self):
         state = 'disabled' if self.app.busy else 'normal'
-        for widget in (*self._option_widgets, self.pin_option, self.save_button, self.delete_button, self.status_button):
+        for widget in (*self._option_widgets, self.pin_option, self.status_button):
             widget.configure(state=state)
+        editor_state = 'disabled' if self._view == 'retrieval' else state
+        self.save_button.configure(state=editor_state)
+        self.delete_button.configure(state=editor_state)
+        self.retrieval.sync_busy(self.app.busy)
+        self.importance_input.configure(state='disabled' if self.app.busy else 'readonly')
         selected = next((row for row in self.rows if row['id'] == self.identity), None)
         verify = 'normal' if not self.app.busy and selected and not selected['verified'] else 'disabled'
         self.verify_button.configure(state=verify)
+        restore = 'normal' if not self.app.busy and selected and selected['archived'] else 'disabled'
+        self.restore_button.configure(state=restore)
 
     def new(self):
         self.identity, self.delete_pending = None, None
@@ -216,6 +308,9 @@ class MemoryPanel:
         self.content.delete('1.0', 'end')
         self.kind.set('偏好')
         self.scope.set('当前项目' if self.workspace() else '这个助手')
+        self.importance.set('普通')
+        self.restore_button.pack_forget()
+        self.restore_button.configure(state='disabled')
         self.listbox.selection_clear(0, 'end')
         self.provenance.configure(text='手工填写会作为你定义的记忆。')
         self.pin_enabled.set(False)
@@ -256,9 +351,15 @@ class MemoryPanel:
             self._write_source()
         origin = ('聊天对话' if evidence.startswith(('对话', '用户原话')) else
                   '项目任务' if evidence.startswith('项目运行') else evidence[:60])
-        self.provenance.configure(text=source + ('\n来源：' + origin if origin else ''))
+        state = '\n已归档，暂不参与自动检索。' if row['archived'] else ''
+        self.provenance.configure(text=source + ('\n来源：' + origin if origin else '') + state)
+        if row['archived']:
+            self.restore_button.pack(anchor='w', after=self.provenance, pady=(0, 5))
+        else:
+            self.restore_button.pack_forget()
         self.status_button.configure(text='启用' if row['status'] != 'active' else '停用')
         self.pin_enabled.set(row['pinned'])
+        self.importance.set('重要' if row['importance'] >= IMPORTANCE['重要'] else '普通')
         self.verify_button.configure(text='已核实' if row['verified'] else '核实这条')
 
     def _write_source(self):
@@ -302,6 +403,33 @@ class MemoryPanel:
         self.refresh()
         self.notice.set('已置顶。' if row['pinned'] else '已取消置顶。')
 
+    def change_importance(self, event=None):
+        if self.app.busy or not self.identity:
+            return
+        importance = self.importance.get()
+        try:
+            self.app.personal_memory.set_importance(self.identity, IMPORTANCE[importance])
+        except Exception:
+            self.refresh()
+            self.notice.set('无法更新记忆重要性。')
+            return
+        self.refresh()
+        self.notice.set(f'记忆已设为{importance}。')
+
+    def restore(self):
+        if self.app.busy or not self.identity:
+            return
+        try:
+            row = self.app.personal_memory.restore(self.identity)
+        except Exception:
+            self.notice.set('无法恢复这条记忆。')
+            return
+        self.refresh()
+        if row['status'] == 'active':
+            self.notice.set('记忆已恢复，可在适用范围内参与自动检索。')
+        else:
+            self.notice.set('已解除归档。启用这条记忆后，它才会参与自动检索。')
+
     def verify(self):
         if self.app.busy or not self.identity:
             return
@@ -319,12 +447,13 @@ class MemoryPanel:
         self.notice.set('已核实并保留 AI 来源，不再被自动覆盖。')
 
     def save(self):
-        if self.app.busy:
+        if self.app.busy or self._view == 'retrieval':
             return
         try:
             row = self.app.personal_memory.save_user(self.title.get(), self.content.get('1.0', 'end-1c'),
                 kind=KINDS[self.kind.get()], scope=SCOPES[self.scope.get()], workspace=self.workspace(),
-                memory_id=self.identity, pinned=self.pin_enabled.get())
+                memory_id=self.identity, pinned=self.pin_enabled.get(),
+                importance=None if self.identity else IMPORTANCE[self.importance.get()])
             self.identity = row['id']
             self.refresh()
             self.select()
@@ -340,15 +469,20 @@ class MemoryPanel:
         try:
             row = self.app.personal_memory.get(self.identity)
             status = 'disabled' if row['status'] == 'active' else 'active'
-            self.app.personal_memory.set_status(self.identity, status)
+            row = self.app.personal_memory.set_status(self.identity, status)
             self.refresh()
             self.select()
-            self.notice.set('已停用，后续不会再检索这条记忆。' if status == 'disabled' else '已启用。')
+            if status == 'disabled':
+                self.notice.set('已停用，后续不会再检索这条记忆。')
+            elif row['archived']:
+                self.notice.set('已启用。恢复这条记忆后，它才会参与自动检索。')
+            else:
+                self.notice.set('已启用。')
         except Exception:
             self.notice.set('未能更新记忆状态。')
 
     def delete(self):
-        if self.app.busy or not self.identity:
+        if self.app.busy or self._view == 'retrieval' or not self.identity:
             return
         if self.delete_pending != self.identity:
             self.delete_pending = self.identity

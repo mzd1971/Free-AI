@@ -461,7 +461,7 @@ class HuggingFaceDatasetPanel(tk.Frame):
             self._preview_source = source if rows else None
             self._show_preview(preview, source)
             if rows and self._columns and hf_datasets.is_training_split(source[2]):
-                self._choose_fields()
+                self._choose_fields(rows)
                 self.mapping_area.pack(fill='x', pady=(4, 0))
                 self._set_status('确认字段对应关系后即可导入。')
             else:
@@ -496,7 +496,7 @@ class HuggingFaceDatasetPanel(tk.Frame):
         self.preview_description.set(shown)
         self.preview_area.pack(fill='x')
 
-    def _choose_fields(self):
+    def _choose_fields(self, rows):
         names = {column.casefold(): column for column in self._columns}
         suggestions = {
             'prompt': ('prompt', 'question', 'instruction', 'query', 'user', 'input', 'text'),
@@ -513,6 +513,9 @@ class HuggingFaceDatasetPanel(tk.Frame):
                               if name in names and names[name] not in used), '')
                 if key == 'messages' and not (self.fields['prompt'].get() and self.fields['response'].get()):
                     value = names.get('messages', '')
+                    alias = names.get('conversations')
+                    if not value and alias and hf_datasets.has_chat_samples(rows, alias):
+                        value = alias
             variable.set(value)
             used.add(value)
 

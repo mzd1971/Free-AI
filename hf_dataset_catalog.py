@@ -32,6 +32,15 @@ _CATALOG = (
     _Recommendation('人工编写对话', 'HuggingFaceH4/no_robots',
                     '人工编写的英文问答、写作与改写资料；仅限非商业用途。',
                     'cc-by-nc-4.0', ('english', 'humanchat', 'chat', 'qa', 'writing')),
+    _Recommendation('中文三轮对话', 'opencsg/smoltalk-chinese',
+                    '模型生成的中文对话，适合练习接续追问和给出日常建议。',
+                    'apache-2.0', ('chinese', 'chat')),
+    _Recommendation('编程与调试练习', 'ise-uiuc/Magicoder-Evol-Instruct-110K',
+                    '英文编程指令与参考答案，适合练习修改代码、排查错误和解释解决方法。',
+                    'apache-2.0', ('english', 'code')),
+    _Recommendation('英文多轮对话', 'HuggingFaceTB/smol-smoltalk',
+                    '面向小模型的英文训练资料，包含多轮对话、改写和按要求回答的示例。',
+                    'apache-2.0', ('english', 'chat', 'writing')),
 )
 RECOMMENDED_DATASETS = tuple((entry.title, entry.repository, entry.description) for entry in _CATALOG)
 _RECOMMENDATIONS_BY_ID = {entry.repository.casefold(): entry for entry in _CATALOG}

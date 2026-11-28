@@ -26,6 +26,10 @@ SYSTEM = "你是一个中文助手。请准确、简洁地回答；不确定时�
 CHECKPOINT_FILES = ("adapter/adapter_config.json", "adapter/adapter_model.safetensors")
 
 
+class TrainingStopped(SystemExit):
+    pass
+
+
 def dump(path, obj):
     path = Path(path)
     stream = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
@@ -123,13 +127,39 @@ def answer(model, tokenizer, prompt, max_tokens=192):
             "new_tokens": len(new_ids), "hit_token_limit": len(new_ids) >= max_tokens and not ended}
 
 
+def _recall_training_context(target):
+    recalled = []
+    try:
+        from agent_memory import AgentMemoryStore
+        from training_memory import MANIFEST_FILE, recall_training_memory
+        store = AgentMemoryStore()
+        recalled = recall_training_memory(target, store)
+        dump(target / MANIFEST_FILE, {'outcome': 'running', 'recalled': recalled})
+        if recalled:
+            store.mark_used([item['id'] for item in recalled])
+            text = f'已将 {len(recalled)} 条相关训练经验加入本次运行记录。'
+            print(json.dumps({'event': 'log', 'text': text}, ensure_ascii=False), flush=True)
+    except Exception:
+        print(json.dumps({'event': 'memory_warning', 'message': '无法读取或引用以前的训练记忆。'},
+                         ensure_ascii=False), flush=True)
+    return recalled
+
+
+def _remember_training_outcome(target, outcome, recalled):
+    try:
+        from training_memory import MANIFEST_FILE, record_training_memory
+        dump(target / MANIFEST_FILE, {'outcome': outcome, 'recalled': recalled})
+        if record_training_memory(target, outcome) is not None:
+            print(json.dumps({'event': 'log', 'text': '已保存本次训练运行的长期记忆。'},
+                             ensure_ascii=False), flush=True)
+    except Exception:
+        print(json.dumps({'event': 'memory_warning', 'message': '无法保存本次运行的长期记忆。'},
+                         ensure_ascii=False), flush=True)
+
+
 def run(epochs=3, data_dir=None, initial_adapter=None, output_prefix="qwen-lora", learning_rate=0.0001, stop_file=None):
     if not 1 <= epochs <= 10 or not math.isfinite(learning_rate) or not 0 < learning_rate <= 0.01:
         raise ValueError("轮数必须为1–10，学习率必须大于0且不超过0.01。")
-    def check_stop():
-        if stop_file and Path(stop_file).exists():
-            print(json.dumps({"event": "cancelled", "run": str(target)}, ensure_ascii=False), flush=True)
-            raise SystemExit(2)
     if not torch.cuda.is_available():
         raise RuntimeError("本次正式微调需要 CUDA GPU。")
     torch.set_num_threads(4)
@@ -138,7 +168,42 @@ def run(epochs=3, data_dir=None, initial_adapter=None, output_prefix="qwen-lora"
     start = time.monotonic()
     target = RUNS_ROOT / (output_prefix + "-" + datetime.now().strftime("%Y%m%d-%H%M%S"))
     target.mkdir(parents=True, exist_ok=False)
-    check_stop()
+
+    def check_stop():
+        if stop_file and Path(stop_file).exists():
+            print(json.dumps({"event": "cancelled", "run": str(target)}, ensure_ascii=False), flush=True)
+            raise TrainingStopped(2)
+
+    track_memory = output_prefix != 'desktop-smoke'
+    recalled = []
+    try:
+        check_stop()
+        if track_memory:
+            recalled = _recall_training_context(target)
+        summary = _run_training(target, epochs, data_dir, initial_adapter, learning_rate, start, check_stop)
+    except (TrainingStopped, KeyboardInterrupt):
+        if track_memory:
+            _remember_training_outcome(target, 'cancelled', recalled)
+        raise
+    except Exception:
+        if track_memory:
+            _remember_training_outcome(target, 'failed', recalled)
+        raise
+
+    if track_memory:
+        _remember_training_outcome(target, 'completed', recalled)
+    print(json.dumps(summary, ensure_ascii=False), flush=True)
+    if track_memory and summary['acceptance_status'] == 'passed':
+        try:
+            from epistemology import record_training
+            print(json.dumps({'event': 'training_experience', **record_training(summary)}, ensure_ascii=False), flush=True)
+        except Exception as exc:
+            # Saved weights remain valid even if the optional experience store is unavailable.
+            print(json.dumps({'event': 'memory_warning', 'message': str(exc)}, ensure_ascii=False), flush=True)
+    return target
+
+
+def _run_training(target, epochs, data_dir, initial_adapter, learning_rate, start, check_stop):
     files = ["sft_train.jsonl", "sft_validation.jsonl", "sft_test.jsonl", "sft_general_test.jsonl"]
     groups = [read_rows(name, data_dir) for name in files]
     if not groups[0] or not groups[1]:
@@ -259,15 +324,7 @@ def run(epochs=3, data_dir=None, initial_adapter=None, output_prefix="qwen-lora"
     check_stop()
     dump(target / ACCEPTANCE_FILE, acceptance)
     dump(target / "summary.json", summary)
-    print(json.dumps(summary, ensure_ascii=False), flush=True)
-    if output_prefix != 'desktop-smoke' and acceptance["status"] == "passed":
-        try:
-            from epistemology import record_training
-            print(json.dumps({'event': 'training_experience', **record_training(summary)}, ensure_ascii=False), flush=True)
-        except Exception as exc:
-            # Saved weights remain valid even if the optional experience store is unavailable.
-            print(json.dumps({'event': 'memory_warning', 'message': str(exc)}, ensure_ascii=False), flush=True)
-    return target
+    return summary
 
 
 if __name__ == "__main__":

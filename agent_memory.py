@@ -5,11 +5,13 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import os
+import math
 from pathlib import Path
 import re
 import sqlite3
 import unicodedata
 import uuid
+from memory_retention import new_state, reinforce, priority, retention, should_archive
 
 from clock_context import clock_query_kind
 
@@ -144,13 +146,15 @@ def _public(row):
     record.pop('title_key', None)
     record['verified'] = bool(record['verified'])
     record['pinned'] = bool(record['pinned'])
+    record['archived'] = bool(record['archived'])
     return record
 
 
 class AgentMemoryStore:
     """Store durable preferences and observations for an assistant."""
 
-    def __init__(self, root=None):
+    def __init__(self, root=None, *, clock=None):
+        self._clock = clock
         if root is None:
             from paths import ARTIFACTS
 
@@ -185,6 +189,35 @@ class AgentMemoryStore:
                 db.execute("UPDATE memories SET verified=1 WHERE source='user'")
             if 'pinned' not in columns:
                 db.execute('ALTER TABLE memories ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0')
+            for name, definition in (
+                ('importance', 'REAL NOT NULL DEFAULT 0.5'),
+                ('archived', 'INTEGER NOT NULL DEFAULT 0'),
+                ('access_count', 'INTEGER NOT NULL DEFAULT 0'),
+                ('last_access', "TEXT NOT NULL DEFAULT ''"),
+                ('retention_state', "TEXT NOT NULL DEFAULT ''"),
+                ('origin', "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if name not in columns:
+                    db.execute(f'ALTER TABLE memories ADD COLUMN {name} {definition}')
+            for row in db.execute("SELECT id,updated FROM memories WHERE retention_state='' ").fetchall():
+                try:
+                    timestamp = datetime.fromisoformat(row['updated']).astimezone(timezone.utc)
+                except (TypeError, ValueError):
+                    timestamp = self._time()
+                db.execute('UPDATE memories SET retention_state=? WHERE id=?',
+                           (new_state(timestamp), row['id']))
+
+    def _time(self):
+        value = self._clock() if self._clock else datetime.fromisoformat(_now())
+        if not isinstance(value, datetime) or value.tzinfo is None:
+            raise ValueError('记忆时钟必须包含时区。')
+        return value.astimezone(timezone.utc)
+
+    @staticmethod
+    def _importance(value):
+        if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError('保留优先级必须在 0 到 1 之间。')
+        return float(value)
 
     @contextmanager
     def _connect(self, write=False):
@@ -212,23 +245,32 @@ class AgentMemoryStore:
                    (memory_id, action, source, timestamp))
 
     def save_user(self, title, content, *, kind='note', scope='agent', agent_id='freeai',
-                  workspace='', memory_id=None, pinned=None):
+                  workspace='', memory_id=None, pinned=None, importance=None):
         if pinned is not None and type(pinned) is not bool:
             raise ValueError('置顶必须是布尔值。')
         row, _ = self._save(title, content, kind, scope, agent_id, workspace,
-                            source='user', evidence='', status='active', memory_id=memory_id, pinned=pinned)
+                            source='user', evidence='', status='active', memory_id=memory_id, pinned=pinned,
+                            importance=importance)
         return row
 
     def remember(self, title, content, *, kind='note', scope='agent', agent_id='freeai',
-                 workspace='', evidence='', pending=False, return_changed=False):
+                 workspace='', evidence='', pending=False, return_changed=False, importance=None):
         if type(pending) is not bool:
             raise ValueError('pending 必须是布尔值。')
         row, changed = self._save(title, content, kind, scope, agent_id, workspace, source='agent',
-                                  evidence=evidence, status='pending' if pending else 'active')
+                                  evidence=evidence, status='pending' if pending else 'active', importance=importance)
         return (row, changed) if return_changed else row
 
+    def remember_training(self, title, content, *, evidence, importance=0.6):
+        """Trusted local worker entry point; never exposed as a model tool."""
+        row, _ = self._save(title, content, 'note', 'agent', 'freeai', '', source='agent',
+                            evidence=evidence, status='active', importance=importance, origin='training')
+        return row
+
     def _save(self, title, content, kind, scope, agent_id, workspace, *, source, evidence,
-              status, memory_id=None, pinned=None):
+              status, memory_id=None, pinned=None, importance=None, origin=''):
+        if importance is not None:
+            importance = self._importance(importance)
         if not isinstance(kind, str) or kind not in KINDS:
             raise ValueError('未知的记忆类型。')
         if not isinstance(scope, str) or scope not in SCOPES or (source == 'agent' and scope == 'global'):
@@ -254,7 +296,8 @@ class AgentMemoryStore:
             else:
                 row = existing
             if source == 'agent':
-                if row is not None and (row['source'] == 'user' or row['verified'] or row['status'] == 'disabled'):
+                if row is not None and (row['source'] == 'user' or row['verified'] or row['status'] == 'disabled'
+                                        or row['archived'] or (row['origin'] == 'training' and origin != 'training')):
                     return _public(row), False
                 duplicate = db.execute("""
                     SELECT * FROM memories
@@ -267,10 +310,11 @@ class AgentMemoryStore:
                     return _public(duplicate), False
             if row is not None and source == 'agent':
                 if all(row[name] == value for name, value in (
-                    ('title', title), ('content', content), ('kind', kind), ('status', status),
+                    ('title', title), ('content', content), ('kind', kind), ('status', status), ('origin', origin),
                 )):
                     return _public(row), False
-            now = _now()
+            instant = self._time()
+            now = instant.isoformat()
             if row is None:
                 memory_id = uuid.uuid4().hex
                 db.execute("""
@@ -291,6 +335,10 @@ class AgentMemoryStore:
                 """, (title, title_key, content, kind, scope, agent_id, workspace, source, status,
                       now, evidence, source == 'user', pinned, memory_id))
                 action = 'updated'
+            weight = importance if importance is not None else (row['importance'] if row is not None
+                     else 0.75 if kind in ('preference', 'procedure') else 0.5)
+            db.execute('UPDATE memories SET importance=?,archived=0,retention_state=?,origin=? WHERE id=?',
+                       (weight, new_state(instant), origin, memory_id))
             self._audit(db, memory_id, action, source, now)
             return _public(self._record(db, memory_id)), True
 
@@ -298,11 +346,13 @@ class AgentMemoryStore:
         with self._connect() as db:
             return _public(self._record(db, memory_id))
 
-    def list(self, *, agent_id='freeai', workspace='', include_disabled=True):
+    def list(self, *, agent_id='freeai', workspace='', include_disabled=True, include_archived=True):
         filters = ("((scope='global' AND source='user') OR (agent_id=? AND "
                    "(scope='agent' OR (scope='project' AND workspace=?))))")
         if not include_disabled:
             filters += " AND status!='disabled'"
+        if not include_archived:
+            filters += ' AND archived=0'
         with self._connect() as db:
             rows = db.execute('SELECT * FROM memories WHERE ' + filters + ' ORDER BY updated DESC, id',
                               (_agent(agent_id), _workspace(workspace))).fetchall()
@@ -314,7 +364,7 @@ class AgentMemoryStore:
         with self._connect(write=True) as db:
             row = self._record(db, memory_id)
             if row['status'] != status:
-                now = _now()
+                now = self._time().isoformat()
                 db.execute('UPDATE memories SET status=?, updated=? WHERE id=?', (status, now, memory_id))
                 self._audit(db, memory_id, 'status_' + status, 'user', now)
             return _public(self._record(db, memory_id))
@@ -325,8 +375,10 @@ class AgentMemoryStore:
         with self._connect(write=True) as db:
             row = self._record(db, memory_id)
             if bool(row['pinned']) != pinned:
-                now = _now()
+                now = self._time().isoformat()
                 db.execute('UPDATE memories SET pinned=?, updated=? WHERE id=?', (pinned, now, memory_id))
+                if pinned:
+                    db.execute('UPDATE memories SET archived=0 WHERE id=?', (memory_id,))
                 self._audit(db, memory_id, 'pinned' if pinned else 'unpinned', 'user', now)
             return _public(self._record(db, memory_id))
 
@@ -334,8 +386,11 @@ class AgentMemoryStore:
         with self._connect(write=True) as db:
             row = self._record(db, memory_id)
             if not row['verified']:
-                now = _now()
+                instant = self._time()
+                now = instant.isoformat()
                 db.execute('UPDATE memories SET verified=1, updated=? WHERE id=?', (now, memory_id))
+                db.execute('UPDATE memories SET archived=0,retention_state=? WHERE id=?',
+                           (reinforce(row['retention_state'], instant), memory_id))
                 self._audit(db, memory_id, 'verified', 'user', now)
             return _public(self._record(db, memory_id))
 
@@ -343,49 +398,169 @@ class AgentMemoryStore:
         with self._connect(write=True) as db:
             self._record(db, memory_id)
             db.execute('DELETE FROM memories WHERE id=?', (memory_id,))
-            self._audit(db, memory_id, 'deleted', 'user', _now())
+            self._audit(db, memory_id, 'deleted', 'user', self._time().isoformat())
 
-    def before_call(self, query, *, agent_id='freeai', workspace='', budget=1800):
-        if not isinstance(query, str) or type(budget) is not int or budget < 0:
-            raise ValueError('长期记忆检索参数无效。')
+    def set_importance(self, memory_id, importance):
+        importance = self._importance(importance)
+        with self._connect(write=True) as db:
+            row = self._record(db, memory_id)
+            if row['importance'] != importance:
+                now = self._time().isoformat()
+                db.execute('UPDATE memories SET importance=?,updated=? WHERE id=?',
+                           (importance, now, memory_id))
+                self._audit(db, memory_id, 'importance', 'user', now)
+            return _public(self._record(db, memory_id))
+
+    def restore(self, memory_id):
+        with self._connect(write=True) as db:
+            row = self._record(db, memory_id)
+            if row['archived']:
+                instant = self._time()
+                db.execute('UPDATE memories SET archived=0,updated=?,retention_state=? WHERE id=?',
+                           (instant.isoformat(), reinforce(row['retention_state'], instant), memory_id))
+                self._audit(db, memory_id, 'restored', 'user', instant.isoformat())
+            return _public(self._record(db, memory_id))
+
+    def maintain(self, *, agent_id='freeai', workspace=''):
+        instant = self._time()
+        candidates = self.list(agent_id=agent_id, workspace=workspace,
+                               include_disabled=False, include_archived=False)
+        archived = 0
+        with self._connect(write=True) as db:
+            for candidate in candidates:
+                # Re-read under the write lock: a second window may have verified it.
+                row = db.execute('SELECT * FROM memories WHERE id=?', (candidate['id'],)).fetchone()
+                if row is None or row['archived'] or not should_archive(dict(row), instant):
+                    continue
+                db.execute('UPDATE memories SET archived=1 WHERE id=?', (row['id'],))
+                self._audit(db, row['id'], 'archived', 'system', instant.isoformat())
+                archived += 1
+        return {'archived': archived}
+
+    def mark_used(self, memory_ids):
+        """Log actual context use, without treating retrieval as proof or rehearsal."""
+        if not isinstance(memory_ids, (list, tuple, set)) or len(memory_ids) > 100:
+            raise ValueError('记忆引用列表无效。')
+        with self._connect(write=True) as db:
+            now = self._time().isoformat()
+            for identity in set(memory_ids):
+                db.execute("UPDATE memories SET access_count=access_count+1,last_access=? "
+                           "WHERE id=? AND status='active' AND archived=0", (now, identity))
+
+    def before_call(self, query, *, agent_id='freeai', workspace='', budget=1800, allowed_ids=None):
+        """Build the actual context using the same selector as the read-only test."""
+        self._validate_retrieval(query, budget, allowed_ids, None, 1)
         if budget < len(HEADER.encode('utf-8')) + 40:
             return {'context': '', 'memory_ids': []}
+        self.maintain(agent_id=agent_id, workspace=workspace)
+        result = self._retrieve(query, agent_id=agent_id, workspace=workspace, budget=budget,
+                                allowed_ids=allowed_ids, max_items=None, minimum_match=1)
+        return {name: result[name] for name in ('context', 'memory_ids')}
+
+    def preview_call(self, query, *, agent_id='freeai', workspace='', budget=1800, allowed_ids=None,
+                     max_items=None, minimum_match=1):
+        """Explain retrieval without writes, remote calls or persistent test settings."""
+        self._validate_retrieval(query, budget, allowed_ids, max_items, minimum_match)
+        return self._retrieve(query, agent_id=agent_id, workspace=workspace, budget=budget,
+                              allowed_ids=allowed_ids, max_items=max_items, minimum_match=minimum_match)
+
+    @staticmethod
+    def _validate_retrieval(query, budget, allowed_ids, max_items, minimum_match):
+        if not isinstance(query, str) or type(budget) is not int or budget < 0:
+            raise ValueError('长期记忆检索参数无效。')
+        if allowed_ids is not None and not isinstance(allowed_ids, (list, tuple, set, frozenset)):
+            raise ValueError('记忆范围无效。')
+        if max_items is not None and (type(max_items) is not int or not 1 <= max_items <= 100):
+            raise ValueError('最多条数应为 1 到 100，或使用默认。')
+        if type(minimum_match) is not int or not 1 <= minimum_match <= 100:
+            raise ValueError('匹配下限应为 1 到 100 的整数。')
+
+    def _retrieve(self, query, *, agent_id, workspace, budget, allowed_ids, max_items, minimum_match):
+        instant = self._time()
         query_terms = _terms(query)
         clock_query = clock_query_kind(query)
         overview = MEMORY_OVERVIEW.fullmatch(unicodedata.normalize('NFKC', query).strip().rstrip('?!。！').strip())
-        ranked = []
-        for item in self.list(agent_id=agent_id, workspace=workspace, include_disabled=False):
-            if item['status'] != 'active':
+        ranked, excluded = [], []
+        for item in self.list(agent_id=agent_id, workspace=workspace):
+            if allowed_ids is not None and item['id'] not in allowed_ids:
                 continue
             user = item['source'] == 'user'
-            if (clock_query or not user) and is_clock_snapshot(item['title'], item['content']):
-                continue
-            if (not user and is_transient_turn(item['content'])
+            title_terms = query_terms & _terms(item['title'])
+            body_terms = query_terms & _terms(item['content'])
+            match_score = len(title_terms) * 3 + len(body_terms)
+            result = dict(item, selected=False, reason_code='', reason='', rank=None, fragment='',
+                          match_score=match_score, matched_terms=sorted(title_terms | body_terms),
+                          retention_score=retention(item.get('retention_state'), instant))
+            code, reason = '', ''
+            if item['status'] == 'disabled':
+                code, reason = 'disabled', '你已停用这条记忆。'
+            elif item['status'] != 'active':
+                code, reason = 'pending', '这条记忆仍待确认。'
+            elif item['archived']:
+                code, reason = 'archived', '已经归档，恢复后才能自动读取。'
+            elif should_archive(item, instant):
+                code, reason = 'expired', '已达到归档条件；本次测试仅预览，不更改记录。'
+            elif (clock_query or not user) and is_clock_snapshot(item['title'], item['content']):
+                code, reason = 'transient', '日期或时间快照可能过时，不作为长期依据。'
+            elif (not user and is_transient_turn(item['content'])
                     and (is_turn_label(item['title']) or is_transient_turn(item['title']))):
-                continue
-            title_match = len(query_terms & _terms(item['title']))
-            body_match = len(query_terms & _terms(item['content']))
-            if title_match or body_match or item['kind'] == 'preference' or item['pinned'] or overview:
-                ranked.append(((user, item['pinned'], title_match * 3 + body_match), item))
+                code, reason = 'transient', '临时问候、确认或查询不作为长期依据。'
+            elif not (item['kind'] == 'preference' or item['pinned'] or overview):
+                if match_score == 0:
+                    code, reason = 'no_match', '没有找到与问题匹配的关键词。'
+                elif match_score < minimum_match:
+                    code, reason = 'match_threshold', '匹配程度未达到本次测试设置。'
+            if code:
+                result.update(reason_code=code, reason=reason)
+                excluded.append(result)
+            else:
+                ranked.append(((user, item['pinned'], match_score, priority(item, instant)), result))
         ranked.sort(key=lambda match: match[0], reverse=True)
         context = HEADER
         memory_ids = []
         remaining = budget - len(context.encode('utf-8'))
         labels = {'global': '全局', 'agent': '助手', 'project': '项目'}
-        for _, item in ranked:
+        for rank, (_, item) in enumerate(ranked, start=1):
+            item['rank'] = rank
+            if max_items is not None and len(memory_ids) >= max_items:
+                item.update(reason_code='item_limit', reason='超过本次测试的最多条数。')
+                continue
+            if budget < len(HEADER.encode('utf-8')) + 40:
+                item.update(reason_code='budget', reason='当前上下文容量不足，未加入。')
+                continue
             provenance = '用户' if item['source'] == 'user' else ('AI，用户已核实' if item['verified'] else 'AI，未核实')
             label = f'\n- [{provenance} · {labels[item["scope"]]}] '
             label_size = len(label.encode('utf-8'))
             available = remaining - label_size
             if available < 16:
+                item.update(reason_code='budget', reason='当前上下文容量不足，未加入。')
                 continue
             title = _snippet(item['title'].replace('\n', ' '), min(160, available // 3))
             line = f'{label}{title}：'
             content_budget = remaining - len(line.encode('utf-8'))
             if content_budget < 4:
+                item.update(reason_code='budget', reason='当前上下文容量不足，未加入。')
                 continue
             line += _snippet(item['content'].replace('\n', ' '), min(650, content_budget))
             context += line
             remaining -= len(line.encode('utf-8'))
             memory_ids.append(item['id'])
-        return {'context': context if memory_ids else '', 'memory_ids': memory_ids}
+            reasons = ['已加入预览']
+            if item['source'] == 'user':
+                reasons.append('人工记忆优先')
+            if item['pinned']:
+                reasons.append('已置顶')
+            if item['match_score']:
+                reasons.append('与问题关键词匹配')
+            elif item['kind'] == 'preference':
+                reasons.append('默认参考已保存的偏好')
+            elif overview:
+                reasons.append('问题是在查看已有记忆')
+            if title != item['title'].replace('\n', ' ') or not line.endswith(item['content'].replace('\n', ' ')):
+                reasons.append('内容已按容量截短')
+            item.update(selected=True, reason_code='included', reason='；'.join(reasons) + '。', fragment=line)
+        final_context = context if memory_ids else ''
+        return {'context': final_context, 'memory_ids': memory_ids,
+                'items': [item for _, item in ranked] + excluded,
+                'budget': budget, 'used_bytes': len(final_context.encode('utf-8')),
+                'max_items': max_items, 'minimum_match': minimum_match}

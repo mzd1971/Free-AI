@@ -4,6 +4,7 @@ from tkinter import ttk
 from urllib.parse import urlsplit
 
 from remote_api import APIClient, normalize_base_url
+from ui_controls import SwitchRow
 from ui_kit import COLORS as C, FONT, FlatButton, RoundedFrame, label, ui_font
 
 
@@ -22,10 +23,10 @@ class APISettingsPanel:
         self.thinking = tk.BooleanVar(value=config.get('thinking', False))
         self.max_tokens = tk.StringVar(value=str(config['max_output_tokens']))
         self.notice = tk.StringVar()
-        card = RoundedFrame(parent, padding=22)
+        card = RoundedFrame(parent, padding=22, radius=16)
         card.pack(fill='x', pady=(0, 14))
         self.body = card.body
-        label(self.body, 'API 连接 · 使用联网模型', size=14, bold=True).pack(anchor='w')
+        label(self.body, '连接在线模型', size=14, bold=True).pack(anchor='w')
         intro = label(self.body, '聊天会发送到你填写的服务地址，费用由该服务商计算。保存和打开应用都不会自动发起请求。',
                       size=11, color=C['muted'], justify='left', anchor='w')
         intro.pack(fill='x', pady=(8, 14))
@@ -44,10 +45,16 @@ class APISettingsPanel:
         key_hint = label(self.body, '已保存的密钥不会回填显示；留空可保留。更换服务地址后，请重新填写。',
                          size=10, color=C['muted'], justify='left', anchor='w')
         key_hint.pack(fill='x', pady=(0, 8))
-        ttk.Checkbutton(self.body, text='在本机加密保存密钥（换电脑需重新填写）', variable=self.remember).pack(anchor='w', pady=3)
-        ttk.Checkbutton(self.body, text='允许引用本地经验（相关经验会一起发给服务商）', variable=self.include_memory).pack(anchor='w', pady=3)
-        self.thinking_check = ttk.Checkbutton(self.body, text='DeepSeek 深入思考（可能更慢）', variable=self.thinking)
-        self.thinking_check.pack(anchor='w', pady=3)
+        ttk.Separator(self.body).pack(fill='x', pady=(6, 8))
+        self.remember_switch = SwitchRow(self.body, '记住密钥', self.remember,
+            description='仅在这台电脑加密保存，换电脑需重新填写。', font_size=11)
+        self.remember_switch.pack(fill='x', pady=3)
+        self.memory_switch = SwitchRow(self.body, '参考本地经验', self.include_memory,
+            description='相关经验会随请求发送给你选择的服务商。', font_size=11)
+        self.memory_switch.pack(fill='x', pady=3)
+        self.thinking_check = SwitchRow(self.body, '深入思考', self.thinking,
+            description='适用于 DeepSeek，回答可能需要更多时间。', font_size=11)
+        self.thinking_check.pack(fill='x', pady=3)
         limits = tk.Frame(self.body, bg=C['surface'])
         limits.pack(fill='x', pady=(9, 10))
         label(limits, '回答长度上限', size=11).pack(side='left')

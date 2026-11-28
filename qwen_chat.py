@@ -97,6 +97,10 @@ def chat(message, history=None, use_base=False, agent_model=False, use_memory=Tr
 
     if memory_ids and memory_used:
         result['memory_ids'] = memory_ids
+        try:
+            personal_memory.mark_used(memory_ids)
+        except Exception:
+            warnings.append('记忆引用统计未保存，回答仍然有效。')
     if personal_memory is not None and write_personal_memory:
         attempted, failed = False, False
 

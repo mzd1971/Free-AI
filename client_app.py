@@ -21,12 +21,14 @@ from app_skills import skill_catalog, get_skill, execute_skill
 from api_settings import APISettings
 from desktop_app import DesktopApp as ExistingActions, size_text
 from epistemology import KnowledgeStore
+from keyboard_shortcuts import (CONTROL, SHIFT, install_shortcuts, key_modifiers,
+                                load_shortcut_preferences, save_shortcut_preferences,
+                                shortcut_available, shortcut_hint)
 from paths import ROOT, ARTIFACTS
 from ui_kit import COLORS as C, CLIENT_SKINS, CLIENT_LIGHT_COLORS, FONT, FlatButton, RoundedFrame, ScrollArea, label, setup_theme, ui_font, set_text_size, text_scale
 from ui_preferences import TEXT_SIZES, load_text_size, save_text_size
 
 
-SHORTCUT_HINT = 'Ctrl + Enter 发送 · Enter 换行'
 BUSY_DRAFT_HINT = '当前任务结束后再发送。你可以继续编辑草稿。'
 
 
@@ -78,7 +80,8 @@ class ClientApp(ExistingActions):
         self.status = tk.StringVar(value='当前使用 API；发送时会将当前对话交给所填服务商。' if self.backend == 'api'
                                   else '先下载模型或连接 API，也可以直接使用本机小工具。' if not self.selected_model else '模型按需加载，打开应用不会启动推理。')
         self.model_state = tk.StringVar(value='未启用模型')
-        self.chat_hint = tk.StringVar(value=SHORTCUT_HINT)
+        self.send_key, self.shortcut_keys = load_shortcut_preferences(self.sessions)
+        self.chat_hint = tk.StringVar(value=shortcut_hint(self.send_key))
         self.download_status = tk.StringVar(value='只下载你需要的能力，聊天和经验会一直保留。')
         self.sidebar = tk.Frame(root, bg=C['side'], width=280)
         self.sidebar.pack(side='left', fill='y')
@@ -119,6 +122,8 @@ class ClientApp(ExistingActions):
         self.page_title = tk.StringVar(value='新的对话')
         self.sidebar_button = FlatButton(header, '', self.toggle_sidebar, icon='sidebar', variant='ghost', width=34, height=34, font_size=11)
         self.sidebar_button.pack(side='left', padx=(0, 10))
+        self.back_to_chat_button = FlatButton(header, '返回对话', self.return_to_chat,
+            icon='arrow_left', variant='ghost', height=34, font_size=11)
         self.details_button = FlatButton(header, '', self.toggle_project_details, icon='panel', variant='ghost', width=36, height=34, font_size=11)
         self.details_button.pack(side='right', padx=(12, 0))
         self.memory_button = FlatButton(header, '长期记忆', self.open_memory, icon='memory', variant='ghost', height=34, font_size=10)
@@ -161,7 +166,6 @@ class ClientApp(ExistingActions):
         self.refresh_capabilities()
         self.select_page(0)
         self.apply_text_layout()
-        from keyboard_shortcuts import install_shortcuts
         install_shortcuts(self)
         self.transcript.bind('<Configure>', lambda event: self._resize_reasoning_views(), add='+')
         root.bind('<<FreeAITextSizeChanged>>', lambda event: self.apply_text_layout(), add='+')
@@ -183,12 +187,21 @@ class ClientApp(ExistingActions):
             page.pack_forget()
         self.pages[index].pack(fill='both', expand=True)
         self.current_page = index
+        if index == 0:
+            self.back_to_chat_button.pack_forget()
+        else:
+            self.back_to_chat_button.pack(side='left', padx=(0, self.px(10)), before=self.sidebar_button)
         self.models_nav_button.configure(variant='selected' if index == 1 else 'ghost')
         self.page_title.set(dict(self.recent_rows).get(self.session_id, '新的对话') if index == 0 else ['对话', '能力中心', '设置'][index])
         if index == 0:
             self.layout_chat()
         elif index == 2 and hasattr(self, 'settings_panel'):
             self.settings_panel.sync_busy()
+
+    def return_to_chat(self):
+        """Leave settings without creating a session or replacing the draft."""
+        self.select_page(0)
+        self.input.focus_set()
 
     def build_chat(self, page):
         self.show_project_details = True
@@ -257,8 +270,8 @@ class ClientApp(ExistingActions):
         self.input.bind('<Configure>', self._schedule_composer_size)
         self.input.bind('<FocusIn>', lambda e: self.update_placeholder())
         self.input.bind('<FocusOut>', lambda e: self.update_placeholder())
-        self.input.bind('<Control-Return>', self.enter_send)
-        self.input.bind('<Control-KP_Enter>', self.enter_send)
+        self.input.bind('<Return>', self.enter_send)
+        self.input.bind('<KP_Enter>', self.enter_send)
         tools = self.composer_tools = tk.Frame(self.composer.body, bg=C['input'])
         tools.pack(fill='x', pady=(12, 0))
         self.add_button = FlatButton(tools, '', self.attachment_menu, icon='plus', variant='secondary', width=34, height=34, radius=17, font_size=11)
@@ -579,10 +592,28 @@ class ClientApp(ExistingActions):
         except OSError:
             self.status.set('项目文件夹无法打开，请检查它是否已移动。')
 
+    def update_shortcuts(self, send_key, keys):
+        old_hint = shortcut_hint(self.send_key)
+        self.shortcut_keys = save_shortcut_preferences(self.sessions, send_key, keys)
+        self.send_key = send_key
+        hint = self.chat_hint.get()
+        if hint.startswith(old_hint):
+            self.chat_hint.set(shortcut_hint(send_key) + hint[len(old_hint):])
+
     def enter_send(self, event):
-        # Plain Return belongs to Tk and the input method. Windows reserves
-        # VK_PROCESSKEY for IME processing, even if a modifier is present.
-        if getattr(event, 'keycode', None) == 229:
+        if not shortcut_available(event, self.root):
+            return None
+        modifiers = key_modifiers(event)
+        send_modifiers = CONTROL if self.send_key == 'Ctrl+Enter' else 0
+        if modifiers != send_modifiers:
+            if modifiers == CONTROL:
+                return 'break'
+            if event.keysym == 'KP_Enter' and modifiers in (0, SHIFT):
+                # Tk's Text binding inserts a newline for Return only.
+                self.input.tk.call('tk::TextInsert', str(self.input), '\n')
+                if self.input.cget('autoseparators'):
+                    self.input.edit_separator()
+                return 'break'
             return None
         if self.busy:
             self.chat_hint.set(BUSY_DRAFT_HINT)
@@ -697,7 +728,7 @@ class ClientApp(ExistingActions):
             self.sessions.set('client_skill', 'general')
             self.skill_button.configure(text=get_skill('general')['title'] + ' ▾')
         self.chat_hint.set('工具任务只支持计算和读取本项目训练摘要。其他问题会给出建议。' if self.tool_mode.get()
-                           else SHORTCUT_HINT)
+                           else shortcut_hint(self.send_key))
         self._schedule_draft_save()
         self.refresh_model_state()
 

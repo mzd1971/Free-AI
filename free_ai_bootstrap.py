@@ -128,12 +128,15 @@ def self_test(trainer=False):
                 assert app.last_tool_result['tool_execution_verified']
                 from model_catalog import chat_models
                 from app_skills import skill_catalog
-                assert len(chat_models(app.manager.catalog)) == 5
+                models = chat_models(app.manager.catalog)
+                expected_models = {'text-default', 'text-qwen3-0-6b', 'text-deepseek-r1-1-5b',
+                                   'text-deepseek-r1-7b', 'text-code-1-5b'}
+                assert expected_models <= {spec['id'] for spec in models}
                 assert len(skill_catalog()) == 10
                 for section in ('models', 'skills', 'extensions'):
                     app.show_capabilities(section)
                     window.update()
-                report.update(model_options=5, skill_options=10, local_skill_without_model=True)
+                report.update(model_options=len(models), skill_options=10, local_skill_without_model=True)
             for index in range(3):
                 app.select_page(index)
                 window.update()

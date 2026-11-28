@@ -300,6 +300,18 @@ def _chat_pair(messages):
     return _read_text(prompt), turns[-1][1]
 
 
+
+def has_chat_samples(rows, column):
+    """Check whether a preview column contains a supported dialogue."""
+    for row in rows:
+        try:
+            _chat_pair(row.get(column))
+        except ValueError:
+            continue
+        return True
+    return False
+
+
 def _pair(row, mapping):
     if 'messages' in mapping:
         return _chat_pair(row[mapping['messages']])

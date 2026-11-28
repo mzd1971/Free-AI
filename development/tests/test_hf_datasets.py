@@ -166,11 +166,14 @@ class HuggingFaceDatasetsTests(unittest.TestCase):
             'alpaca gpt4 zh': 'llamafactory/alpaca_gpt4_zh',
             'Belle Group': 'BelleGroup/train_0.5M_CN',
             '入门': 'yahma/alpaca-cleaned',
+            '中文多轮对话': 'opencsg/smoltalk-chinese',
+            'magicoder': 'ise-uiuc/Magicoder-Evol-Instruct-110K',
+            'smol-smoltalk': 'HuggingFaceTB/smol-smoltalk',
         }
         with patch.object(hf, '_get_json') as get_json:
-            self.assertEqual(len(recommend_datasets()), 6)
-            self.assertEqual(len(recommend_datasets('中文')), 2)
-            self.assertEqual(len(recommend_datasets('英文')), 4)
+            self.assertEqual(len(recommend_datasets()), 9)
+            self.assertEqual(len(recommend_datasets('中文')), 3)
+            self.assertEqual(len(recommend_datasets('英文')), 6)
             self.assertEqual(recommend_datasets('unsuitable_zzzxqx'), [])
             for query, expected in examples.items():
                 with self.subTest(query=query):

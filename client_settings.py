@@ -6,7 +6,7 @@ from tkinter import filedialog, ttk
 
 from api_panel import APISettingsPanel
 from coding_tools import load_preferences, save_preferences
-from keyboard_shortcuts import COMPOSER_SHORTCUTS, SHORTCUTS
+from keyboard_shortcuts import DEFAULT_SEND_KEY, DEFAULT_SHORTCUTS, SEND_KEYS, SHORTCUT_FORMAT, SHORTCUTS
 from paths import ARTIFACTS, ROOT
 from project_chat import PERMISSION_LABELS
 from ui_kit import CLIENT_SKINS, COLORS as C, FONT, FlatButton, RoundedFrame, ScrollArea, label, ui_font
@@ -39,10 +39,10 @@ class SettingsPanel(tk.Frame):
         self.app = app
         self.category = 'general'
         self.sections = {category: [] for category in CATEGORIES}
-        self.pack(fill='both', expand=True, padx=24, pady=(12, 4))
+        self.pack(fill='both', expand=True, padx=24, pady=(18, 8))
 
-        navigation = self.navigation = tk.Frame(self, bg=C['side'], width=156)
-        navigation.pack(side='left', fill='y', padx=(0, 18))
+        navigation = self.navigation = tk.Frame(self, bg=C['bg'], width=176)
+        navigation.pack(side='left', fill='y', padx=(0, 24))
         navigation.pack_propagate(False)
         label(navigation, '搜索设置', size=10, color=C['muted']).pack(anchor='w', padx=12, pady=(12, 4))
         self.query = tk.StringVar(self)
@@ -52,8 +52,8 @@ class SettingsPanel(tk.Frame):
         self.category_buttons = {}
         for key, title in CATEGORIES.items():
             button = FlatButton(navigation, title, lambda key=key: self.select_category(key),
-                                variant='ghost', anchor='w', height=34, font_size=11)
-            button.pack(fill='x', padx=8, pady=2)
+                                variant='ghost', anchor='w', height=38, font_size=11, radius=10)
+            button.pack(fill='x', padx=8, pady=3)
             self.category_buttons[key] = button
 
         area = app.settings_area = ScrollArea(self, bg=C['bg'], max_width=1100)
@@ -102,7 +102,7 @@ class SettingsPanel(tk.Frame):
         if self.navigation.winfo_manager():
             self.navigation.pack_forget()
         else:
-            self.navigation.pack(side='left', fill='y', padx=(0, 18), before=self.app.settings_area)
+            self.navigation.pack(side='left', fill='y', padx=(0, 24), before=self.app.settings_area)
 
     def render(self, *_):
         terms = self.query.get().casefold().strip().split()
@@ -122,7 +122,7 @@ class SettingsPanel(tk.Frame):
         else:
             visible = [widget for widget, _ in self.sections[self.category]]
         for widget in visible:
-            widget.pack(fill='x', padx=(0, 10), pady=(0, 12))
+            widget.pack(fill='x', padx=(0, 10), pady=(0, 16))
         if not visible:
             self.empty_message.pack(anchor='w', pady=10)
         self.app.settings_area.canvas.yview_moveto(0)
@@ -131,7 +131,7 @@ class SettingsPanel(tk.Frame):
         self.sections[category].append((widget, f'{CATEGORIES[category]} {keywords}'.casefold()))
 
     def card(self, category, title, description='', keywords=''):
-        card = RoundedFrame(self.body, padding=(18, 15))
+        card = RoundedFrame(self.body, padding=(22, 18), radius=16)
         self.register_section(category, card, f'{title} {description} {keywords}')
         label(card.body, title, size=13, bold=True).pack(anchor='w')
         if description:
@@ -315,9 +315,85 @@ class SettingsPanel(tk.Frame):
         self.actions(models, [('打开模型文件夹', app.open_model_folder)])
 
     def build_shortcuts(self):
-        entries = (*COMPOSER_SHORTCUTS, *((item.keys, item.description) for item in SHORTCUTS))
-        for keys, description in entries:
-            self.card('shortcuts', keys, description)
+        body = self.card('shortcuts', '聊天输入', 'Shift+Enter 始终换行。选择 Ctrl+Enter 发送时，Enter 也可以换行。',
+                         'Enter 发送消息 换行')
+        controls = tk.Frame(body, bg=C['surface'])
+        controls.pack(fill='x', pady=(8, 0))
+        options = [f'{key} 发送' for key in SEND_KEYS]
+        self.send_key_control = ttk.Combobox(controls, values=options, state='readonly', width=16,
+                                             font=ui_font(self.app.root, 11))
+        self.send_key_control.set(f'{self.app.send_key} 发送')
+        self.send_key_control.bind('<<ComboboxSelected>>', self.change_send_key)
+        self.send_key_control.pack(side='left', padx=(0, 8))
+        FlatButton(controls, '恢复默认快捷键', self.reset_shortcuts, variant='ghost',
+                   height=32, font_size=10).pack(side='left')
+        self.shortcuts_notice = tk.StringVar(self)
+        self.description(body, textvariable=self.shortcuts_notice).pack(fill='x', pady=(4, 0))
+        self.description(body, SHORTCUT_FORMAT).pack(fill='x', pady=(4, 0))
+
+        self.shortcut_entries = {}
+        for item in SHORTCUTS:
+            key = self.app.shortcut_keys[item.name]
+            section = len(self.sections['shortcuts'])
+            card = RoundedFrame(self.body, padding=(18, 10), radius=16)
+            self.register_section('shortcuts', card, f'{item.description} {item.keys} {key}')
+            body = card.body
+            row = tk.Frame(body, bg=C['surface'])
+            row.pack(fill='x')
+            row.columnconfigure(0, weight=1)
+            title = label(row, item.description, size=11, bold=True, anchor='w', justify='left')
+            title.grid(row=0, column=0, sticky='ew', padx=(0, 12))
+            title.bind('<Configure>', lambda event: event.widget.configure(wraplength=max(40, event.width)))
+            entry = ttk.Entry(row, width=16, font=ui_font(self.app.root, 11))
+            entry.insert(0, key)
+            entry.grid(row=0, column=1, padx=(0, 8))
+            entry.bind('<Return>', lambda event, item=item: self.change_shortcut(item))
+            FlatButton(row, '保存', lambda item=item: self.change_shortcut(item),
+                       height=32, width=58, font_size=10).grid(row=0, column=2)
+            notice = tk.StringVar(self, f'默认 {item.keys}')
+            self.description(body, textvariable=notice).pack(fill='x', pady=(4, 0))
+            self.shortcut_entries[item.name] = entry, notice, section
+
+    def apply_shortcuts(self, send_key, keys, notice):
+        try:
+            self.app.update_shortcuts(send_key, keys)
+        except ValueError as exc:
+            notice.set(str(exc))
+        except (OSError, sqlite3.Error):
+            notice.set('无法保存快捷键，请检查记录文件夹是否可写。')
+        else:
+            return True
+        return False
+
+    def change_send_key(self, _event=None):
+        send_key = self.send_key_control.get().split(' ', 1)[0]
+        if self.apply_shortcuts(send_key, self.app.shortcut_keys, self.shortcuts_notice):
+            self.shortcuts_notice.set('发送快捷键已保存。')
+        self.send_key_control.set(f'{self.app.send_key} 发送')
+
+    def change_shortcut(self, item):
+        entry, notice, _ = self.shortcut_entries[item.name]
+        keys = {**self.app.shortcut_keys, item.name: entry.get()}
+        if self.apply_shortcuts(self.app.send_key, keys, notice):
+            self.refresh_shortcut_entry(item)
+            notice.set(f'已保存 · 默认 {item.keys}')
+        return 'break'
+
+    def refresh_shortcut_entry(self, item):
+        entry, notice, index = self.shortcut_entries[item.name]
+        key = self.app.shortcut_keys[item.name]
+        entry.delete(0, 'end')
+        entry.insert(0, key)
+        notice.set(f'默认 {item.keys}')
+        card, _ = self.sections['shortcuts'][index]
+        self.sections['shortcuts'][index] = (card, f'快捷键 {item.description} {item.keys} {key}'.casefold())
+
+    def reset_shortcuts(self):
+        if self.apply_shortcuts(DEFAULT_SEND_KEY, DEFAULT_SHORTCUTS, self.shortcuts_notice):
+            self.shortcuts_notice.set('已恢复默认快捷键。')
+            self.send_key_control.set(f'{self.app.send_key} 发送')
+            for item in SHORTCUTS:
+                self.refresh_shortcut_entry(item)
 
     def build_about(self):
         about = self.card('about', 'Free AI', '版本 2.8.0', '使用说明 帮助')
